@@ -60,7 +60,8 @@ class Graph:
     breakers: CircuitBreakers
     grid_state: GridState
     deal_feedback: Any = None
-    _pending_pred: dict = field(default_factory=dict)   # position_id -> 融合分符号
+    _pending_pred: dict = field(default_factory=dict)
+    _position_adds: dict = field(default_factory=dict)   # {position_ticket_str: 加仓次数}   # position_id -> 融合分符号
 
     @classmethod
     def build(cls) -> "Graph":
@@ -186,7 +187,9 @@ class Graph:
                                   llm=None, last_close=summary["last_close"],
                                   atr=atr, realized_vol=st["fused"].indicators.realized_vol_daily
                                   if st["fused"].indicators else None,
-                                  round_id=round_id)
+                                  round_id=round_id,
+                                  position_adds=self._position_adds,
+                                  point_value_per_lot=self._point_value())
             if need_llm and self.llm is not None:
                 st["llm"] = await self.llm.review_and_news(ev, st["news"],
                                                            summary["last_close"])
@@ -216,13 +219,14 @@ class Graph:
             wr = self.deal_feedback.current_win_rate() if self.deal_feedback is not None else 0.5
             approved: Approved = self.gate.evaluate(
                 Proposal(kind=prop.kind, direction=prop.direction, entry=prop.entry,
-                         tp_struct=None, reasons=prop.reasons, evidence_ids=[]),
+                         tp_struct=prop.tp_struct, reasons=prop.reasons, evidence_ids=[]),
                 ev, st["account"], st["positions"],
                 point_value_per_lot=self._point_value(),
                 df_5m=st["bundle"].frames["5m"], atr=atr,
                 realized_vol=st["fused"].indicators.realized_vol_daily
                 if st["fused"].indicators else None,
-                win_rate=wr)
+                win_rate=wr,
+                position_adds=self._position_adds)
             st["approved"] = approved
             summary["risk"] = {"ok": approved.ok, "reason": approved.reason}
             if not approved.ok:
@@ -250,6 +254,7 @@ class Graph:
                                       ("last_close", "proposal", "risk", "execution")}})
             self.breakers.save(CFG.state_path.parent / "breakers.json")
             self.grid_state.save(CFG.state_path.parent / "grid_state.json")
+            self._save_position_adds()
             return summary
         except Mt5Error as e:
             log_error(f"round {round_id}: MT5 {e}")
@@ -294,6 +299,61 @@ class Graph:
                             comment="goldagent-close",
                             idempotency_key=f"close-{plan['position_ticket']}-{int(time.time())}")
             return await self.executor.execute(req)
+        if kind == "modify_sltp":
+            # 保护性移损：TP 保持原位（None = 不动），SL 推到锁盈位（tp_struct 携带新 SL）
+            req = OrderPlan(kind="modify_sltp", direction=plan.get("direction"),
+                            position_ticket=int(plan["position_ticket"]),
+                            sl=float(plan["new_sl"]), tp=None,
+                            comment="goldagent-lock",
+                            idempotency_key=f"lock-{plan['position_ticket']}-{int(time.time())}")
+            res = await self.executor.execute(req)
+            if res.ok:
+                trade_log({"event": "sl_locked", "position": plan["position_ticket"],
+                           "new_sl": plan["new_sl"],
+                           "direction": plan.get("direction")})
+            return res
+        if kind == "add_layer":
+            # 顺势加仓：固定 0.01 手，同向市价；成功后计数+1、记录分数/置信/基础差值（指数阶梯）
+            req = OrderPlan(kind="open_market", direction=plan["direction"],
+                            lots=float(plan["lots"]), tp=plan.get("tp"),
+                            sl=plan.get("sl"), comment="goldagent-add",
+                            idempotency_key=f"add-{plan['position_ticket']}-{int(time.time())}")
+            res = await self.executor.execute(req)
+            if res.ok:
+                key = str(plan["position_ticket"])
+                rec = self._position_adds.get(key)
+                rec = rec if isinstance(rec, dict) else {"count": int(rec or 0)}
+                prev_score = rec.get("last_score")
+                fused = st.get("fused")
+                llm = st.get("llm") or {}
+                cur_score = float(fused.result.score) if fused and getattr(fused, "result", None) else None
+                rec["count"] = int(rec.get("count", 0)) + 1
+                rec["last_score"] = cur_score
+                rec["last_conf"] = float((llm.get("review") or {}).get("confidence") or 0) or None
+                # base_gap = 本次相对上次加仓的分数差（第 3 次起作指数增长基数）
+                if prev_score is not None and cur_score is not None:
+                    rec["base_gap"] = max(abs(cur_score) - abs(prev_score), 0.05)
+                elif "base_gap" not in rec:
+                    rec["base_gap"] = 0.1
+                self._position_adds[key] = rec
+                self._save_position_adds()
+                trade_log({"event": "layer_added", "position": key,
+                           "add_no": rec["count"],
+                           "max": CFG.risk.max_adds_per_position,
+                           "score": rec["last_score"], "conf": rec["last_conf"],
+                           "base_gap": rec["base_gap"],
+                           "lots": plan["lots"], "direction": plan["direction"]})
+            return res
+        if kind == "cancel_pending":
+            # 行情反转撤挂单（docs/06 状态机：PENDING_GRID → IDLE）
+            req = OrderPlan(kind="cancel_pending", position_ticket=int(plan["order_ticket"]),
+                            comment="goldagent-cancel",
+                            idempotency_key=f"cancel-{plan['order_ticket']}-{int(time.time())}")
+            res = await self.executor.execute(req)
+            if res.ok:
+                trade_log({"event": "pending_cancelled", "ticket": plan["order_ticket"],
+                           "direction": plan.get("direction")})
+            return res
         if kind == "place_grid":
             # 逐层挂单
             last = ExecutionResult(ok=True)
@@ -309,6 +369,20 @@ class Graph:
                     break
             return last
         return ExecutionResult(ok=True, error=f"noop kind {kind}")
+
+    def _save_position_adds(self) -> None:
+        path = CFG.state_path.parent / "position_adds.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self._position_adds), encoding="utf-8")
+
+    def __post_init__(self) -> None:
+        # 加仓计数跨进程持久
+        try:
+            path = CFG.state_path.parent / "position_adds.json"
+            if path.exists():
+                self._position_adds = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            log_warn(f"position_adds load failed: {e}")
 
     def _point_value(self) -> float:
         si = self.client.symbol_info()

@@ -40,7 +40,13 @@ def build_review_user(ev: FusedEvidence, news: NewsView | None, last_close: floa
                          f"center={cr.center} invalidation={cr.invalidation}")
             for sig in cr.signals[:3]:
                 lines.append(f"  信号: {sig.get('kind')} @ {sig.get('price')}")
-    if ev.mobius is not None and ev.mobius.status != "unavailable":
+    if isinstance(ev.mobius, dict):
+        for tf, mr in ev.mobius.items():
+            if mr is None or mr.status == "unavailable":
+                continue
+            structs = [f"{s.get('kind')}/{s.get('bias')}@{s.get('pivot_price')}" for s in mr.structures[-3:]]
+            lines.append(f"openmobius SMC[{tf}][{mr.status}]: {structs}")
+    elif ev.mobius is not None and ev.mobius.status != "unavailable":
         structs = [f"{s.get('kind')}/{s.get('bias')}@{s.get('pivot_price')}" for s in ev.mobius.structures[-4:]]
         lines.append(f"openmobius SMC[{ev.mobius.status}]: {structs}")
         actives = [ob for ob in ev.mobius.order_blocks if ob.get("status") == "active"]
@@ -48,8 +54,8 @@ def build_review_user(ev: FusedEvidence, news: NewsView | None, last_close: floa
             lines.append(f"  active OB: {[(round(o['top'],2), round(o['bottom'],2), o['bias']) for o in actives[:3]]}")
     if ev.indicators is not None:
         i = ev.indicators
-        lines.append(f"指标: macd={i.macd_score:+.2f} rsi={i.rsi_score:+.2f} ma={i.ma_score:+.1f} "
-                     f"atr={i.atr}")
+        lines.append(f"前瞻指标: 加速度={i.momentum_accel:+.2f} tick买盘={i.tick_imbalance:+.2f} "
+                     f"量价压力={i.vol_pressure:+.2f} 收缩={i.range_compression:+.2f} atr={i.atr}")
     if news and news.items:
         lines.append("最近快讯:")
         for it in news.items[:8]:

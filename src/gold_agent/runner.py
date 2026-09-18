@@ -30,10 +30,17 @@ async def main_async(dry: bool, rounds: int | None) -> None:
         # doctor 内部线程初始化成功但 _connected 标志未同步；显式补一次
         await graph.client.initialize()
 
-    n = 0
+    # 轮号跨进程持久（用户要求：重启不从 1 开始，便于日志对照）
+    round_state_path = CFG.state_path.parent / "runner_state.json"
+    try:
+        n = int(json.loads(round_state_path.read_text(encoding="utf-8")).get("round", 0))
+    except Exception:
+        n = 0
     try:
         while rounds is None or n < rounds:
             n += 1
+            round_state_path.parent.mkdir(parents=True, exist_ok=True)
+            round_state_path.write_text(json.dumps({"round": n}), encoding="utf-8")
             summary = await graph.run_round(n)
             # 一行式控制台摘要（信号分 / 动作 / 风控 / 执行），PyCharm 运行窗直接可见
             score = summary.get("score")
