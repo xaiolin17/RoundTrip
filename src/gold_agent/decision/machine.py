@@ -51,6 +51,8 @@ class DecisionEngine:
         self.llm = llm
         self.state = State.IDLE
         self._exit_streak: dict[str, int] = {}   # direction -> 连续反向轮数
+        self._profit_peak: dict[str, float] = {}  # ticket -> 持仓期间浮盈峰值（回吐检测）
+        self._score_peak: dict[str, float] = {}   # ticket -> 持仓期间顺向信号峰值
 
     def decide(self, ctx: DecisionContext) -> Proposal:
         """纯函数式判定一轮行为；执行与对账在 runner。"""
@@ -175,6 +177,28 @@ class DecisionEngine:
                             reasons=[f"add #{adds_count + 1}/{CFG.risk.max_adds_per_position} "
                                      f"S={s:+.2f} (need>={required:.2f} last={last_score}) "
                                      f"conf={conf_cur:.2f} (last={last_conf})"])
+        # ---- 超短期利润回吐检测（用户要求：识别到利润会回吐就主动平仓）----
+        # 信号面：持仓期间信号从峰值回落超过 reserve_drop 分数即视为「回吐启动」；
+        # 盈利面：浮盈曾达 peak_profit 后回落超过一半且当前仍为正 → 保住大部分利润离场。
+        # 两者任一触发即平仓（优先级高于加仓/锁盈）。
+        key_pos = str(pos.ticket)
+        peak = self._profit_peak.get(key_pos, 0.0)
+        cur_profit = pos.profit
+        self._profit_peak[key_pos] = max(peak, cur_profit)
+        score_peak = self._score_peak.get(key_pos, 0.0)
+        same_dir_score = s if direction == "LONG" else -s     # 顺持仓方向的信号分
+        self._score_peak[key_pos] = max(score_peak, same_dir_score)
+        reserve_drop = CFG.decision.reserve_drop_score
+        profit_giveback = (self._profit_peak[key_pos] > CFG.decision.reserve_min_profit
+                           and cur_profit < 0.5 * self._profit_peak[key_pos])
+        signal_giveback = (self._score_peak[key_pos] >= CFG.decision.open_threshold
+                           and same_dir_score <= self._score_peak[key_pos] - reserve_drop)
+        if profit_giveback or signal_giveback:
+            why = (f"profit giveback: peak ${self._profit_peak[key_pos]:.2f} -> ${cur_profit:.2f}"
+                   if profit_giveback else
+                   f"signal giveback: peak S={self._score_peak[key_pos]:+.2f} -> {same_dir_score:+.2f}")
+            return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
+                            reasons=[why])
         # 新闻反向减仓
         na = (ctx.llm or {}).get("news_assessment") or {}
         if na.get("impact", 0) >= 0.8:

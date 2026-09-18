@@ -87,6 +87,9 @@ class RiskConfig:
     max_group_lots_mult: float = _TOML.get("risk", {}).get("max_group_lots_mult", 3.0)
     # 用户规则：每仓固定 0.01 手，同向最多加仓次数
     max_adds_per_position: int = _TOML.get("risk", {}).get("max_adds_per_position", 5)
+    # 用户指定：市价单 TP 缩 40%、SL 缩 （与挂单一致）
+    market_tp_shrink: float = _TOML.get("risk", {}).get("market_tp_shrink", 0.6)
+    market_sl_shrink: float = _TOML.get("risk", {}).get("market_sl_shrink", 0.65)
     daily_loss_stop_pct: float = _TOML.get("risk", {}).get("daily_loss_stop_pct", 0.03)
     consecutive_loss_cooloff_h: float = _TOML.get("risk", {}).get("consecutive_loss_cooloff_h", 4.0)
     consecutive_loss_n: int = _TOML.get("risk", {}).get("consecutive_loss_n", 4)
@@ -102,6 +105,9 @@ class DecisionConfig:
     open_threshold: float = _TOML.get("decision", {}).get("open_threshold", 1.6)
     exit_threshold: float = _TOML.get("decision", {}).get("exit_threshold", 1.2)
     exit_persist_rounds: int = _TOML.get("decision", {}).get("exit_persist_rounds", 3)
+    # 利润回吐检测（用户要求：超短期有利润回吐时主动平仓）
+    reserve_min_profit: float = _TOML.get("decision", {}).get("reserve_min_profit", 5.0)
+    reserve_drop_score: float = _TOML.get("decision", {}).get("reserve_drop_score", 0.6)
     loop_interval_s: float = _TOML.get("decision", {}).get("loop_interval_s", 60.0)
     disagreement_lot_mult: float = _TOML.get("decision", {}).get("disagreement_lot_mult", 0.5)
 

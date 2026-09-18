@@ -16,11 +16,13 @@ from gold_agent.common.config import CFG
 
 
 def shrink_tp(atr: float) -> float:
-    return CFG.risk.tp_atr_mult * 0.7 * atr
+    # 用户指定：挂单 TP 缩 40%（系数 0.6）
+    return CFG.risk.tp_atr_mult * 0.6 * atr
 
 
 def shrink_sl(atr: float) -> float:
-    return CFG.risk.sl_atr_mult * 0.85 * atr
+    # 用户指定：挂单 SL 缩
+    return CFG.risk.sl_atr_mult * 0.65 * atr
 
 
 def pull_entry_inside(level: float, direction: str, atr: float) -> float:

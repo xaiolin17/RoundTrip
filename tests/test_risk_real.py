@@ -65,11 +65,11 @@ def test_shrink_for_pending_real_df():
     atr = 5.0
     for direction in ("LONG", "SHORT"):
         sh = shrink_for_pending(direction, 4350.0, atr, df)
-        # 收缩语义：TP 距离 ≤ 0.7×mult×ATR（可达性校验只会拉近）；但至少保留 0.3×ATR 空间
+        # 收缩语义（用户指定）：TP 缩 40% → 距离 ≤ 0.6×mult×ATR；SL 缩 20% → 距离 ≤ 0.8×mult×ATR
         tp_dist = abs(sh["tp"] - 4350.0)
-        assert tp_dist <= CFG.risk.tp_atr_mult * 0.7 * atr + 1e-6, sh
-        assert tp_dist >= 0.3 * atr - 0.3 * atr + 0.0 or tp_dist > 0  # 保证有正利润空间
-        assert abs(sh["sl"] - 4350.0) >= CFG.risk.sl_atr_mult * 0.85 * atr - 1e-6
+        assert tp_dist <= CFG.risk.tp_atr_mult * 0.6 * atr + 1e-6, sh
+        assert tp_dist > 0                       # 保证有正利润空间
+        assert abs(sh["sl"] - 4350.0) <= CFG.risk.sl_atr_mult * 0.8 * atr + 1e-6
     # 不可达 TP 收缩：远超历史极值的 TP 必须被拉近
     far_tp = 4350.0 + 100.0
     got = reachable_tp(far_tp, "LONG", df)
