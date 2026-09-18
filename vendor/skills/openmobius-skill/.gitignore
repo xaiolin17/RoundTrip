@@ -1,0 +1,40 @@
+# Virtual env
+# Temporary files
+tmp/
+Tmp/
+temp/
+*.tmp
+
+.venv/
+venv/
+.env/
+
+# Secrets / local config
+.env.local
+.env.*.local
+*credentials*
+*secret*
+
+# Built vector index and local embedding cache (rebuilt by install.py)
+knowledge_base/_index/
+knowledge_base/_embedding_cache/
+knowledge_base/._index.build-*/
+knowledge_base/._index.backup-*/
+knowledge_base/._cards.build-*/
+knowledge_base/._cards.backup-*/
+knowledge_base/.embedding_seed_v2.build-*/
+knowledge_base/.embedding_seed_v2.backup-*/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
