@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>QuantKnowledge Chart</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+    body { font-family: system-ui, -apple-system, sans-serif; }
+    #root { width: 100vw; height: 100vh; }
+    #header {
+      position: absolute; top: 0; left: 0; right: 0; height: 36px;
+      display: flex; align-items: center; gap: 16px; padding: 0 16px;
+      font-size: 13px; border-bottom: 1px solid; z-index: 10;
+    }
+    #chart-container { position: absolute; top: 36px; left: 0; right: 0; bottom: 0; }
+  </style>
+  <!-- lightweight-charts UMD（本地，离线可用） -->
+  <script src="lightweight-charts.standalone.js"></script>
+  <!-- 主题 -->
+  <script src="theme.js"></script>
+  <!-- Rectangle plugin（ISeriesPrimitive） -->
+  <script src="rectangle_primitive.js"></script>
+  <!-- 渲染器 -->
+  <script src="renderer.js"></script>
+</head>
+<body>
+  <div id="header"></div>
+  <div id="chart-container"></div>
+
+  <!-- payload JSON 由 Python 注入到此 script 标签的 textContent -->
+  <script id="payload" type="application/json">{"_placeholder": true}</script>
+
+  <script>
+    (function() {
+      try {
+        const raw = document.getElementById('payload').textContent;
+        const payload = JSON.parse(raw);
+
+        // 读 URL query 决定主题（默认 dark）
+        const params = new URLSearchParams(window.location.search);
+        const themeName = params.get('theme') || payload.theme || 'dark';
+        const theme = window.QKTheme.THEMES[themeName] || window.QKTheme.THEMES.dark;
+
+        // 应用全局背景 + 文字色
+        document.body.style.background = theme.background;
+        document.body.style.color = theme.text;
+        const header = document.getElementById('header');
+        header.style.background = theme.background;
+        header.style.color = theme.text;
+        header.style.borderBottomColor = theme.border;
+
+        // 填 header（symbol / interval / overlay 摘要）
+        // 相同 label 去重并计数: ['bear FVG','bear FVG','bull OB'] → 'bear FVG ×2 · bull OB'
+        const allLabels = (payload.panels || [])
+          .flatMap(p => (p.items || [])
+            .filter(it => it.label)
+            .map(it => it.label))
+          .filter(Boolean);
+        const counts = new Map();
+        for (const lab of allLabels) {
+          counts.set(lab, (counts.get(lab) || 0) + 1);
+        }
+        const dedupedLabels = [];
+        for (const [lab, n] of counts) {
+          dedupedLabels.push(n > 1 ? `${lab} ×${n}` : lab);
+        }
+        // 上限 6 个，再多省略
+        const shown = dedupedLabels.slice(0, 6);
+        if (dedupedLabels.length > 6) shown.push(`+${dedupedLabels.length - 6} more`);
+        header.innerHTML =
+          `<strong>${(payload.symbol || '').toUpperCase()}</strong>` +
+          `<span>${payload.interval || ''}</span>` +
+          `<span style="opacity:.6">${shown.join(' · ') || '(no overlays)'}</span>`;
+
+        // 渲染
+        const root = document.getElementById('chart-container');
+        window.QKRenderer.renderPayload(root, payload, theme);
+
+        // 等下一帧确保 canvas 已绘制，再设 chartReady
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          document.body.dataset.chartReady = 'true';
+        }));
+      } catch (e) {
+        document.body.innerHTML =
+          `<div style="padding:24px;color:#ef5350;font-family:monospace;">` +
+          `Render error: ${e.message}\n\n${e.stack || ''}</div>`;
+        document.body.dataset.chartReady = 'error';
+      }
+    })();
+  </script>
+</body>
+</html>

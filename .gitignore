@@ -1,0 +1,46 @@
+# ---- Secrets ----
+.env
+.env.*
+!.env.example
+*_token.txt
+*.key
+
+# ---- Runtime data (cache/logs are local-only) ----
+data/cache/*
+logs/*
+!data/cache/.gitkeep
+!logs/.gitkeep
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Parquet / large data ----
+*.parquet
+*.h5
+*.npz
+
+# ---- Vendor skill runtime artifacts ----
+vendor/skills/openmobius-skill/knowledge_base/embedding_seed_v2/*.npz
+vendor/skills/chanlun-trading-system/.uv-cache/
+
+# ---- IDE / OS ----
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# ---- MT5 terminal logs ----
+*.mt5.log
