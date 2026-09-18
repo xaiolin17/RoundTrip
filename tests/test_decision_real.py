@@ -26,7 +26,8 @@ def test_flat_hold_low_score():
     e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
     p = e.decide(_ctx(score=0.7))
     assert p.kind == "hold"
-    assert any("1.6" in r for r in p.reasons)
+    # 阈值来自 config.toml（现为 1.2）；断言理由包含当前阈值数字
+    assert any(str(CFG.decision.open_threshold) in r for r in p.reasons)
 
 
 def test_flat_hold_high_sigma():

@@ -120,13 +120,21 @@ class Graph:
                     summary["deals_closed"] = len(closed)
 
             # t2 analyze (chanlun 本地 + mobius) 并发
+            # 周期选择（用户要求：1 分钟线为主，15 分钟内研判权重更大，1d 最小）：
+            #   短周期 1m/5m/15m 为主 + 1h/4h 作趋势背景，1d 只做超长线参考
             cl_tasks = {tf: asyncio.to_thread(analyze_tf, st["bundle"].frames[tf], tf)
-                        for tf in ("5m", "15m", "1h")}
-            mob_task = asyncio.create_task(self.mobius.get_smc("XAUUSD", "15m", limit=200))
+                        for tf in ("1m", "5m", "15m", "1h", "4h")}
+            mob_tasks = {
+                "1m": asyncio.create_task(self.mobius.get_smc("XAUUSD", "1m", limit=200)),
+                "5m": asyncio.create_task(self.mobius.get_smc("XAUUSD", "5m", limit=200)),
+                "15m": asyncio.create_task(self.mobius.get_smc("XAUUSD", "15m", limit=200)),
+                "1h": asyncio.create_task(self.mobius.get_smc("XAUUSD", "1h", limit=200)),
+            }
             news_task = asyncio.create_task(self.news.fetch())
             cl_vals = await asyncio.gather(*cl_tasks.values())
             st["chanlun"] = dict(zip(cl_tasks.keys(), cl_vals))
-            st["mobius"] = await mob_task
+            mob_vals = await asyncio.gather(*mob_tasks.values())
+            st["mobius"] = dict(zip(mob_tasks.keys(), mob_vals))
             st["news"] = await news_task
 
             # t2/t3 fuse（先本地融合；LLM 之后若有效再融合一次）
@@ -150,13 +158,15 @@ class Graph:
                 "per_source": st["fused"].result.per_source,
                 "chanlun": {tf: {"score": r.score, "status": r.status}
                             for tf, r in st["chanlun"].items()},
-                "mobius_score": (None if st["mobius"] is None
-                                 else _mobius_score(st["mobius"], mob_last)),
-                "mobius_status": (st["mobius"].status if st["mobius"] is not None else None),
+                "mobius_score": {tf: (None if r is None else _mobius_score(r, mob_last))
+                                 for tf, r in st["mobius"].items()},
+                "mobius_status": {tf: (r.status if r is not None else None)
+                                  for tf, r in st["mobius"].items()},
                 "indicators": {
-                    "macd": round(ind.macd_score, 3) if ind else None,
-                    "rsi": round(ind.rsi_score, 3) if ind else None,
-                    "ma": round(ind.ma_score, 3) if ind else None,
+                    "momentum_accel": round(ind.momentum_accel, 3) if ind else None,
+                    "tick_imbalance": round(ind.tick_imbalance, 3) if ind else None,
+                    "vol_pressure": round(ind.vol_pressure, 3) if ind else None,
+                    "range_compression": (round(ind.range_compression, 3) if ind else None),
                     "atr": round(ind.atr, 3) if ind and ind.atr else None,
                     "realized_vol_daily": (round(ind.realized_vol_daily, 5)
                                            if ind and ind.realized_vol_daily else None),

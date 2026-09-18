@@ -21,10 +21,22 @@ def _mobius_score(res: MobiusResult, last_price: float) -> float:
 
 @dataclass
 class IndicatorScores:
-    """经典指标分数（MACD/RSI/均线/ATR），从 15m/1h 计算。"""
-    macd_score: float = 0.0
-    rsi_score: float = 0.0
-    ma_score: float = 0.0
+    """前瞻性指标（用户要求：替换滞后的 MACD/RSI，取有前瞻含义的量价结构）。
+
+    - momentum_accel（动量加速度）：一阶动量（ROC5）的二阶差分——趋势「正在变快/变慢」。
+      MACD 只能看到趋势已经发生，加速度能领先 MACD 一拍看到趋势衰竭/启动
+    - tick_imbalance（tick 量不对称）：近 10 根上涨 bar 的 tick_volume 占比——主动买/卖
+      力量对比（订单流不平衡 OFI 的 K 线近似，参考 Cont/Kukanov/Stoikov order flow
+      imbalance 思想；MT5 无逐笔数据，tick_volume 是最近似代理）
+    - vol_pressure（量价背离压力）：价升量缩=趋势衰竭（负），价涨量增=健康（正）
+    - range_compression（波动收缩）：当前 bar 范围 / 近 14 根 ATR——收缩后常发生方向
+      选择（波动聚集 volatility clustering 的前瞻信号）
+    - atr / realized_vol_daily：保留（用于仓位与波动目标，非方向性）
+    """
+    momentum_accel: float = 0.0
+    tick_imbalance: float = 0.0
+    vol_pressure: float = 0.0
+    range_compression: float = 0.0
     atr: float | None = None
     realized_vol_daily: float | None = None
 
@@ -32,42 +44,52 @@ class IndicatorScores:
 def compute_indicators(df: pd.DataFrame) -> IndicatorScores:
     out = IndicatorScores()
     close = df["close"]
-    if len(close) < 60:
+    if len(close) < 40:
         return out
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    dif = ema12 - ema26
-    dea = dif.ewm(span=9, adjust=False).mean()
-    out.macd_score = float(np.clip((dif.iloc[-1] - dea.iloc[-1]) / max(close.iloc[-1] * 0.0005, 1e-9), -2, 2))
-    # RSI14
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - 100 / (1 + rs)
-    r = rsi.iloc[-1]
-    out.rsi_score = float(np.clip((50 - r) / 20, -2, 2))   # 超买回拉看空、超卖回抽看多
-    ma20 = close.rolling(20).mean()
-    ma60 = close.rolling(60).mean()
-    s = 0.0
-    if close.iloc[-1] > ma20.iloc[-1]:
-        s += 1
-    else:
-        s -= 1
-    if ma20.iloc[-1] > ma60.iloc[-1]:
-        s += 1
-    else:
-        s -= 1
-    out.ma_score = s
+    rets = close.pct_change()
+
+    # --- 1) 动量加速度（ROC5 的一阶差分）---
+    roc5 = close.pct_change(5)
+    accel = roc5.diff()
+    out.momentum_accel = float(np.clip(accel.iloc[-1] / max(rets.std(), 1e-9), -2, 2))
+
+    # --- 2) tick 量不对称（近 10 根）---
+    if "tick_volume" in df.columns:
+        tv = df["tick_volume"].astype(float)
+        up = (df["close"] > df["open"]).astype(float)
+        w = tv.tail(10)
+        u = float((up.tail(10) * w).sum())
+        tot = float(w.sum())
+        if tot > 0:
+            out.tick_imbalance = float(np.clip((2 * u - tot) / tot, -1, 1))
+
+    # --- 3) 量价背离压力（近 20 根价格/量的一阶关系）---
+    if "tick_volume" in df.columns:
+        tv = df["tick_volume"].astype(float)
+        pr = close.tail(20).pct_change()
+        vr = tv.tail(20).pct_change().replace([np.inf, -np.inf], np.nan)
+        corr = pr.corr(vr)
+        dp = float(pr.iloc[-1]) if len(pr) else 0.0
+        dv = float(vr.iloc[-1]) if len(vr) and not np.isnan(vr.iloc[-1]) else 0.0
+        # 价涨量缩（corr<0 或 dv<0）→ 衰竭压力；价涨量增 → 健康支撑
+        div = (1 if dp > 0 else -1 if dp < 0 else 0) * (-dv if (not np.isnan(corr) and corr < 0) else dv)
+        out.vol_pressure = float(np.clip(div, -1, 1))
+
+    # --- 4) 波动收缩 + ATR ---
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - close.shift()).abs(),
         (df["low"] - close.shift()).abs(),
     ], axis=1).max(axis=1)
-    out.atr = float(tr.rolling(14).mean().iloc[-1])
-    rets = close.pct_change().dropna()
-    if len(rets) >= 100:
-        out.realized_vol_daily = float(rets.tail(1440 if len(rets) >= 1440 else len(rets)).std() * np.sqrt(1440))
+    atr14 = tr.rolling(14).mean()
+    out.atr = float(atr14.iloc[-1])
+    rc = float(tr.iloc[-1] / max(out.atr, 1e-9))   # <1 收缩，>1 扩张
+    out.range_compression = float(np.clip(1.0 - rc, -1, 1))
+
+    # --- 日化波动率 ---
+    r = rets.dropna()
+    if len(r) >= 100:
+        out.realized_vol_daily = float(r.tail(1440 if len(r) >= 1440 else len(r)).std() * np.sqrt(1440))
     return out
 
 
@@ -102,41 +124,61 @@ class FusionEngine:
         ev.mobius = mobius_result
         sources: list[SourceView] = []
 
-        # 1) 卡尔曼（1m 顺势，8h 前瞻 IC=+0.028；持续性加权 +0.043 更强）
+        # 1) 卡尔曼（1m 短期趋势；1m 为主战周期，8h 前瞻 IC=+0.028，持续性 +0.043）
         k = self.kalman.fit(frames["1m"]["close"].to_numpy(dtype=float))
         ev.kalman = k
         kalman_persist = float(np.clip(k.trend * min(k.slope_persist / 10.0, 1.5), -3.0, 3.0))
         sources.append(SourceView("kalman_persist", kalman_persist, max(k.sigma * 0.8, 0.2)))
 
-        # 2) chanlun：15m 顺势 + 高周期反转修正（回放结论）
-        cl15 = chanlun_results.get("15m")
-        cl1h = chanlun_results.get("1h")
-        if horizon == "8h":
-            parts = []
-            if cl15 and cl15.status == "ok":
-                parts.append(0.6 * cl15.score)           # 顺势 +0.042
-            if cl1h and cl1h.status == "ok":
-                parts.append(-0.25 * cl1h.score)         # 1h 反转修正 -0.038
-            cl_score = sum(parts)
-        else:
-            cl_scores = [r.score for r in chanlun_results.values() if r.status == "ok"]
-            cl_score = float(np.mean(cl_scores)) if cl_scores else 0.0
+        # 2) chanlun 多周期：短周期权重高（1m 为主战，15m 内为大头），1d 最小（用户要求）
+        #    权重：1m×1.0  5m×0.9  15m×0.7  1h×0.3  4h×0.15  1d×0.05（1h+ 反转特性）
+        _CL_W = {"1m": 1.00, "5m": 0.90, "15m": 0.70, "1h": -0.30, "4h": -0.15, "1d": -0.05}
+        parts = []
+        for tf, w in _CL_W.items():
+            r = chanlun_results.get(tf)
+            if r is not None and r.status == "ok":
+                parts.append(w * r.score)
+        cl_score = sum(parts) / (sum(abs(w) for w in _CL_W.values()) / 3.0)
+        cl_score = float(np.clip(cl_score, -3.0, 3.0))
+        any_ok = any(r is not None and r.status == "ok" for r in chanlun_results.values())
         sources.append(SourceView("chanlun", cl_score, 0.5,
-                                  status="ok" if cl15 and cl15.status == "ok" else "unavailable"))
+                                  status="ok" if any_ok else "unavailable"))
 
-        # 3) mobius SMC
-        if mobius_result is not None and mobius_result.status != "unavailable":
-            last = float(frames["15m"]["close"].iloc[-1])
-            s = _mobius_score(mobius_result, last)
-            sources.append(SourceView("openmobius_smc", s, 0.5,
-                                      status=mobius_result.status))
-        else:
-            sources.append(SourceView("openmobius_smc", 0.0, 3.0, status="unavailable"))
+        # 3) mobius SMC 多周期：1m/5m/15m 为主，1h 辅助（限速 10 req/min，缓存下共享）
+        #    权重与 chanlun 一致的短周期优先思想
+        _MB_W = {"1m": 1.00, "5m": 0.80, "15m": 0.60, "1h": -0.25}
+        parts, statuses = [], []
+        last_1m = float(frames["1m"]["close"].iloc[-1])
+        last_15m = float(frames["15m"]["close"].iloc[-1])
+        if isinstance(mobius_result, dict):
+            for tf, w in _MB_W.items():
+                r = mobius_result.get(tf)
+                if r is not None and r.status != "unavailable":
+                    px = last_1m if tf == "1m" else last_15m
+                    parts.append(w * _mobius_score(r, px))
+                    statuses.append(r.status)
+        elif mobius_result is not None and mobius_result.status != "unavailable":
+            parts.append(_MB_W["15m"] * _mobius_score(mobius_result, last_15m))
+            statuses.append(mobius_result.status)
+        mb_score = float(np.clip(sum(parts), -3.0, 3.0)) if parts else 0.0
+        mb_status = "ok" if "ok" in statuses else ("stale" if "stale" in statuses else "unavailable")
+        sources.append(SourceView("openmobius_smc", mb_score, 0.5, status=mb_status))
 
-        # 4) 经典指标（15m，8h 前瞻 IC=+0.078 最强单源）
-        ind = compute_indicators(frames["15m"])
-        ev.indicators = ind
-        classic = 0.4 * ind.macd_score + 0.3 * ind.rsi_score + 0.3 * ind.ma_score
+        # 4) 经典指标：1m 为主（15m IC=+0.078 已验证；1m 上更贴近入场节奏）
+        ind_1m = compute_indicators(frames["1m"])
+        ind_15m = compute_indicators(frames["15m"])
+        ev.indicators = ind_15m     # ATR/波动率仍取 15m（更稳）
+
+        def _lead_score(ind: IndicatorScores) -> float:
+            """前瞻指标合成分：加速度 0.35 + tick 不对称 0.30 + 量价压力 0.20 + 收缩 0.15。
+
+            方向约定：accel>0 加速上行、tick_imbalance>0 买盘占优、vol_pressure>0 健康上涨、
+            range_compression>0 收缩蓄势（配合 accel/tick 同向才有意义，单独给弱分）。
+            """
+            return (0.35 * ind.momentum_accel + 0.30 * ind.tick_imbalance * 2.0
+                    + 0.20 * ind.vol_pressure + 0.15 * ind.range_compression * np.sign(ind.momentum_accel + 0.01))
+
+        classic = 0.5 * _lead_score(ind_1m) + 0.5 * _lead_score(ind_15m)
         sources.append(SourceView("classic_indicators", classic, 0.6))
 
         # 5) 新闻面
