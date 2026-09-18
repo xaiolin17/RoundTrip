@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 import aiohttp
 
@@ -34,6 +35,20 @@ class NewsView:
     high_risk_window: bool = False
     error: str = ""
     fetched_at: float = 0.0
+
+
+def _news_age_seconds(ts: str, now: float) -> float | None:
+    """快讯时间距今秒数；解析失败返回 None（视为不可判定，不参与高危判定）。"""
+    if not ts:
+        return None
+    try:
+        s = str(ts).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, now - dt.timestamp())
+    except Exception:
+        return None
 
 
 class Jin10Collector:
@@ -64,7 +79,15 @@ class Jin10Collector:
             elif any(k in it.title for k in _GOLD_KEYWORDS):
                 it.level = "gold"
                 it.gold_relevant = True
-        recent_hr = any(it.level == "high_risk" for it in view.items[-5:])
+        recent_hr = False
+        for it in view.items:
+            if it.level != "high_risk":
+                continue
+            # 高危窗口只认「最近 30 分钟内」的快讯（用户指定）；旧闻不锁开仓
+            age = _news_age_seconds(it.ts, now)
+            if age is None or age <= 1800:
+                recent_hr = True
+                break
         view.high_risk_window = recent_hr
         self._cache, self._cache_at = view, now
         return view
