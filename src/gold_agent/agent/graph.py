@@ -118,6 +118,9 @@ class Graph:
                                     "classic_indicators"):
                             self.fusion.bayes.record_outcome(src, pred_sign, actual)
                         self.fusion.bayes.save()
+                        # 清理已平仓位的回吐检测峰值（防旧峰值误触发/泄漏）
+                        engine._profit_peak.pop(str(d.get("position_id")), None)
+                        engine._score_peak.pop(str(d.get("position_id")), None)
                     summary["deals_closed"] = len(closed)
 
             # t2 analyze (chanlun 本地 + mobius) 并发

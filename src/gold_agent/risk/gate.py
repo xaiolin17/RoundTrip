@@ -85,8 +85,8 @@ class RiskGate:
                 decision_log({"event": "risk_reject", "kind": prop.kind,
                               "reason": rej, "win_rate": round(win_rate, 3)})
                 return Approved(ok=False, reason=rej)
-            sl_dist = CFG.risk.sl_atr_mult * atr
-            tp_dist = CFG.risk.tp_atr_mult * atr
+            sl_dist = CFG.risk.sl_atr_mult * atr * CFG.risk.market_sl_shrink
+            tp_dist = CFG.risk.tp_atr_mult * atr * CFG.risk.market_tp_shrink
             entry = prop.entry   # 市价由 executor 取当前 bid/ask
             tp = entry + tp_dist if prop.direction == "LONG" else entry - tp_dist
             sl = entry - sl_dist if prop.direction == "LONG" else entry + sl_dist
