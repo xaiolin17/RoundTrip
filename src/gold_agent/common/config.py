@@ -85,6 +85,8 @@ class RiskConfig:
     grid_atr_mult: float = _TOML.get("risk", {}).get("grid_atr_mult", 0.8)
     martin_atr_mult: float = _TOML.get("risk", {}).get("martin_atr_mult", 1.5)
     max_group_lots_mult: float = _TOML.get("risk", {}).get("max_group_lots_mult", 3.0)
+    # 用户规则：每仓固定 0.01 手，同向最多加仓次数
+    max_adds_per_position: int = _TOML.get("risk", {}).get("max_adds_per_position", 5)
     daily_loss_stop_pct: float = _TOML.get("risk", {}).get("daily_loss_stop_pct", 0.03)
     consecutive_loss_cooloff_h: float = _TOML.get("risk", {}).get("consecutive_loss_cooloff_h", 4.0)
     consecutive_loss_n: int = _TOML.get("risk", {}).get("consecutive_loss_n", 4)

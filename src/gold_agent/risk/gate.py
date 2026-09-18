@@ -41,15 +41,27 @@ class RiskGate:
     def evaluate(self, prop: Proposal, ev: FusedEvidence, account: AccountInfo,
                  positions: PositionsView, point_value_per_lot: float,
                  df_5m, atr: float | None, realized_vol: float | None,
-                 win_rate: float | None = None) -> Approved:
+                 win_rate: float | None = None,
+                 position_adds: dict | None = None) -> Approved:
         reasons = prop.reasons or []
         # ---------- 平仓/修改类直接放行（风控永不阻止离场） ----------
-        if prop.kind in ("close_position", "modify_sltp"):
+        if prop.kind == "modify_sltp":
+            # 锁盈移损：把新 SL 放进 plan（executor 消费 new_sl）
+            return Approved(ok=True, plan={"kind": "modify_sltp",
+                                           "direction": prop.direction,
+                                           "position_ticket": prop.entry,
+                                           "new_sl": prop.tp_struct})
+        if prop.kind == "hold":
+            return Approved(ok=True, plan={"kind": "hold"})
+        if prop.kind == "cancel_pending":
+            # 撤单：风控直接放行（离场动作永不被拦，与平仓同级）
+            return Approved(ok=True, plan={"kind": "cancel_pending",
+                                           "order_ticket": prop.entry,
+                                           "direction": prop.direction})
+        if prop.kind == "close_position":
             return Approved(ok=True, plan={"kind": prop.kind,
                                            "direction": prop.direction,
                                            "position_ticket": prop.entry})
-        if prop.kind == "hold":
-            return Approved(ok=True, plan={"kind": "hold"})
 
         r = ev.result
         # ---------- 熔断 ----------
@@ -91,10 +103,36 @@ class RiskGate:
             decision_log({"event": "risk_approve", "proposal": prop.__dict__, "plan": plan})
             return Approved(ok=True, plan=plan)
 
+        if prop.kind == "add_layer":
+            # 用户规则：加仓固定 0.01 手，每仓最多 5 次（风控硬顶，LLM 不可绕过）
+            # 第二道闸：阶梯条件（分数+置信均须高于上次加仓）在决策层已查，此处防绕过
+            if atr is None:
+                return Approved(ok=False, reason="no_atr")
+            position_id = str(prop.entry)   # entry 携带 position ticket
+            adds = (position_adds or {})
+            rec = adds.get(position_id) or {}
+            adds_count = int(rec.get("count", 0)) if isinstance(rec, dict) else int(rec or 0)
+            if adds_count >= CFG.risk.max_adds_per_position:
+                return Approved(ok=False, reason=f"adds capped at {CFG.risk.max_adds_per_position}")
+            my_lots = sum(p.volume for p in positions.positions if p.magic == CFG.mt5.magic)
+            if my_lots + 0.01 > CFG.max_lot:
+                return Approved(ok=False, reason=f"max_lot cap: {my_lots:.2f}+0.01 > {CFG.max_lot}")
+            plan = {"kind": "add_layer", "direction": prop.direction,
+                    "lots": 0.01, "position_ticket": prop.entry, "reasons": reasons}
+            trade_log({"event": "risk_decision", "kind": "add_layer",
+                       "direction": prop.direction, "lots": 0.01,
+                       "position": position_id, "score": round(r.score, 3),
+                       "reasons": reasons})
+            return Approved(ok=True, plan=plan)
+
         if prop.kind == "place_grid":
             # 挂单：全部走 shrink_for_pending（docs/05 §3b）
             if atr is None:
                 return Approved(ok=False, reason="no_atr")
+            # 防重复：已有本策略同向挂单 → 不再放（决策层已拦，此处是第二道闸）
+            my_pending = [o for o in positions.pending_orders if o.magic == CFG.mt5.magic]
+            if my_pending:
+                return Approved(ok=False, reason=f"pending x{len(my_pending)} already waiting")
             layers = []
             base_lots, rej = position_lots(account.equity, atr, point_value_per_lot, 0.5)
             if rej:
