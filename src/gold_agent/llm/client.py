@@ -1,6 +1,10 @@
 """runninghub LLM 客户端（docs/03）。
 
-- 主模型 glm/glm-5.3-flash（用户明确要求不用 qwen 做评审）。
+- 主模型 deepseek/deepseek-v4.1-flash，**关闭思考模式**
+  （`reasoning_effort="none"`；界面上叫 off，线上传 "off" 会 400）。
+  换模型与关思考的原因：原 glm/glm-5.3-flash 强制思考无法关闭，
+  白天 review 中位 60.7 秒超时、成功率仅 22.9%，
+  每轮因此耗时 121 秒（其中 120 秒是等超时）。
 - 并发、超时、**分离预算器**、结构化输出 JSON、降级路径。
 
 research/20 的修正
@@ -165,6 +169,10 @@ class RunningHubClient:
             "response_format": {"type": "json_object"},
             "temperature": temperature,
         }
+        # 关闭思考模式（用户要求）。界面上叫 off，线上取值是 "none"。
+        # 留空则不带该参数，保持模型默认行为。
+        if CFG.llm.reasoning_effort:
+            body["reasoning_effort"] = CFG.llm.reasoning_effort
         session = await self._ensure()
         t0 = time.time()
         try:
@@ -181,6 +189,7 @@ class RunningHubClient:
                 parsed = _extract_json(content)
                 llm_log({"event": "chat_ok", "model": self.model, "kind": kind,
                          "latency_s": round(time.time() - t0, 2),
+                         "reasoning_effort": CFG.llm.reasoning_effort or "default",
                          "user_len": len(user),
                          "parsed_keys": list(parsed) if parsed else None})
                 if parsed is None:
