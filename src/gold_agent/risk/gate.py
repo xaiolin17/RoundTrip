@@ -126,38 +126,29 @@ class RiskGate:
             return Approved(ok=True, plan=plan)
 
         if prop.kind == "place_grid":
-            # 挂单：全部走 shrink_for_pending（docs/05 §3b）
+            # 单张限价挂单（用户要求：取消网格，只挂预测的那一单）
+            # 入场价 = 原网格第 1 层的位置：收盘价回踩 0.8×ATR
             if atr is None:
                 return Approved(ok=False, reason="no_atr")
-            # 防重复：已有本策略同向挂单 → 不再放（决策层已拦，此处是第二道闸）
+            # 防重复：已有本策略挂单 → 不再放（决策层已拦，此处是第二道闸）
             my_pending = [o for o in positions.pending_orders if o.magic == CFG.mt5.magic]
             if my_pending:
                 return Approved(ok=False, reason=f"pending x{len(my_pending)} already waiting")
-            layers = []
             base_lots, rej = position_lots(account.equity, atr, point_value_per_lot, 0.5)
             if rej:
                 return Approved(ok=False, reason=f"grid base: {rej}")
-            for i in range(CFG.risk.grid_layers):
-                gap = CFG.risk.grid_atr_mult * atr * (i + 1)
-                level = prop.entry - gap if prop.direction == "LONG" else prop.entry + gap
-                lots = round(base_lots * (CFG.risk.grid_layer_decay ** i), 2)
-                if lots < 0.01:
-                    break
-                sh = shrink_for_pending(prop.direction, level, atr, df_5m,
-                                        tp_raw=prop.tp_struct)
-                layers.append({"level": sh["entry"], "lots": lots,
-                               "tp": sh["tp"], "sl": sh["sl"],
-                               "expiration_s": 4 * 3600})
-            if not layers:
-                return Approved(ok=False, reason="grid_layers_empty")
-            total = sum(l["lots"] for l in layers)
-            if total > CFG.risk.max_group_lots_mult * base_lots:
-                return Approved(ok=False, reason="grid_exposure_cap")
+            gap = CFG.risk.grid_atr_mult * atr
+            level = prop.entry - gap if prop.direction == "LONG" else prop.entry + gap
+            sh = shrink_for_pending(prop.direction, level, atr, df_5m,
+                                    tp_raw=prop.tp_struct)
+            order = {"level": sh["entry"], "lots": base_lots,
+                     "tp": sh["tp"], "sl": sh["sl"],
+                     "expiration_s": 4 * 3600}
             plan = {"kind": "place_grid", "direction": prop.direction,
-                    "grid_plan": layers, "reasons": reasons}
+                    "grid_plan": [order], "reasons": reasons}
             trade_log({"event": "risk_decision", "kind": "place_grid",
                        "direction": prop.direction, "score": round(r.score, 3),
-                       "disagreement": r.disagreement, "layers": layers,
+                       "disagreement": r.disagreement, "layers": [order],
                        "reasons": reasons})
             decision_log({"event": "risk_approve_grid", "plan": plan})
             return Approved(ok=True, plan=plan)

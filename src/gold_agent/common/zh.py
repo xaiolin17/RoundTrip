@@ -17,7 +17,7 @@ from __future__ import annotations
 #: 提案/动作类型 → 中文
 KIND_LABELS: dict[str, str] = {
     "open_market": "市价开仓",
-    "place_grid": "挂网格单",
+    "place_grid": "挂限价单",
     "add_layer": "顺势加仓",
     "close_position": "平仓",
     "modify_sltp": "移动止损",
@@ -25,7 +25,7 @@ KIND_LABELS: dict[str, str] = {
     "hold": "观望",
     "skip_round": "跳过本轮",
     "safe_hold": "安全观望",
-    "place_pending": "挂单",
+    "place_pending": "挂限价单",
 }
 
 #: 方向 → 中文

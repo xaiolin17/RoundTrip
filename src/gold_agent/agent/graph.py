@@ -114,7 +114,7 @@ class Graph:
             if self.deal_feedback is not None:
                 closed = await self.deal_feedback.poll(self.client, self._pred_orders)
                 if closed:
-                    # 鐢ㄦˉ鎺ユ壘鍥炵殑棰勬祴绗﹀彿鍋氳礉鍙舵柉 outcome 鍥炲～
+                    # 用桥接找回的预测符号做贝叶斯 outcome 回填
                     for d in closed:
                         pred_sign = self.deal_feedback.last_pred_by_position.get(
                             str(d.get("position_id")))
@@ -263,7 +263,7 @@ class Graph:
             summary["sigma"] = ev.result.sigma
             # ⚠️ action 必须**在这里**就设好。
             #    原实现只在 hold / skip_round / safe_hold 三个分支里赋值，
-            #    浜庢槸 place_grid / open_market / cancel_pending 杩欎簺
+            #    于是 place_grid / open_market / cancel_pending 这些
             #    **真正下单**的轮次没有 action → 控制台打印 `-> ?`。
             #    结果恰好是：越重要的轮次越看不出发生了什么。
             summary["action"] = prop.kind
@@ -412,7 +412,8 @@ class Graph:
                            "direction": plan.get("direction")})
             return res
         if kind == "place_grid":
-            # 逐层挂单；挂单成功后把预测符号记入 _pred_orders（成交→贝叶斯反馈桥接）
+            # 单张限价挂单（用户要求：取消网格）；挂单成功后把预测符号记入
+            # _pred_orders（成交→贝叶斯反馈桥接）
             fused = st.get("fused")
             pred_sign = 0
             if fused is not None and getattr(fused, "result", None):
@@ -424,8 +425,8 @@ class Graph:
                                 lots=layer["lots"], entry=layer["level"],
                                 tp=layer["tp"], sl=layer["sl"],
                                 expiration_s=layer["expiration_s"],
-                                comment="goldagent-grid",
-                                idempotency_key=f"grid-{layer['level']}-{int(time.time())}")
+                                comment="goldagent-pending",
+                                idempotency_key=f"pending-{layer['level']}-{int(time.time())}")
                 last = await self.executor.execute(req)
                 if not last.ok:
                     break

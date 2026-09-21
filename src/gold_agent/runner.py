@@ -95,6 +95,14 @@ def _order_lines(summary: dict) -> list[str]:
 
     if kind == "place_grid":
         layers = plan.get("grid_plan") or []
+        if len(layers) == 1:
+            # 用户要求：取消网格，只挂预测的那一单
+            ly = layers[0]
+            out.append(f"    挂限价单 {d} {ly.get('lots')}手 "
+                       f"入场 {_fmt_price(ly.get('level'))} "
+                       f"止损 {_fmt_price(ly.get('sl'))} "
+                       f"止盈 {_fmt_price(ly.get('tp'))}")
+            return out
         out.append(f"    挂单层数: {len(layers)}")
         for i, ly in enumerate(layers, 1):
             out.append(f"      第{i}层 {d} {ly.get('lots')}手 "

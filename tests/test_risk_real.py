@@ -92,6 +92,61 @@ def test_risk_gate_reject_paths():
 
 
 # ══════════════════════════════════════════════════════════════════
+# 单张限价挂单（用户要求：取消网格）
+# ══════════════════════════════════════════════════════════════════
+def test_place_grid_now_emits_single_pending_order():
+    """取消网格：`place_grid` 只产出**一张**挂单，且入场价是回踩 0.8×ATR。
+
+    实测问题：原实现按 `CFG.risk.grid_layers`（=2）挂多层，是网格行为。
+    用户要求只挂预测的那一单。
+    """
+    gate = RiskGate(CircuitBreakers(), GridState())
+    ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
+    acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
+                      margin=0, margin_level=0, leverage=2000, currency="USD")
+    views = type("V", (), {"positions": [], "pending_orders": []})()
+    atr, close = 12.339, 4350.0
+    df5 = pd.DataFrame({"high": [close] * 10, "low": [close] * 10,
+                        "close": [close] * 10})
+    res = gate.evaluate(Proposal(kind="place_grid", direction="LONG", entry=close),
+                        ev, acc, views, 0.1, df5, atr, None)
+    assert res.ok, f"应放行: {res.reason}"
+    layers = res.plan["grid_plan"]
+    assert len(layers) == 1, f"应只有一张挂单，实际 {len(layers)} 张（网格未取消）"
+    # 入场价 = 收盘价 - 0.8×ATR（做多回踩）
+    assert layers[0]["level"] == pytest.approx(close - CFG.risk.grid_atr_mult * atr, abs=0.5)
+    # 必须带止损止盈，否则控制台看不到点位
+    assert layers[0]["sl"] and layers[0]["tp"]
+
+
+def test_max_lot_allows_configured_adds():
+    """配置一致性：`max_lot` 必须容得下「基础仓 + max_adds_per_position 次加仓」。
+
+    实测事故：`.env` 的 `MAX_LOT=0.01`，而 `max_adds_per_position=5`。
+    基础仓 0.01 手 + 加仓 0.01 手 = 0.02 > 0.01 → **加仓永远被拦**，
+    "最多加仓 5 次"这条规则是死代码（实盘 21 次 risk_reject 全是 max_lot cap）。
+    """
+    need = 0.01 * (1 + CFG.risk.max_adds_per_position)
+    assert CFG.max_lot >= need - 1e-9, (
+        f"max_lot={CFG.max_lot} 容不下基础仓 0.01 + "
+        f"{CFG.risk.max_adds_per_position} 次加仓（需要 {need:.2f}）——"
+        "加仓会被 max_lot 永久拦截")
+
+
+def test_add_layer_passes_risk_gate_with_configured_max_lot():
+    """方案 A 验收：持 1 笔 0.01 手时，第 1 次加仓应能通过风控。"""
+    gate = RiskGate(CircuitBreakers(), GridState())
+    ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
+    acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
+                      margin=0, margin_level=0, leverage=2000, currency="USD")
+    pos = type("P", (), {"volume": 0.01, "magic": CFG.mt5.magic})()
+    views = type("V", (), {"positions": [pos], "pending_orders": []})()
+    res = gate.evaluate(Proposal(kind="add_layer", direction="LONG", entry=123456),
+                        ev, acc, views, 0.1, None, 5.0, None)
+    assert res.ok, f"第 1 次加仓不应被拦: {res.reason}"
+
+
+# ══════════════════════════════════════════════════════════════════
 # P2-3 Wilson 置信下界
 # ══════════════════════════════════════════════════════════════════
 def test_wilson_lower_is_conservative_for_small_samples():

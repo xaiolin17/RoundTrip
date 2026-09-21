@@ -120,9 +120,13 @@ tp_atr_mult = 2.0
 atr_tf = "1h"
 # 最长持仓时间（小时）—— 1m 短线：4 小时上限
 max_holding_h = 4.0
-# 网格层数（层距 0.8×ATR）
-grid_layers = 2
+# ---- 限价挂单（用户要求：取消网格，只挂预测的那一单）----
+# grid_atr_mult 现在只用来算**那一张**挂单的回踩距离：
+#   入场价 = 收盘价 ∓ 0.8×ATR（做多向下回踩 / 做空向上回踩）
 grid_atr_mult = 0.8
+# ⚠️ grid_layers 已不再生效（保留仅为兼容旧配置/旧状态文件）。
+#    挂单数量恒为 1 —— 见 risk/gate.py 的 place_grid 分支。
+grid_layers = 1
 # ---- P2-2 方向偏置熔断（research/16：3 笔全 LONG，结构性做多）----
 direction_bias_window = 100
 direction_bias_max = 0.85
