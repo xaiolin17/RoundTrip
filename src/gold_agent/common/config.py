@@ -45,6 +45,12 @@ class LLMConfig:
     base_url: str = os.getenv("RUNNINGHUB_BASE_URL", "https://llm.runninghub.cn/v1")
     api_key: str = os.getenv("RUNNINGHUB_API_KEY", "")
     model: str = os.getenv("RUNNINGHUB_MODEL", "glm/glm-5.3-flash")
+    #: 推理等级。界面上叫 off，**线上参数值是 "none"**（传 "off" 会 400
+    #: InvalidParameter）。实测 deepseek/deepseek-v4.1-flash：
+    #:   none -> 无 reasoning_content，completion 106 tok
+    #:   low  -> reasoning_content 1506 字符，completion 560 tok
+    #: 留空则不带该参数（保持模型默认，即开启思考）。
+    reasoning_effort: str = os.getenv("RUNNINGHUB_REASONING_EFFORT", "")
     timeout_s: float = _TOML.get("llm", {}).get("timeout_s", 60.0)
     review_timeout_s: float = _TOML.get("llm", {}).get("review_timeout_s", 60.0)
     news_timeout_s: float = _TOML.get("llm", {}).get("news_timeout_s", 30.0)
