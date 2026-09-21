@@ -96,5 +96,5 @@ class GridState:
             try:
                 return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
             except Exception as e:
-                log_warn(f"grid state load failed: {e}")
+                log_warn(f"网格状态读取失败: {e}")
         return cls()

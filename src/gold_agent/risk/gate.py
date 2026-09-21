@@ -9,7 +9,6 @@ from dataclasses import dataclass
 
 from gold_agent.common.config import CFG
 from gold_agent.common.logging_util import decision_log, trade_log
-from gold_agent.common.zh import reason_label
 from gold_agent.fusion.engine import FusedEvidence
 from gold_agent.mt5.client import AccountInfo, PositionsView
 from gold_agent.risk.grid import GridGroup, GridLayer, GridState
@@ -70,10 +69,10 @@ class RiskGate:
         reject = self.breakers.check(account.equity, margin_used,
                                      high_risk_window=False)  # news 高危由 decision 传入 flags
         if reject:
-            return Approved(ok=False, reason=f"熔断：{reject}")
+            return Approved(ok=False, reason=f"circuit: {reject}")
         # ---------- 分歧加严 ----------
         if r.disagreement:
-            reasons.append("源间分歧：手数 x0.5")
+            reasons.append("disagreement: lots x0.5")
 
         if prop.kind == "open_market":
             vol_k = volatility_k(realized_vol, None)
@@ -108,19 +107,16 @@ class RiskGate:
             # 用户规则：加仓固定 0.01 手，每仓最多 5 次（风控硬顶，LLM 不可绕过）
             # 第二道闸：阶梯条件（分数+置信均须高于上次加仓）在决策层已查，此处防绕过
             if atr is None:
-                return Approved(ok=False, reason="无 ATR 数据")
+                return Approved(ok=False, reason="no_atr")
             position_id = str(prop.entry)   # entry 携带 position ticket
             adds = (position_adds or {})
             rec = adds.get(position_id) or {}
             adds_count = int(rec.get("count", 0)) if isinstance(rec, dict) else int(rec or 0)
             if adds_count >= CFG.risk.max_adds_per_position:
-                return Approved(ok=False,
-                                reason=f"加仓次数已达上限 {CFG.risk.max_adds_per_position}")
+                return Approved(ok=False, reason=f"adds capped at {CFG.risk.max_adds_per_position}")
             my_lots = sum(p.volume for p in positions.positions if p.magic == CFG.mt5.magic)
             if my_lots + 0.01 > CFG.max_lot:
-                return Approved(
-                    ok=False,
-                    reason=f"总手数上限：现有 {my_lots:.2f}+0.01 > 上限 {CFG.max_lot}")
+                return Approved(ok=False, reason=f"max_lot cap: {my_lots:.2f}+0.01 > {CFG.max_lot}")
             plan = {"kind": "add_layer", "direction": prop.direction,
                     "lots": 0.01, "position_ticket": prop.entry, "reasons": reasons}
             trade_log({"event": "risk_decision", "kind": "add_layer",
@@ -132,16 +128,15 @@ class RiskGate:
         if prop.kind == "place_grid":
             # 挂单：全部走 shrink_for_pending（docs/05 §3b）
             if atr is None:
-                return Approved(ok=False, reason="无 ATR 数据")
+                return Approved(ok=False, reason="no_atr")
             # 防重复：已有本策略同向挂单 → 不再放（决策层已拦，此处是第二道闸）
             my_pending = [o for o in positions.pending_orders if o.magic == CFG.mt5.magic]
             if my_pending:
-                return Approved(ok=False,
-                                reason=f"已有 {len(my_pending)} 张挂单在等待成交")
+                return Approved(ok=False, reason=f"pending x{len(my_pending)} already waiting")
             layers = []
             base_lots, rej = position_lots(account.equity, atr, point_value_per_lot, 0.5)
             if rej:
-                return Approved(ok=False, reason=f"网格基准手数：{reason_label(rej)}")
+                return Approved(ok=False, reason=f"grid base: {rej}")
             for i in range(CFG.risk.grid_layers):
                 gap = CFG.risk.grid_atr_mult * atr * (i + 1)
                 level = prop.entry - gap if prop.direction == "LONG" else prop.entry + gap
@@ -154,10 +149,10 @@ class RiskGate:
                                "tp": sh["tp"], "sl": sh["sl"],
                                "expiration_s": 4 * 3600})
             if not layers:
-                return Approved(ok=False, reason="网格层数为空")
+                return Approved(ok=False, reason="grid_layers_empty")
             total = sum(l["lots"] for l in layers)
             if total > CFG.risk.max_group_lots_mult * base_lots:
-                return Approved(ok=False, reason="网格总敞口超上限")
+                return Approved(ok=False, reason="grid_exposure_cap")
             plan = {"kind": "place_grid", "direction": prop.direction,
                     "grid_plan": layers, "reasons": reasons}
             trade_log({"event": "risk_decision", "kind": "place_grid",
@@ -167,4 +162,4 @@ class RiskGate:
             decision_log({"event": "risk_approve_grid", "plan": plan})
             return Approved(ok=True, plan=plan)
 
-        return Approved(ok=False, reason=f"未处理的动作类型 {prop.kind}")
+        return Approved(ok=False, reason=f"unhandled kind {prop.kind}")

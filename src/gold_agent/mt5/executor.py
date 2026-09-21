@@ -79,7 +79,7 @@ class Executor:
                                        error=result["comment"] or f"retcode={result['retcode']}")
             return ExecutionResult(ok=False, error="retries exhausted")
         except Mt5Error as e:
-            log_error(f"executor: {e}")
+            log_error(f"执行器异常: {e}")
             return ExecutionResult(ok=False, error=str(e))
 
     def _build_request(self, plan: OrderPlan) -> dict:
