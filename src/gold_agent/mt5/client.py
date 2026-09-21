@@ -80,11 +80,37 @@ class PositionRow:
     magic: int
 
 
+def _order_direction(mt5_type) -> str:
+    """把 MT5 订单类型码映射成 LONG / SHORT。
+
+    ⚠️ 必须**穷举**映射，不能靠字符串猜。
+    实测事故：原实现 `OrderRow.type = str(o.type)` 存的是整数码（如 "2"），
+    而 `decision/machine.py` 用 `"buy" in str(type).lower()` 判方向 ——
+    `"buy" in "2"` 恒为 False，于是**所有挂单都被当成 SHORT**。
+
+    MT5 常量：
+      0 ORDER_TYPE_BUY         1 ORDER_TYPE_SELL
+      2 ORDER_TYPE_BUY_LIMIT   3 ORDER_TYPE_SELL_LIMIT
+      4 ORDER_TYPE_BUY_STOP    5 ORDER_TYPE_SELL_STOP
+      6 ORDER_TYPE_BUY_STOP_LIMIT  7 ORDER_TYPE_SELL_STOP_LIMIT
+      8 ORDER_TYPE_CLOSE_BY
+    """
+    t = int(mt5_type)
+    # 买单：BUY / BUY_LIMIT / BUY_STOP / BUY_STOP_LIMIT
+    if t in (0, 2, 4, 6):
+        return "LONG"
+    # 卖单：SELL / SELL_LIMIT / SELL_STOP / SELL_STOP_LIMIT
+    if t in (1, 3, 5, 7):
+        return "SHORT"
+    # CLOSE_BY(8) 及其它：无方向，交给上层按"未知"处理
+    return "UNKNOWN"
+
+
 @dataclass
 class OrderRow:
     ticket: int
     symbol: str
-    type: str
+    type: str          # LONG | SHORT（与 PositionRow 统一，**不是** MT5 整数码）
     volume: float
     price_open: float
     sl: float
@@ -194,6 +220,27 @@ class MT5Client:
         tick = await loop.run_in_executor(self._io_pool, self._tick_sync, sym)
         return self._validate(frames, tick)
 
+    def get_ohlcv_sync(self, bars_per_tf: int | None = None) -> OHLCVBundle | None:
+        """同步拉取全部周期 —— 仅供**启动预热**使用（在事件循环启动前调用）。
+
+        预热需要比 `bars_per_tf` 更长的历史（默认 300 轮 + min_periods），
+        所以这里会按 `prime_steps + min_periods + 50` 向上取整请求更多 1m bar。
+        失败返回 None（预热失败不应阻止启动，只是会晚几小时才开仓）。
+        """
+        try:
+            if not mt5.initialize():
+                return None
+            n = bars_per_tf or max(
+                CFG.mt5.bars_per_tf,
+                CFG.fusion.prime_steps + CFG.fusion.norm_min_periods + 50)
+            sym = CFG.mt5.symbol
+            frames = {tf: self._copy_rates_sync(sym, code, n)
+                      for tf, code in TF_MAP.items()}
+            tick = self._tick_sync(sym)
+            return self._validate(frames, tick)
+        except Exception:
+            return None
+
     def _copy_rates_sync(self, symbol: str, tf_code: int, n: int) -> pd.DataFrame | None:
         rates = mt5.copy_rates_from_pos(symbol, tf_code, 0, n)
         if rates is None or len(rates) == 0:
@@ -250,8 +297,10 @@ class MT5Client:
         for o in mt5.orders_get(symbol=sym) or []:
             orders.append(OrderRow(
                 ticket=o.ticket, symbol=o.symbol,
-                type=str(o.type), volume=o.volume_current, price_open=o.price_open,
-                sl=o.sl, tp=o.tp, time_setup=o.time_setup, comment=o.comment or "", magic=o.magic))
+                type=_order_direction(o.type), volume=o.volume_current,
+                price_open=o.price_open,
+                sl=o.sl, tp=o.tp, time_setup=o.time_setup, comment=o.comment or "",
+                magic=o.magic))
         return PositionsView(positions=positions, pending_orders=orders)
 
     async def get_account(self) -> AccountInfo:

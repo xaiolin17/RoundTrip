@@ -1,46 +1,157 @@
-# ---- Secrets ----
+# ============================================================
+#  GoldAgent / RoundTrip  .gitignore
+#
+#  原则：只保留「别人 clone 后需要、且无法自动重建」的文件。
+#  体积大 / 可重新生成 / 第三方 / 运行时状态 / 含密钥 → 不入库。
+#
+#  ⚠️ git 不支持行尾注释：# 之后的全部内容会被当成 pattern 的一部分。
+#  目录结构与引用关系见 docs/compliance/README.md
+# ============================================================
+
+# ---- 密钥（绝对不能入库）----
 .env
 .env.*
 !.env.example
 *_token.txt
 *.key
+*.pem
 
-# ---- Runtime data (cache/logs are local-only) ----
-data/cache/*
-logs/*
-!data/cache/.gitkeep
-!logs/.gitkeep
-
-# ---- Python ----
+# ---- Python 字节码 / 构建产物 ----
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
 *.egg-info/
 .eggs/
 build/
 dist/
 .venv/
 venv/
+env/
+
+# ---- 测试 / 类型检查 / 覆盖率缓存 ----
 .pytest_cache/
+.pytest_tmp/
 .mypy_cache/
 .ruff_cache/
+.tox/
 .coverage
+.coverage.*
 htmlcov/
+coverage.xml
+junit*.xml
 
-# ---- Parquet / large data ----
-*.parquet
-*.h5
-*.npz
-
-# ---- Vendor skill runtime artifacts ----
-vendor/skills/openmobius-skill/knowledge_base/embedding_seed_v2/*.npz
-vendor/skills/chanlun-trading-system/.uv-cache/
-
-# ---- IDE / OS ----
+# ---- IDE / 操作系统 ----
 .idea/
 .vscode/
 *.swp
+*~
 Thumbs.db
+Desktop.ini
 .DS_Store
 
-# ---- MT5 terminal logs ----
+# ============================================================
+#  运行时状态
+#  这些文件每次运行都会变（入库只会产生无意义 diff），
+#  且都能由代码自动重建 —— 删掉不影响启动。
+# ============================================================
+data/cache/*
+!data/cache/.gitkeep
+
+# 归一化器 / 基线 / 波动分位 / 反馈学习 / 熔断 / 网格 / 轮号 / 试验族
+# 全部是累积状态：bayes_state, breakers, deals_cursor, grid_state,
+# position_adds, pred_orders, runner_state, score_baseline,
+# source_normalizer, trade_stats, trials.csv, vol_percentile
+data/*.json
+data/*.csv
+data/runner.lock
+data/*.log
+
+# data/source_ir.json 是**生产权重的来源**（research/21 产出），必须入库
+!data/source_ir.json
+
+# ---- 日志（本地保留，不入库）----
+logs/*
+!logs/.gitkeep
+
+# ---- 行情数据（体积大，可用 scripts/fetch_history*.py 重新抓取）----
+*.parquet
+*.h5
+*.hdf5
+*.npz
+*.feather
+*.pkl
+
+# ============================================================
+#  第三方 vendor skill
+#
+#  运行时**只**需要 vendor/skills/chanlun-trading-system/src ——
+#  chanlun_adapter.py 把它注入 sys.path 后 import chanlun_visual.engine。
+#
+#  openmobius 走 HTTP（CFG.mobius.base_url = api.mobiusquant.ai），
+#  **完全不读本地磁盘**：实测把整个 openmobius-skill 移走后
+#  108 个测试全绿、Graph.build() 正常、权重表不变。
+# ============================================================
+
+# openmobius-skill 整体不参与运行（116.7 MB / 2089 文件）。
+# 其中 knowledge_base 占 108 MB（2015 个 json + 16 个 npz 向量），
+# 是该 skill 自身的检索语料，由它的服务端使用，与本交易进程无关。
+vendor/skills/openmobius-skill/
+
+# chanlun-trading-system：只保留 src/ 运行时代码
+vendor/skills/chanlun-trading-system/agents/
+vendor/skills/chanlun-trading-system/docs/
+vendor/skills/chanlun-trading-system/references/
+vendor/skills/chanlun-trading-system/tests/
+vendor/skills/chanlun-trading-system/tools/
+vendor/skills/chanlun-trading-system/ui/
+vendor/skills/chanlun-trading-system/.github/
+vendor/skills/chanlun-trading-system/.uv-cache/
+vendor/skills/chanlun-trading-system/uv.lock
+vendor/skills/chanlun-trading-system/package-lock.json
+
+# 前端工作台静态资源（只有 api.py / cli.py 用；我们只 import engine）
+vendor/skills/chanlun-trading-system/src/chanlun_visual/static/
+
+# 第三方依赖目录 / 构建产物的通用规则
+vendor/**/node_modules/
+vendor/**/.venv/
+vendor/**/dist/
+vendor/**/build/
+
+# ============================================================
+#  研究 / 合规证据（体积大，本地保留）
+#  保留 .py 脚本与 .md 结论（可复现、体积极小），
+#  其余抓取来的原文 / PDF / 数据不入库。
+#  目录结构与引用关系见 docs/compliance/README.md
+# ============================================================
+_reg/
+_research/
+pdf/
+
+sources/*
+!sources/fetch.ps1
+!sources/list1.txt
+
+research/raw/
+research/pdf/
+research/model_cache/
+research/**/*.pdf
+research/**/*.html
+research/**/*.htm
+research/**/*.xml
+research/**/*.txt
+research/**/*.log
+research/**/*.parquet
+research/**/*.bin
+research/**/*.csv
+research/_*_run.log
+
+# ---- 临时调试残渣（根目录 `_xxx.py` / `_xxx.txt` / 二进制转储）----
+/_*.py
+/_*.txt
+/_*.bin
+/_*.json
+
+# ---- MT5 终端日志 ----
 *.mt5.log
