@@ -48,8 +48,15 @@ class LLMConfig:
     timeout_s: float = _TOML.get("llm", {}).get("timeout_s", 60.0)
     review_timeout_s: float = _TOML.get("llm", {}).get("review_timeout_s", 60.0)
     news_timeout_s: float = _TOML.get("llm", {}).get("news_timeout_s", 30.0)
+    #: 评审（LLM-A）每小时预算。与新闻面分开计账——research/20 显示
+    #: 两者共用 24 次/小时的池子时，news 会把 review 的额度吃光。
     per_hour_budget: int = _TOML.get("llm", {}).get("per_hour_budget", 24)
-    min_interval_min: float = _TOML.get("llm", {}).get("min_interval_min", 15.0)
+    #: 新闻面（LLM-B）每小时预算，独立于 review。
+    news_per_hour_budget: int = _TOML.get("llm", {}).get("news_per_hour_budget", 24)
+    #: 评审最小间隔（分钟）。1h 决策周期下应为 0（每轮都评审）。
+    min_interval_min: float = _TOML.get("llm", {}).get("min_interval_min", 0.0)
+    #: review 失败重试次数（换温度 0）
+    retry: int = _TOML.get("llm", {}).get("retry", 1)
 
 
 @dataclass
@@ -72,6 +79,19 @@ class FusionConfig:
     hurst_window: int = _TOML.get("fusion", {}).get("hurst_window", 500)
     bayes_window: int = _TOML.get("fusion", {}).get("bayes_window", 300)
     sigma_max: float = _TOML.get("fusion", {}).get("sigma_max", 0.8)
+    # ---- P0-1 源去均值（滚动 z-score）----
+    norm_window: int = _TOML.get("fusion", {}).get("norm_window", 1440)
+    norm_min_periods: int = _TOML.get("fusion", {}).get("norm_min_periods", 240)
+    # ---- P1-2 波动分位 ----
+    vol_pct_window: int = _TOML.get("fusion", {}).get("vol_pct_window", 1440)
+    vol_pct_min_periods: int = _TOML.get("fusion", {}).get("vol_pct_min_periods", 240)
+    # ---- P1-3 融合分滚动基线 ----
+    baseline_window: int = _TOML.get("fusion", {}).get("baseline_window", 1440)
+    baseline_min_periods: int = _TOML.get("fusion", {}).get("baseline_min_periods", 240)
+    # ---- 启动预热（1m 短线：不预热则前 min_periods 轮永不开仓）----
+    # prime_steps = 回放多少轮；prime_step_bars = 每轮跨多少根 1m
+    prime_steps: int = _TOML.get("fusion", {}).get("prime_steps", 300)
+    prime_step_bars: int = _TOML.get("fusion", {}).get("prime_step_bars", 1)
 
 
 @dataclass
@@ -80,6 +100,8 @@ class RiskConfig:
     target_vol_daily: float = _TOML.get("risk", {}).get("target_vol_daily", 0.01)
     sl_atr_mult: float = _TOML.get("risk", {}).get("sl_atr_mult", 1.2)
     tp_atr_mult: float = _TOML.get("risk", {}).get("tp_atr_mult", 2.0)
+    # 止损用哪个周期的 ATR（research/23：1m 短线必须用高级别，否则成本吃掉止损）
+    atr_tf: str = _TOML.get("risk", {}).get("atr_tf", "1h")
     grid_layers: int = _TOML.get("risk", {}).get("grid_layers", 3)
     grid_layer_decay: float = _TOML.get("risk", {}).get("grid_layer_decay", 0.7)
     grid_atr_mult: float = _TOML.get("risk", {}).get("grid_atr_mult", 0.8)
@@ -98,6 +120,15 @@ class RiskConfig:
     margin_use_cap: float = _TOML.get("risk", {}).get("margin_use_cap", 0.60)
     news_blackout_min: int = _TOML.get("risk", {}).get("news_blackout_min", 15)
     max_holding_h: float = _TOML.get("risk", {}).get("max_holding_h", 48.0)
+    # ---- P2-2 方向偏置熔断：近 N 笔同向占比超阈值 → 停机复查 ----
+    direction_bias_window: int = _TOML.get("risk", {}).get("direction_bias_window", 100)
+    direction_bias_max: float = _TOML.get("risk", {}).get("direction_bias_max", 0.85)
+    #: 生效所需的最少样本（样本不足时该熔断不触发）
+    direction_bias_min_samples: int = _TOML.get("risk", {}).get(
+        "direction_bias_min_samples", 20)
+    # ---- P2-3 交割单样本量门槛 ----
+    #: 胜率参与 Kelly 计算所需的最少交割单样本
+    min_deals_for_kelly: int = _TOML.get("risk", {}).get("min_deals_for_kelly", 10)
 
 
 @dataclass
@@ -110,6 +141,14 @@ class DecisionConfig:
     reserve_drop_score: float = _TOML.get("decision", {}).get("reserve_drop_score", 0.6)
     loop_interval_s: float = _TOML.get("decision", {}).get("loop_interval_s", 60.0)
     disagreement_lot_mult: float = _TOML.get("decision", {}).get("disagreement_lot_mult", 0.5)
+    # ---- P1-2 波动 regime 闸：只在 σ 位于滚动高分位时开仓 ----
+    vol_pct_min: float = _TOML.get("decision", {}).get("vol_pct_min", 0.0)
+    # ---- LLM 一致性要求：aligned 时的最低 confidence ----
+    llm_align_conf: float = _TOML.get("decision", {}).get("llm_align_conf", 0.6)
+    #: 持仓时 LLM 反向 verdict 触发平仓的 confidence 门槛
+    llm_adverse_conf: float = _TOML.get("decision", {}).get("llm_adverse_conf", 0.7)
+    #: 未对齐 LLM 时是否仍允许挂网格（False = 直接 hold，等 LLM 明确表态）
+    allow_grid_without_llm: bool = _TOML.get("decision", {}).get("allow_grid_without_llm", True)
 
 
 @dataclass

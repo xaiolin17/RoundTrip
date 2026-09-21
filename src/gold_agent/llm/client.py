@@ -1,8 +1,18 @@
 """runninghub LLM 客户端（docs/03）。
 
-- 不使用 qwen（用户明确要求）；主模型 glm/glm-5.3-flash。
-- 并发、超时、预算器、结构化输出 JSON、降级路径。
-- 新闻面不再依赖 webSearch 模型；由金十快讯直接给出消息面数据。
+- 主模型 glm/glm-5.3-flash（用户明确要求不用 qwen 做评审）。
+- 并发、超时、**分离预算器**、结构化输出 JSON、降级路径。
+
+research/20 的修正
+------------------
+旧版 review 与 news 共用一个 24 次/小时的预算池，news 每轮都可能触发 →
+把 review 的额度吃光（budget_exhausted 150 次），review 覆盖率只剩 4.3%。
+本版按 `kind` 分离预算：`review` 与 `news` 各自独立计账。
+
+重试策略（docs/03 §3）
+----------------------
+失败/解析失败 → 重试 `CFG.llm.retry` 次（温度 0）→ 仍失败 → 返回 None，
+调用方降级（该轮 LLM 分量记 0，本地融合照常决策）。
 """
 from __future__ import annotations
 
@@ -22,9 +32,21 @@ REVIEW_SCHEMA = {
         "verdict": {"type": "string", "enum": ["bullish", "bearish", "neutral"]},
         "confidence": {"type": "number"},
         "rationale": {"type": "string"},
+        # skill 契约：LLM 必须走完两个 skill 的检查项
+        "skill_audit": {
+            "type": "object",
+            "properties": {
+                "chanlun_mode": {"type": "string"},
+                "chanlun_gates": {"type": "object"},
+                "smc_steps": {"type": "object"},
+                "probability_tier": {"type": "string"},
+                "caveats_disclosed": {"type": "boolean"},
+            },
+        },
         "key_levels": {"type": "array", "items": {"type": "number"}},
         "risk_flags": {"type": "array", "items": {"type": "string"}},
         "invalidation": {"type": "string"},
+        "next_observation": {"type": "string"},
     },
     "required": ["verdict", "confidence", "rationale"],
 }
@@ -46,6 +68,8 @@ class LLMError(RuntimeError):
 
 
 class Budget:
+    """按 kind 分离的滚动小时预算器（research/20）。"""
+
     def __init__(self, per_hour: int) -> None:
         self.per_hour = per_hour
         self._calls: deque[float] = deque()
@@ -59,6 +83,13 @@ class Budget:
     def record(self) -> None:
         self._calls.append(time.time())
 
+    @property
+    def used(self) -> int:
+        now = time.time()
+        while self._calls and now - self._calls[0] > 3600:
+            self._calls.popleft()
+        return len(self._calls)
+
 
 class RunningHubClient:
     def __init__(self) -> None:
@@ -68,8 +99,15 @@ class RunningHubClient:
         self.base_url = cfg.base_url.rstrip("/")
         self.model = cfg.model
         self.api_key = cfg.api_key
-        self.budget = Budget(cfg.per_hour_budget)
+        # 分离预算：review 与 news 各自独立，互不挤占
+        self.budgets: dict[str, Budget] = {
+            "review": Budget(cfg.per_hour_budget),
+            "news": Budget(cfg.news_per_hour_budget),
+        }
         self._session: aiohttp.ClientSession | None = None
+
+    def _budget(self, kind: str) -> Budget:
+        return self.budgets.setdefault(kind, Budget(CFG.llm.per_hour_budget))
 
     async def _ensure(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -84,12 +122,40 @@ class RunningHubClient:
             await self._session.close()
 
     async def chat_json(self, system: str, user: str, schema: dict,
-                        timeout_s: float | None = None) -> dict | None:
-        """结构化输出；失败返回 None（调用方降级），不抛出。"""
-        if not self.budget.allow():
-            llm_log({"event": "budget_exhausted", "model": self.model})
+                        timeout_s: float | None = None,
+                        kind: str = "review") -> dict | None:
+        """结构化输出；失败返回 None（调用方降级），不抛出。
+
+        kind: "review" | "news" —— 决定使用哪个预算池。
+        """
+        budget = self._budget(kind)
+        if not budget.allow():
+            llm_log({"event": "budget_exhausted", "model": self.model, "kind": kind,
+                     "used": budget.used, "cap": budget.per_hour})
             return None
-        self.budget.record()
+        budget.record()
+
+        attempts = max(1, int(CFG.llm.retry) + 1)
+        last_err = ""
+        for attempt in range(attempts):
+            # 重试时换温度 0（docs/03 §3）
+            temp = 0.2 if attempt == 0 else 0.0
+            parsed, err = await self._one_call(system, user, schema, timeout_s, temp, kind)
+            if parsed is not None:
+                # 最小校验：required 字段必须存在
+                missing = [r for r in schema.get("required", []) if r not in parsed]
+                if not missing:
+                    return parsed
+                last_err = f"missing required fields: {missing}"
+                llm_log({"event": "schema_incomplete", "kind": kind, "missing": missing})
+            else:
+                last_err = err
+        llm_log({"event": "chat_failed_after_retry", "kind": kind, "error": last_err})
+        return None
+
+    async def _one_call(self, system: str, user: str, schema: dict,
+                        timeout_s: float | None, temperature: float,
+                        kind: str) -> tuple[dict | None, str]:
         body = {
             "model": self.model,
             "messages": [
@@ -97,35 +163,34 @@ class RunningHubClient:
                 {"role": "user", "content": user},
             ],
             "response_format": {"type": "json_object"},
-            "temperature": 0.2,
+            "temperature": temperature,
         }
         session = await self._ensure()
         t0 = time.time()
         try:
-            async with session.post(f"{self.base_url}/chat/completions", json=body,
-                                    timeout=aiohttp.ClientTimeout(total=timeout_s or CFG.llm.timeout_s)) as resp:
+            async with session.post(
+                    f"{self.base_url}/chat/completions", json=body,
+                    timeout=aiohttp.ClientTimeout(total=timeout_s or CFG.llm.timeout_s)) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    llm_log({"event": "http_error", "status": resp.status, "body": text[:500]})
-                    return None
+                    llm_log({"event": "http_error", "status": resp.status,
+                             "kind": kind, "body": text[:500]})
+                    return None, f"http {resp.status}"
                 data = await resp.json()
                 content = data["choices"][0]["message"]["content"]
                 parsed = _extract_json(content)
-                llm_log({"event": "chat_ok", "model": self.model,
+                llm_log({"event": "chat_ok", "model": self.model, "kind": kind,
                          "latency_s": round(time.time() - t0, 2),
-                         "user_len": len(user), "parsed_keys": list(parsed) if parsed else None})
+                         "user_len": len(user),
+                         "parsed_keys": list(parsed) if parsed else None})
                 if parsed is None:
-                    return None
-                # 最小校验
-                for req in schema.get("required", []):
-                    if req not in parsed:
-                        return None
-                return parsed
+                    return None, "json_parse_failed"
+                return parsed, ""
         except Exception as e:
             ename = type(e).__name__
-            llm_log({"event": "chat_error", "error_type": ename,
+            llm_log({"event": "chat_error", "kind": kind, "error_type": ename,
                      "error": str(e) or ename, "latency_s": round(time.time() - t0, 2)})
-            return None
+            return None, f"{ename}: {e}"
 
 
 def _extract_json(content: str) -> dict | None:

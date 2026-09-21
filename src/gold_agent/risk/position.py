@@ -15,13 +15,22 @@ from gold_agent.common.logging_util import log_warn
 
 @dataclass
 class CircuitBreakers:
-    """硬风控熔断（不可被 LLM/状态机绕过，docs/05 §5）。"""
+    """硬风控熔断（不可被 LLM/状态机绕过，docs/05 §5）。
+
+    P2-2：新增「方向偏置」熔断。research/16 显示系统 3 笔交割单全为 LONG、
+    融合分 80.2% 为正——**结构性做多**。近 N 笔同向占比过高即停机复查，
+    因为那说明系统不是在择时，而是在单边押注方向。
+    """
     consecutive_losses: int = 0
     cooloff_until: float = 0.0
     day_pnl: float = 0.0
     day_key: str = ""
     peak_equity: float = 0.0
     martin_disabled_today: bool = False
+    #: 近期平仓方向序列（1=LONG, -1=SHORT），用于方向偏置检测
+    recent_directions: list = field(default_factory=list)
+    direction_bias_halt: bool = False
+    direction_bias_reason: str = ""
     extra: dict = field(default_factory=dict)
 
     def check(self, account_equity: float, margin_used: float,
@@ -35,6 +44,8 @@ class CircuitBreakers:
             self.martin_disabled_today = False
         elif not self.day_key:
             self.day_key = today
+        if self.direction_bias_halt:
+            return f"direction_bias_halt: {self.direction_bias_reason}"
         if now < self.cooloff_until:
             return f"cooloff_until {time.strftime('%H:%M', time.localtime(self.cooloff_until))}"
         if self.consecutive_losses >= CFG.risk.consecutive_loss_n:
@@ -53,6 +64,50 @@ class CircuitBreakers:
             return "friday_late"
         return None
 
+    # ---------- P2-2 方向偏置监控 ----------
+    def record_direction(self, direction: str | int | None) -> None:
+        """记录一笔平仓的方向（LONG/SHORT 或 1/-1）。"""
+        if direction is None:
+            return
+        if isinstance(direction, str):
+            d = 1 if direction.upper() in ("LONG", "BUY") else (
+                -1 if direction.upper() in ("SHORT", "SELL") else 0)
+        else:
+            d = int(direction)
+        if d == 0:
+            return
+        self.recent_directions.append(d)
+        win = max(int(CFG.risk.direction_bias_window), 2)
+        if len(self.recent_directions) > win:
+            del self.recent_directions[: len(self.recent_directions) - win]
+        self._check_direction_bias()
+
+    def _check_direction_bias(self) -> None:
+        n = len(self.recent_directions)
+        if n < max(int(CFG.risk.direction_bias_min_samples), 2):
+            return
+        longs = sum(1 for d in self.recent_directions if d > 0)
+        ratio = max(longs, n - longs) / n
+        if ratio > CFG.risk.direction_bias_max:
+            side = "LONG" if longs > n - longs else "SHORT"
+            self.direction_bias_halt = True
+            self.direction_bias_reason = (
+                f"{n} 笔中 {ratio:.0%} 为 {side}（阈值 {CFG.risk.direction_bias_max:.0%}）")
+
+    def clear_direction_bias(self) -> None:
+        """人工复查后解除偏置停机。"""
+        self.direction_bias_halt = False
+        self.direction_bias_reason = ""
+        self.recent_directions = []
+
+    @property
+    def direction_bias_ratio(self) -> float:
+        n = len(self.recent_directions)
+        if n == 0:
+            return 0.0
+        longs = sum(1 for d in self.recent_directions if d > 0)
+        return max(longs, n - longs) / n
+
     def deleverage_k(self, account_equity: float) -> float:
         dd = (self.peak_equity - account_equity) / max(self.peak_equity, 1e-9) if self.peak_equity else 0.0
         if dd >= CFG.risk.max_drawdown_halt_pct:
@@ -61,7 +116,8 @@ class CircuitBreakers:
             return 0.5
         return 1.0
 
-    def on_trade_closed(self, pnl: float, equity: float) -> None:
+    def on_trade_closed(self, pnl: float, equity: float,
+                        direction: str | int | None = None) -> None:
         today = time.strftime("%Y-%m-%d")
         if self.day_key and self.day_key != today:
             self.day_key = today
@@ -77,6 +133,7 @@ class CircuitBreakers:
         else:
             self.consecutive_losses = 0
         self.peak_equity = max(self.peak_equity, equity)
+        self.record_direction(direction)
 
     # ---------- 持久化 ----------
     def to_dict(self) -> dict:
@@ -111,6 +168,38 @@ def half_kelly(p: float, b: float) -> float:
     return max(0.0, f) * 0.5
 
 
+def wilson_lower(wins: int, n: int, z: float = 1.96) -> float:
+    """Wilson score 置信下界（P2-3）。
+
+    为什么不用点估计：3 笔 1 胜的胜率点估计是 0.333，看起来"还行"；
+    但 3 笔样本的 95% 置信区间是 [6%, 79%] —— 它不能支持任何结论。
+    Wilson 下界给 0.061，仓位会自动缩到最小。
+
+    research/18 §P2-3：`deal_feedback.current_win_rate()` 在样本 < 10 时
+    返回 0.5 冷启动，但 **3 笔就参与 Kelly 计算是危险的**。
+    """
+    if n <= 0:
+        return 0.0
+    ph = wins / n
+    d = 1 + z * z / n
+    c = ph + z * z / (2 * n)
+    r = z * math.sqrt(max(ph * (1 - ph) / n + z * z / (4 * n * n), 0.0))
+    return max(0.0, (c - r) / d)
+
+
+def conservative_win_rate(wins: int, n: int, fallback: float = 0.5,
+                          min_samples: int | None = None) -> float:
+    """用于仓位计算的保守胜率：Wilson 下界 + 样本量门槛（P2-3）。
+
+    样本 < min_samples 时返回 fallback（冷启动），因为此时任何估计都不可信；
+    样本足够时返回 Wilson 下界（而非点估计），使小样本自动缩仓。
+    """
+    thr = CFG.risk.min_deals_for_kelly if min_samples is None else min_samples
+    if n < max(int(thr), 1):
+        return fallback
+    return wilson_lower(wins, n)
+
+
 def position_lots(equity: float, atr: float, point_value_per_lot: float,
                   win_rate: float, vol_k: float = 1.0,
                   volume_min: float = 0.01, volume_step: float = 0.01,
@@ -120,7 +209,7 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     返回 (lots, reject_reason)。
     """
     if atr is None or atr <= 0:
-        return 0.0, "no_atr"
+        return 0.0, "无 ATR 数据"
     risk_usd = equity * CFG.risk.risk_pct
     # Half-Kelly 上限
     b = CFG.risk.tp_atr_mult / CFG.risk.sl_atr_mult
@@ -132,12 +221,12 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     sl_points = CFG.risk.sl_atr_mult * atr / 0.001      # XAUUSDm point=0.001
     per_lot_risk = sl_points * point_value_per_lot
     if per_lot_risk <= 0:
-        return 0.0, "bad_point_value"
+        return 0.0, "点值无效"
     raw_lots = risk_usd / per_lot_risk
     lots = math.floor(raw_lots / volume_step) * volume_step
     lots = round(lots, 2)
     if lots < volume_min:
-        return 0.0, "risk_budget_below_min_lot"
+        return 0.0, "风险预算不足最小手数"
     lots = min(lots, volume_max, CFG.max_lot if CFG.trade_mode == "live" else volume_max)
     return lots, None
 

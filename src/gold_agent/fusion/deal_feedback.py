@@ -19,7 +19,37 @@ from pathlib import Path
 from gold_agent.common.config import CFG
 from gold_agent.common.logging_util import log_info
 from gold_agent.fusion.bayes import BayesianPool
-from gold_agent.risk.position import CircuitBreakers
+from gold_agent.risk.position import CircuitBreakers, wilson_lower
+
+
+def _deal_direction(d: dict) -> int | None:
+    """从交割单推断方向（1=LONG, -1=SHORT）。用于 P2-2 方向偏置监控。
+
+    MT5 deal 的 `type` 字段：0=buy, 1=sell。平仓 deal 的 type 与持仓方向相反，
+    因此优先用显式的 `direction`/`pos_type` 字段，退回用 `type` 反推。
+    """
+    for key in ("direction", "pos_type", "position_type"):
+        v = d.get(key)
+        if isinstance(v, str):
+            u = v.upper()
+            if u in ("LONG", "BUY", "0"):
+                return 1
+            if u in ("SHORT", "SELL", "1"):
+                return -1
+        elif isinstance(v, int):
+            return 1 if v == 0 else -1
+    t = d.get("type")
+    if t is None:
+        return None
+    # 平仓 deal：type=1(sell) 意味着原本是 LONG，反之亦然
+    if isinstance(t, int):
+        return 1 if t == 1 else -1
+    u = str(t).upper()
+    if u in ("SELL", "1"):
+        return 1
+    if u in ("BUY", "0"):
+        return -1
+    return None
 
 
 @dataclass
@@ -61,6 +91,7 @@ class DealFeedback:
         self.stats = TradeStats()
         self.history: list[dict] = []
         self.cursor = 0.0
+        self.last_pred_by_position: dict[str, int | None] = {}
         self._load()
 
     # ---------- 持久化 ----------
@@ -88,8 +119,12 @@ class DealFeedback:
         self.cursor_path.write_text(json.dumps({"cursor": self.cursor}), encoding="utf-8")
 
     # ---------- 主流程 ----------
-    async def poll(self, client) -> list[dict]:
-        """返回本轮新发现的平仓 deal 列表；内部完成全部更新与持久化。"""
+    async def poll(self, client, pred_orders: dict | None = None) -> list[dict]:
+        """返回本轮新发现的平仓 deal 列表；内部完成全部更新与持久化。
+
+        pred_orders: {order_id_str: predicted_sign} 挂单→成交桥接（graph 维护）。
+        网格限价成交的仓位没有 open_market 记录，必须经 order_id 桥接找回预测符号。
+        """
         try:
             deals = await client.get_deals(max(self.cursor, time.time() - 7 * 86400))
         except Exception as e:
@@ -112,11 +147,17 @@ class DealFeedback:
                 self.stats.gross_loss += pnl
             rec = {**d, "pnl": round(pnl, 2), "ts": time.time()}
             self.history.append(rec)
-            # 熔断器更新
+            # 熔断器更新（P2-2：同时记录方向，供方向偏置监控）
             eq = getattr(self.breakers, "peak_equity", 0.0) or 0.0
-            self.breakers.on_trade_closed(pnl, max(eq, 10000.0))
-            # 贝叶斯源反馈：predicted_sign 来自最近一轮融合分符号（存于 rec 注释流）
-            # 简化：以盈亏方向作为 actual，predicted_sign 由 graph 注入 pending 队列
+            direction = _deal_direction(d)
+            self.breakers.on_trade_closed(pnl, max(eq, 10000.0), direction=direction)
+            rec["direction"] = direction
+            # 预测符号：优先 order 桥接（网格单），其次 position 桥（市价单，由 graph 注入 rec["pred"]）
+            pred = d.get("pred")
+            if pred is None and pred_orders:
+                pred = pred_orders.pop(str(d.get("order")), None)
+            rec["pred_sign"] = pred
+            self.last_pred_by_position[str(d.get("position_id"))] = pred
         self.cursor = max(d["time"] for d in new)
         self._save()
         log_info(f"deal_feedback: {len(new)} closed trades, stats={self.stats.to_dict()}")
@@ -124,7 +165,20 @@ class DealFeedback:
 
     # ---------- 胜率反馈给仓位 ----------
     def current_win_rate(self, fallback: float = 0.5) -> float:
-        """供 risk gate 使用：交割单胜率（样本≥10 才生效，否则 fallback）。"""
-        if self.stats.total >= 10:
-            return self.stats.win_rate
+        """供 risk gate 使用（P2-3）。
+
+        样本 < `risk.min_deals_for_kelly`（默认 10）→ fallback 冷启动；
+        样本足够 → **Wilson 置信下界**而非点估计。3 笔 1 胜的点估计是 0.333，
+        Wilson 下界只有 0.061，仓位会自动缩到最小。
+        """
+        if self.stats.total >= CFG.risk.min_deals_for_kelly:
+            return wilson_lower(self.stats.wins, self.stats.total)
         return fallback
+
+    def win_rate_point(self) -> float:
+        """点估计（仅用于展示/日志，不用于仓位）。"""
+        return self.stats.win_rate
+
+    def win_rate_wilson(self) -> float:
+        """Wilson 下界（样本不足时仍给出数值，供审计）。"""
+        return wilson_lower(self.stats.wins, self.stats.total)

@@ -56,3 +56,35 @@ class KalmanTrend:
         return KalmanOutput(trend=trend, slope_raw=float(slopes[-1]),
                             slope_persist=int(min(persist, 999)), sigma=min(sigma, 3.0),
                             level=float(kf.x[0]))
+
+    def fit_series(self, closes: np.ndarray) -> np.ndarray:
+        """单遍滤波，返回**逐点**标准化 trend 序列（无前视，O(n)）。
+
+        为什么需要它：`research/21_source_ir.py` 要为每个 bar 取一次源分。
+        若逐点调用 `fit(closes[:i+1])`，总复杂度是 O(n²)（60000 根要跑几十分钟）。
+        本方法一遍滤波即可得到每个时点的 trend —— 且**天然无前视**，
+        因为 t 时刻的滤波状态只由 closes[:t+1] 决定。
+
+        返回与 closes 等长的数组；预热期（<30 根）填 0。
+        """
+        n = len(closes)
+        out = np.zeros(n, dtype=float)
+        if n < 30:
+            return out
+        kf = KalmanFilter(dim_x=2, dim_z=1)
+        kf.x = np.array([closes[0], 0.0])
+        kf.F = np.array([[1.0, 1.0], [0.0, 1.0]])
+        kf.H = np.array([[1.0, 0.0]])
+        diffs = np.diff(closes)
+        atr_like = np.mean(np.abs(diffs[:50])) if len(diffs) >= 50 else (np.std(diffs) or 1.0)
+        kf.R[0, 0] = max((atr_like * self.r_mult) ** 2, 1e-6)
+        kf.Q = np.eye(2) * (kf.R[0, 0] * 0.01)
+        kf.P = np.eye(2) * atr_like * 10
+        scale = max(atr_like / 8.0, 1e-6)
+        # 滚动 ATR 尺度（用扩展窗口，无前视）
+        for i in range(n):
+            kf.predict()
+            kf.update([closes[i]])
+            if i >= 30:
+                out[i] = float(np.clip(kf.x[1] / scale, -3.0, 3.0))
+        return out
