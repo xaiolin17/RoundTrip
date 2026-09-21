@@ -157,7 +157,7 @@ class CircuitBreakers:
             try:
                 return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
             except Exception as e:
-                log_warn(f"breakers load failed: {e}")
+                log_warn(f"熔断器状态读取失败: {e}")
         return cls()
 
 
@@ -209,7 +209,7 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     返回 (lots, reject_reason)。
     """
     if atr is None or atr <= 0:
-        return 0.0, "无 ATR 数据"
+        return 0.0, "no_atr"
     risk_usd = equity * CFG.risk.risk_pct
     # Half-Kelly 上限
     b = CFG.risk.tp_atr_mult / CFG.risk.sl_atr_mult
@@ -221,12 +221,12 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     sl_points = CFG.risk.sl_atr_mult * atr / 0.001      # XAUUSDm point=0.001
     per_lot_risk = sl_points * point_value_per_lot
     if per_lot_risk <= 0:
-        return 0.0, "点值无效"
+        return 0.0, "bad_point_value"
     raw_lots = risk_usd / per_lot_risk
     lots = math.floor(raw_lots / volume_step) * volume_step
     lots = round(lots, 2)
     if lots < volume_min:
-        return 0.0, "风险预算不足最小手数"
+        return 0.0, "risk_budget_below_min_lot"
     lots = min(lots, volume_max, CFG.max_lot if CFG.trade_mode == "live" else volume_max)
     return lots, None
 

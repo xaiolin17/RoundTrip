@@ -128,7 +128,7 @@ class DealFeedback:
         try:
             deals = await client.get_deals(max(self.cursor, time.time() - 7 * 86400))
         except Exception as e:
-            log_info(f"deal_feedback: read failed {type(e).__name__}: {e}")
+            log_info(f"交割单反馈: 读取失败 {type(e).__name__}: {e}")
             return []
         new = [d for d in deals if d["time"] > self.cursor and d.get("magic") == CFG.mt5.magic]
         if not new:
@@ -160,7 +160,7 @@ class DealFeedback:
             self.last_pred_by_position[str(d.get("position_id"))] = pred
         self.cursor = max(d["time"] for d in new)
         self._save()
-        log_info(f"deal_feedback: {len(new)} closed trades, stats={self.stats.to_dict()}")
+        log_info(f"交割单反馈: 新增 {len(new)} 笔已平仓交易，统计={self.stats.to_dict()}")
         return new
 
     # ---------- 胜率反馈给仓位 ----------

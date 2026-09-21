@@ -1,7 +1,10 @@
-﻿"""LangGraph 鐘舵€佸浘锛坉ocs/06 搂4锛夈€?
-鑺傜偣锛歝ollect 鈫?analyze(parallel) 鈫?fuse 鈫?gate 鈫?[llm_review] 鈫?propose
-     鈫?risk 鈫?execute 鈫?persist 鈫?loop
-寮傚父 鈫?safe_hold銆?LLM 鑺傜偣鏈?TTL 涓庨绠楋紱鎵ц鑺傜偣鍚垚浜ゅ璐︺€?"""
+"""LangGraph 状态图（docs/06 §4）。
+
+节点：collect → analyze(parallel) → fuse → gate → [llm_review] → propose
+     → risk → execute → persist → loop
+异常 → safe_hold。
+LLM 节点有 TTL 与预算；执行节点含成交对账。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -61,8 +64,9 @@ class Graph:
     breakers: CircuitBreakers
     grid_state: GridState
     deal_feedback: Any = None
-    _pending_pred: dict = field(default_factory=dict)
-    _pred_orders: dict = field(default_factory=dict)   # {order_id_str: pred_sign} 鎸傚崟鈫掓垚浜ゆˉ鎺?    _position_adds: dict = field(default_factory=dict)   # {position_ticket_str: 鍔犱粨娆℃暟}   # position_id -> 铻嶅悎鍒嗙鍙?
+    _pending_pred: dict = field(default_factory=dict)   # position_id -> 融合分符号
+    _pred_orders: dict = field(default_factory=dict)   # {order_id_str: pred_sign} 挂单→成交桥接
+    _position_adds: dict = field(default_factory=dict)   # {position_ticket_str: 加仓次数}
     @classmethod
     def build(cls) -> "Graph":
         CFG.ensure_dirs()
@@ -78,7 +82,7 @@ class Graph:
             from gold_agent.llm.client import RunningHubClient
             orchestrator = Orchestrator(RunningHubClient())
         except Exception as e:
-            # LLM 缂?key 鏃剁鐢紙鏈湴闄嶇骇璺緞鐓у父鍐崇瓥锛夛紝棣栨鎴愬姛璋冪敤鍓嶉噸璇曞垵濮嬪寲
+            # LLM 缺 key 时禁用（本地降级路径照常决策），首次成功调用前重试初始化
             orchestrator = Orchestrator(None)
             orchestrator._init_error = str(e)
         gate = RiskGate(breakers, grid_state)
@@ -94,7 +98,7 @@ class Graph:
                    breakers=breakers, grid_state=grid_state, deal_feedback=fb)
 
     async def run_round(self, round_id: int) -> dict:
-        """涓€杞畬鏁村喅绛栵紙docs/00 搂3 t0..t9锛夈€傝繑鍥炴湰杞憳瑕併€?""
+        """一轮完整决策（docs/00 §3 t0..t9）。返回本轮摘要。"""
         st: GraphState = {"round_id": round_id}
         summary: dict = {"round": round_id, "ts": time.time()}
         try:
@@ -106,7 +110,7 @@ class Graph:
             st["positions"] = await self.client.get_positions()
             summary["last_close"] = float(st["bundle"].frames["1m"]["close"].iloc[-1])
 
-            # t0b 浜ゅ壊鍗曞弽棣堥棴鐜紙鑳滅巼/鐩堜簭 鈫?璐濆彾鏂睜 + 鐔旀柇鍣級
+            # t0b 交割单反馈闭环（胜率/盈亏 → 贝叶斯池 + 熔断器）
             if self.deal_feedback is not None:
                 closed = await self.deal_feedback.poll(self.client, self._pred_orders)
                 if closed:
@@ -127,15 +131,18 @@ class Graph:
                             trade_log({"event": "bayes_feedback", "position": d.get("position_id"),
                                        "pred": pred_sign, "actual": actual, "pnl": d.get("pnl")})
                         else:
-                            log_warn(f"deal {d.get('position_id')}: no pred sign (鏈ˉ鎺ワ紝璺宠繃璐濆彾鏂?")
-                        # 娓呯悊宸插钩浠撲綅鐨勫洖鍚愭娴嬪嘲鍊硷紙闃叉棫宄板€艰瑙﹀彂/娉勬紡锛?                        self.engine._profit_peak.pop(str(d.get("position_id")), None)
+                            log_warn(f"交割单 {d.get('position_id')}: 无预测符号（未桥接，跳过贝叶斯）")
+                        # 清理已平仓位的回吐检测峰值（防旧峰值误触发/泄漏）
+                        self.engine._profit_peak.pop(str(d.get("position_id")), None)
                         self.engine._score_peak.pop(str(d.get("position_id")), None)
                     if closed:
                         self._save_pred_orders()
                     summary["deals_closed"] = len(closed)
 
-            # t2 analyze (chanlun 鏈湴 + mobius) 骞跺彂
-            # P1-1锛氬喅绛栧懆鏈熻縼鍒?1h 鍚庯紝鏂瑰悜鍒ゆ嵁浠?1h/4h 涓轰富锛?            #       1m 闄嶄负鎵ц鎷╂椂锛堜笉鍙備笌鏂瑰悜锛屾潈閲?0锛夈€?            cl_tasks = {tf: asyncio.to_thread(analyze_tf, st["bundle"].frames[tf], tf)
+            # t2 analyze (chanlun 本地 + mobius) 并发
+            # P1-1：决策周期迁移到 1h 后，方向判据以 1h/4h 为主，
+            #       1m 降为执行择时（不参与方向，权重 0）。
+            cl_tasks = {tf: asyncio.to_thread(analyze_tf, st["bundle"].frames[tf], tf)
                         for tf in ("1m", "5m", "15m", "1h", "4h")}
             mob_tasks = {
                 "1m": asyncio.create_task(self.mobius.get_smc("XAUUSD", "1m", limit=200)),
@@ -150,13 +157,13 @@ class Graph:
             st["mobius"] = dict(zip(mob_tasks.keys(), mob_vals))
             st["news"] = await news_task
 
-            # t2/t3 fuse锛堝厛鏈湴铻嶅悎锛汱LM 涔嬪悗鑻ユ湁鏁堝啀铻嶅悎涓€娆★級
+            # t2/t3 fuse（先本地融合；LLM 之后若有效再融合一次）
             st["fused"] = self.fusion.fuse_all(st["bundle"].frames, st["chanlun"],
                                                st["mobius"], obs_id=round_id)
-            # P1-1锛歋L/TP 鐢?1h ATR锛堝喅绛栧懆鏈?ATR锛夛紝涓嶆槸 15m
+            # P1-1：SL/TP 用 1h ATR（决策周期 ATR），不是 15m
             atr = self._decision_atr(st)
 
-            # t2c 淇″彿璇︽儏鏃ュ織锛堢敤鎴疯姹傦細鎶婂奖鍝嶅垎鏋愮殑閲嶈淇″彿鎵撳嵃鍒版棩蹇楋級
+            # t2c 信号详情日志（用户要求：把影响分析的重要信号打印到日志）
             ind = st["fused"].indicators
             kal = st["fused"].kalman
             mob_last = float(st["bundle"].frames["15m"]["close"].iloc[-1])
@@ -174,7 +181,8 @@ class Graph:
                 "hurst": round(st["fused"].result.hurst, 3) if st["fused"].result.hurst else None,
                 "disagreement": st["fused"].result.disagreement,
                 "per_source": st["fused"].result.per_source,
-                # P0-1 楠屾敹锛氬師濮嬪垎 vs 褰掍竴鍖栧垎锛堝悇婧愬潎鍊煎簲 鈭?[鈭?.3,+0.3]銆佷负姝?鈭?[40%,60%]锛?                "raw_scores": {k: round(v, 3) for k, v in st["fused"].raw_scores.items()},
+                # P0-1 验收：原始分 vs 归一化分（各源均值应 ∈ [-0.3,+0.3]、为正 ≈ [40%,60%]）
+                "raw_scores": {k: round(v, 3) for k, v in st["fused"].raw_scores.items()},
                 "norm_scores": {k: round(v, 3) for k, v in st["fused"].norm_scores.items()},
                 "source_warmed": st["fused"].warmed,
                 "weight_table": st["fused"].weight_table,
@@ -211,9 +219,12 @@ class Graph:
 
             # t4 gate
             ev = st["fused"]
-            # research/20 鐨勪慨姝ｏ細LLM 璇勫杩涘叆**涓昏矾寰?*銆?            # 鏃ч€昏緫 need_llm = (|S|>=0.9) or 鏈夋寔浠?+ min_interval 15min
-            # 鈫?881 杞彧鎴愬姛 38 娆★紙4.3%锛夛紝绯荤粺缁濆ぇ澶氭暟鏃跺€欏彧鑳芥寕闄愪环鍗曘€?            # 鐜板湪锛?h 鍐崇瓥鍛ㄦ湡涓嬫瘡杞兘璇勫锛坢in_interval_min=0锛夛紝
-            # 涓斿彧鏈夋槑鏄炬棤淇″彿鐨勮疆娆℃墠璺宠繃浠ョ渷棰勭畻銆?            need_llm = (abs(ev.result.score - ev.result.score_baseline)
+            # research/20 的修正：LLM 评审进入**主路径**。
+            # 旧逻辑 need_llm = (|S|>=0.9) or 有持仓 + min_interval 15min
+            # → 881 轮只成功 38 次（4.3%），系统绝大多数时候只能挂限价单。
+            # 现在：1h 决策周期下每轮都评审（min_interval_min=0），
+            # 且只有明显无信号的轮次才跳过以省预算。
+            need_llm = (abs(ev.result.score - ev.result.score_baseline)
                         >= CFG.decision.open_threshold - 0.6
                         or bool(st["positions"].positions)
                         or bool(st["positions"].pending_orders)
@@ -230,7 +241,7 @@ class Graph:
                                                            summary["last_close"])
                 ctx.llm = st["llm"]
                 ctx.llm_available = bool((st["llm"] or {}).get("review"))
-                # LLM 璇勫缁撴灉閲嶆柊铻嶅悎锛坣ews_score 绮楃矑搴︼細sentiment鈫掑垎鏁帮級
+                # LLM 评审结果重新融合（news_score 粗粒度：sentiment→分数）
                 na = (st["llm"] or {}).get("news_assessment") or {}
                 ns = {"bullish": 1.5, "bearish": -1.5, "neutral": 0.0}.get(na.get("sentiment"), 0.0)
                 if ns:
@@ -240,7 +251,8 @@ class Graph:
                                                        obs_id=round_id)
                     ctx.ev = st["fused"]
                     ev = st["fused"]
-                # LLM 璇勫缁撴灉钀芥棩蹇楋紙skill 鍚堣瀹¤锛?                self._log_llm_review(round_id, st["llm"], ctx.llm_available)
+                # LLM 评审结果落日志（skill 合规审计）
+                self._log_llm_review(round_id, st["llm"], ctx.llm_available)
 
             # t6 decide
             prop = self.engine.decide(ctx)
@@ -249,9 +261,12 @@ class Graph:
                                    "reasons": prop.reasons}
             summary["score"] = ev.result.score
             summary["sigma"] = ev.result.sigma
-            # 鈿狅笍 action 蹇呴』**鍦ㄨ繖閲?*灏辫濂姐€?            #    鍘熷疄鐜板彧鍦?hold / skip_round / safe_hold 涓変釜鍒嗘敮閲岃祴鍊硷紝
+            # ⚠️ action 必须**在这里**就设好。
+            #    原实现只在 hold / skip_round / safe_hold 三个分支里赋值，
             #    浜庢槸 place_grid / open_market / cancel_pending 杩欎簺
-            #    **鐪熸涓嬪崟**鐨勮疆娆℃病鏈?action 鈫?鎺у埗鍙版墦鍗?`-> ?`銆?            #    缁撴灉鎭板ソ鏄細瓒婇噸瑕佺殑杞瓒婄湅涓嶅嚭鍙戠敓浜嗕粈涔堛€?            summary["action"] = prop.kind
+            #    **真正下单**的轮次没有 action → 控制台打印 `-> ?`。
+            #    结果恰好是：越重要的轮次越看不出发生了什么。
+            summary["action"] = prop.kind
             if prop.kind == "hold":
                 return summary
 
@@ -295,7 +310,8 @@ class Graph:
             self.breakers.save(CFG.state_path.parent / "breakers.json")
             self.grid_state.save(CFG.state_path.parent / "grid_state.json")
             self._save_position_adds()
-            # P0-1/P1-2/P1-3锛氭粴鍔ㄧ粺璁￠噺璺ㄨ繘绋嬫寔涔咃紙閲嶅惎涓嶄涪棰勭儹锛?            self.fusion.save_state()
+            # P0-1/P1-2/P1-3：滚动统计量跨进程持久（重启不丢预热）
+            self.fusion.save_state()
             return summary
         except Mt5Error as e:
             log_error(f"第 {round_id} 轮：MT5 错误 {e}")
@@ -303,7 +319,7 @@ class Graph:
             summary["action"] = "skip_round"
             return summary
         except Exception as e:
-            log_error(f"round {round_id}: {type(e).__name__}: {e}")
+            log_error(f"第 {round_id} 轮：{type(e).__name__}: {e}")
             summary["error"] = f"{type(e).__name__}: {e}"
             summary["action"] = "safe_hold"
             return summary
@@ -322,9 +338,10 @@ class Graph:
                             idempotency_key=f"open-{int(time.time())}")
             res = await self.executor.execute(req)
             if res.ok:
-                # 璁板綍寮€浠撴椂鐨勮瀺鍚堝垎绗﹀彿锛屽钩浠撳悗鐢ㄤ簬璐濆彾鏂弽棣?                score = st.get("fused")
+                # 记录开仓时的融合分符号，平仓后用于贝叶斯反馈
+                score = st.get("fused")
                 s = float(score.result.score) if score is not None and getattr(score, "result", None) else 0.0
-                # deal Feedback 闇€ position_id锛氭垚浜ゅ悗浠?positions 鏌ユ渶鏂颁粨
+                # deal Feedback 需 position_id：成交后从 positions 查最新仓
                 try:
                     view = await self.client.get_positions()
                     for p in view.positions:
@@ -340,7 +357,8 @@ class Graph:
                             idempotency_key=f"close-{plan['position_ticket']}-{int(time.time())}")
             return await self.executor.execute(req)
         if kind == "modify_sltp":
-            # 淇濇姢鎬хЩ鎹燂細TP 淇濇寔鍘熶綅锛圢one = 涓嶅姩锛夛紝SL 鎺ㄥ埌閿佺泩浣嶏紙tp_struct 鎼哄甫鏂?SL锛?            req = OrderPlan(kind="modify_sltp", direction=plan.get("direction"),
+            # 保护性移损：TP 保持原位（None = 不动），SL 推到锁盈位（tp_struct 携带新 SL）
+            req = OrderPlan(kind="modify_sltp", direction=plan.get("direction"),
                             position_ticket=int(plan["position_ticket"]),
                             sl=float(plan["new_sl"]), tp=None,
                             comment="goldagent-lock",
@@ -352,7 +370,8 @@ class Graph:
                            "direction": plan.get("direction")})
             return res
         if kind == "add_layer":
-            # 椤哄娍鍔犱粨锛氬浐瀹?0.01 鎵嬶紝鍚屽悜甯備环锛涙垚鍔熷悗璁℃暟+1銆佽褰曞垎鏁?缃俊/鍩虹宸€硷紙鎸囨暟闃舵锛?            req = OrderPlan(kind="open_market", direction=plan["direction"],
+            # 顺势加仓：固定 0.01 手，同向市价；成功后计数+1、记录分数/置信/基础差值（指数阶梯）
+            req = OrderPlan(kind="open_market", direction=plan["direction"],
                             lots=float(plan["lots"]), tp=plan.get("tp"),
                             sl=plan.get("sl"), comment="goldagent-add",
                             idempotency_key=f"add-{plan['position_ticket']}-{int(time.time())}")
@@ -368,7 +387,7 @@ class Graph:
                 rec["count"] = int(rec.get("count", 0)) + 1
                 rec["last_score"] = cur_score
                 rec["last_conf"] = float((llm.get("review") or {}).get("confidence") or 0) or None
-                # base_gap = 鏈鐩稿涓婃鍔犱粨鐨勫垎鏁板樊锛堢 3 娆¤捣浣滄寚鏁板闀垮熀鏁帮級
+                # base_gap = 本次相对上次加仓的分数差（第 3 次起作指数增长基数）
                 if prev_score is not None and cur_score is not None:
                     rec["base_gap"] = max(abs(cur_score) - abs(prev_score), 0.05)
                 elif "base_gap" not in rec:
@@ -383,7 +402,8 @@ class Graph:
                            "lots": plan["lots"], "direction": plan["direction"]})
             return res
         if kind == "cancel_pending":
-            # 琛屾儏鍙嶈浆鎾ゆ寕鍗曪紙docs/06 鐘舵€佹満锛歅ENDING_GRID 鈫?IDLE锛?            req = OrderPlan(kind="cancel_pending", position_ticket=int(plan["order_ticket"]),
+            # 行情反转撤挂单（docs/06 状态机：PENDING_GRID → IDLE）
+            req = OrderPlan(kind="cancel_pending", position_ticket=int(plan["order_ticket"]),
                             comment="goldagent-cancel",
                             idempotency_key=f"cancel-{plan['order_ticket']}-{int(time.time())}")
             res = await self.executor.execute(req)
@@ -392,7 +412,7 @@ class Graph:
                            "direction": plan.get("direction")})
             return res
         if kind == "place_grid":
-            # 閫愬眰鎸傚崟锛涙寕鍗曟垚鍔熷悗鎶婇娴嬬鍙疯鍏?_pred_orders锛堟垚浜も啋璐濆彾鏂弽棣堟ˉ鎺ワ級
+            # 逐层挂单；挂单成功后把预测符号记入 _pred_orders（成交→贝叶斯反馈桥接）
             fused = st.get("fused")
             pred_sign = 0
             if fused is not None and getattr(fused, "result", None):
@@ -420,20 +440,26 @@ class Graph:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self._position_adds), encoding="utf-8")
 
-    # ---------- P1-1锛氬喅绛栧懆鏈?ATR ----------
+    # ---------- P1-1：决策周期 ATR ----------
     def _decision_atr(self, st: GraphState) -> float | None:
-        """SL/TP 鐢?*楂樼骇鍒紙榛樿 1h锛?*鐨?ATR锛岃€屼笉鏄叆鍦哄懆鏈燂紙1m锛夈€?
-        鈿狅笍 杩欐槸 1m 鐭嚎鑳藉惁鎴愮珛鐨勫叧閿紝涓嶆槸鍙€夐」銆?
-        research/23_kalman_tb.py 瀹炴祴锛?0,000 鏍圭湡瀹?1m bar锛夛細
+        """SL/TP 用**高级别（默认 1h）**的 ATR，而不是入场周期（1m）。
 
-            姝㈡崯鍩哄噯        姝㈡崯(USD)   鎴愭湰/姝㈡崯   鍑€NW-t
+        ⚠️ 这是 1m 短线能否成立的关键，不是可选项。
+
+        research/23_kalman_tb.py 实测（60,000 根真实 1m bar）：
+
+            止损基准        止损(USD)   成本/止损   净NW-t
             1m ATR x1.2       1.13      46.0%     -30.00
-            15m 灏哄害 x1.2     4.74      11.0%      -4.38
+            15m 尺度 x1.2     4.74      11.0%      -4.38
             1h ATR x1.2      20.80       2.5%      -1.40
 
-        鎴愭湰 0.52 USD 鏄浐瀹氱殑銆傜敤 1m 鐨勬尝鍔ㄥ畾姝㈡崯鏃讹紝鎴愭湰鍚冩帀姝㈡崯鐨?46% 鈥斺€?        鏁板涓婁笉鍙兘鐩堝埄锛涚敤 1h ATR 瀹氭鎹燂紝鎴愭湰鍙崰 2.5%銆?
-        **鎵€浠?1m 涓嶈兘浜ゆ槗"杩欎釜缁撹鍙湪"鐢?1m 娉㈠姩瀹氭鎹?鐨勫墠鎻愪笅鎴愮珛銆?*
-        1m 璐熻矗**鍏ュ満鎷╂椂**锛堢簿搴﹂珮銆佹満浼氬锛夛紝楂樼骇鍒礋璐?*椋庨櫓灏哄害**锛堟垚鏈崰姣斾綆锛夈€?        """
+        成本 0.52 USD 是固定的。用 1m 的波动定止损时，成本吃掉止损的 46% ——
+        数学上不可能盈利；用 1h ATR 定止损，成本只占 2.5%。
+
+        **所以"1m 不能交易"这个结论只在"用 1m 波动定止损"的前提下成立。**
+
+        1m 负责**入场择时**（精度高、机会多），高级别负责**风险尺度**（成本占比低）。
+        """
         frames = st.get("bundle").frames if st.get("bundle") else {}
         tf = CFG.risk.atr_tf
         df = frames.get(tf)
@@ -448,9 +474,9 @@ class Graph:
         atr = float(tr.rolling(14).mean().iloc[-1])
         return atr if atr > 0 else None
 
-    # ---------- LLM 璇勫鏃ュ織锛坰kill 鍚堣瀹¤锛?----------
+    # ---------- LLM 评审日志（skill 合规审计） ----------
     def _log_llm_review(self, round_id: int, llm: dict | None, available: bool) -> None:
-        """璁板綍 LLM 鏄惁鍙備笌銆佷互鍙婂畠鎸?skill 璧颁簡鍝簺妫€鏌ラ」銆?""
+        """记录 LLM 是否参与、以及它按 skill 走了哪些检查项。"""
         review = (llm or {}).get("review") or {}
         audit = review.get("skill_audit") or {}
         decision_log({
@@ -474,29 +500,34 @@ class Graph:
     def _save_pred_orders(self) -> None:
         path = CFG.state_path.parent / "pred_orders.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        # 鍙繚鐣欐渶杩?200 鏉★紙鎴愪氦鍙嶉鐢ㄥ畬鍗冲純锛?        items = list(self._pred_orders.items())[-200:]
+        # 只保留最近 200 条（成交反馈用完即弃）
+        items = list(self._pred_orders.items())[-200:]
         path.write_text(json.dumps(dict(items)), encoding="utf-8")
 
     def __post_init__(self) -> None:
-        # 鍔犱粨璁℃暟璺ㄨ繘绋嬫寔涔?        try:
+        # 加仓计数跨进程持久
+        try:
             path = CFG.state_path.parent / "position_adds.json"
             if path.exists():
                 self._position_adds = json.loads(path.read_text(encoding="utf-8"))
         except Exception as e:
             log_warn(f"加仓记录读取失败：{e}")
-        # 鎸傚崟鈫掓垚浜ら娴嬬鍙锋ˉ鎺ユ寔涔?        try:
+        # 挂单→成交预测符号桥接持久
+        try:
             path = CFG.state_path.parent / "pred_orders.json"
             if path.exists():
                 self._pred_orders = json.loads(path.read_text(encoding="utf-8"))
         except Exception as e:
             log_warn(f"预测挂单读取失败：{e}")
-        # P0-1/P1-2/P1-3锛氭粴鍔ㄧ粺璁￠噺鎭㈠锛堥噸鍚笉涓㈤鐑紝鍚﹀垯姣忔閲嶅惎閮借绌轰粨绛夐鐑級
+        # P0-1/P1-2/P1-3：滚动统计量恢复（重启不丢预热，否则每次重启都要空仓等预热）
         try:
             self.fusion.load_state()
         except Exception as e:
             log_warn(f"融合状态读取失败：{e}")
-        # 鈿狅笍 1m 鐭嚎鐨勫叧閿細鑻ュ綊涓€鍖栧櫒浠嶆湭棰勭儹锛堥娆″惎鍔?/ state 涓㈠け锛夛紝
-        #    鐢ㄥ巻鍙?bar 鍥炴斁鐏屾弧缂撳啿銆傚惁鍒欏惎鍔ㄥ悗 min_periods 杞?        #    锛?m 涓?= 4 灏忔椂锛夋墍鏈夋簮鍒嗘暟閮芥槸 0.0 鈫?铻嶅悎鍒嗘亽 0 鈫?姘镐笉寮€浠撱€?        try:
+        # ⚠️ 1m 短线的关键：若归一化器仍未预热（首次启动 / state 丢失），
+        #    用历史 bar 回放灌满缓冲。否则启动后 min_periods 轮
+        #    （1m 下 = 4 小时）所有源分数都是 0.0 → 融合分恒 0 → 永不开仓。
+        try:
             if not self.fusion.normalizer.warm("kalman_persist"):
                 bundle = self.client.get_ohlcv_sync()
                 if bundle and bundle.frames:
@@ -511,7 +542,7 @@ class Graph:
         si = self.client.symbol_info()
         if si is None:
             return 1.0
-        # XAUUSDm: 1 lot = 100oz; point=0.001 鈫?tick_value 宸叉槸姣?tick 姣?lot 缇庡厓
+        # XAUUSDm: 1 lot = 100oz; point=0.001 → tick_value 已是每 tick 每 lot 美元
         return float(si.trade_tick_value) * (0.001 / max(si.trade_tick_size, 1e-9))
 
     async def close(self) -> None:

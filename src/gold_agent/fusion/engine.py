@@ -541,9 +541,9 @@ class FusionEngine:
         if scores and float(np.std(scores)) > 1e-9:
             self.baseline.prime(scores)
         from gold_agent.common.logging_util import log_info
-        log_info(f"fusion prime: {primed} "
-                 f"vol_pct={self.vol_pct.count()} baseline={self.baseline.count()} "
-                 f"baseline_value={self.baseline.value:+.4f}")
+        log_info(f"融合器预热: {primed} 步 "
+                 f"波动分位样本={self.vol_pct.count()} 基线样本={self.baseline.count()} "
+                 f"基线值={self.baseline.value:+.4f}")
         return primed
 
     # ---------- 持久化（实盘重启保留预热） ----------
@@ -557,7 +557,7 @@ class FusionEngine:
             self.baseline.save(self.state_path("score_baseline.json"))
         except Exception as e:      # 持久化失败不应中断交易循环
             from gold_agent.common.logging_util import log_warn
-            log_warn(f"fusion state save failed: {e}")
+            log_warn(f"融合状态保存失败: {e}")
 
     def load_state(self) -> None:
         try:
@@ -566,4 +566,4 @@ class FusionEngine:
             self.baseline = RollingBaseline.load(self.state_path("score_baseline.json"))
         except Exception as e:
             from gold_agent.common.logging_util import log_warn
-            log_warn(f"fusion state load failed: {e}")
+            log_warn(f"融合状态读取失败: {e}")

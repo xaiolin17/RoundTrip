@@ -19,12 +19,17 @@ from gold_agent.agent.graph import Graph
 
 
 def _zh_reason(reason: str | None) -> str:
-    """把风控拒绝理由翻成中文。
+    """把风控拒绝理由翻成中文（**仅用于显示，不改动源码里的理由码**）。
 
-    `gate.py` 产出的理由分两类：
+    `gate.py` / `position.py` 产出的理由分两类：
       · 固定码（`no_atr` / `grid_layers_empty` …）→ 查表翻译；
       · 带数值的句子（`max_lot cap: 0.01+0.01 > 0.01`）→ 逐条替换关键字，
         保留原始数字（数字是诊断的关键，不能丢）。
+
+    ⚠️ 为什么翻译只放在这一层：这些理由码是**机器可读的标识**，
+    `tests/test_risk_real.py` 直接断言 `rej == "risk_budget_below_min_lot"`、
+    `"circuit" in res.reason`。把码本身改成中文会让测试失败，
+    也会让日志检索/告警规则失配。所以源码保持英文码，显示层翻译。
     """
     if not reason:
         return "未说明原因"
@@ -39,7 +44,19 @@ def _zh_reason(reason: str | None) -> str:
         ("already waiting", "在等待成交"),
         ("grid base", "网格基准手数"),
         ("circuit", "熔断"),
+        ("disagreement", "源间分歧"),
         ("unhandled kind", "未处理的动作类型"),
+        ("no_atr", "无 ATR 数据"),
+        ("bad_point_value", "点值无效"),
+        ("risk_budget_below_min_lot", "风险预算不足最小手数"),
+        ("grid_layers_empty", "网格层数为空"),
+        ("grid_exposure_cap", "网格总敞口超上限"),
+        ("direction_bias_halt", "方向偏置停机"),
+        ("cooloff_until", "冷却至"),
+        ("daily_loss_stop", "当日亏损停机"),
+        ("consecutive_losses", "连续亏损停机"),
+        ("friday_late", "周五尾盘不开仓"),
+        ("drawdown_halt", "回撤停机"),
     ):
         out = out.replace(en, zh)
     return out
