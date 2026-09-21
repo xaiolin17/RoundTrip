@@ -193,19 +193,19 @@ class DecisionEngine:
                             reasons=reasons + [f"LLM 反对 {verdict_label(verdict)}/{conf:.2f}"])
 
         if ctx.ev.result.regime == "mean_reverting":
-            # 均值回归 regime → 只做网格限价
+            # 均值回归 regime → 只挂限价单（用户要求：不再用网格，只挂预测的那一单）
             return Proposal(kind="place_grid", direction=direction, entry=ctx.last_close,
-                            reasons=reasons + ["行情为均值回归 -> 改用网格挂单"])
+                            reasons=reasons + ["行情为均值回归 -> 改用限价挂单"])
         if aligned:
             return Proposal(kind="open_market", direction=direction, reasons=reasons)
         # 未对齐：LLM 没参与 / 说中性 / 置信不足
         if not ctx.llm_available and not CFG.decision.allow_grid_without_llm:
-            # LLM 缺失时不默认放网格（research/20 的教训：那会让系统几乎只挂单）
+            # LLM 缺失时不默认挂限价（research/20 的教训：那会让系统几乎只挂单）
             return Proposal(kind="hold",
-                            reasons=reasons + ["LLM 不可用 -> 观望（不默认放网格）"])
-        # 先放网格限价（内侧挂单），等回踩
+                            reasons=reasons + ["LLM 不可用 -> 观望（不默认挂单）"])
+        # 先挂限价单（回踩位），等回踩
         return Proposal(kind="place_grid", direction=direction, entry=ctx.last_close,
-                        reasons=reasons + ["LLM 未确认 -> 先挂网格"])
+                        reasons=reasons + ["LLM 未确认 -> 先挂限价单"])
 
     # ---------- 持仓 ----------
     def _decide_holding(self, ctx: DecisionContext, holding, s: float, sigma: float) -> Proposal:

@@ -70,7 +70,8 @@ def test_flat_open_market_aligned_llm():
     assert p.direction == "LONG"
 
 
-def test_flat_grid_when_not_aligned():
+def test_flat_pending_when_not_aligned():
+    """未对齐 LLM → 挂一张限价单（用户要求：取消网格，只挂预测的那一单）。"""
     e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
     p = e.decide(_ctx(score=-ABOVE, llm={"review": {"verdict": "bullish", "confidence": 0.6}}))
     assert p.kind == "place_grid"
@@ -357,12 +358,12 @@ def test_llm_unavailable_no_default_grid(monkeypatch):
     assert p.kind == "hold", "LLM 缺失时不应默认挂网格"
 
 
-def test_llm_neutral_still_allows_grid():
-    """LLM 参与但说中性 → 仍可走网格（正常降级，不是缺失）。"""
+def test_llm_neutral_still_allows_pending():
+    """LLM 参与但说中性 → 仍可挂限价单（正常降级，不是缺失）。"""
     e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
     p = e.decide(_ctx(score=ABOVE,
                       llm={"review": {"verdict": "neutral", "confidence": 0.3}}))
-    assert p.kind == "place_grid", "LLM 中性时网格仍是合法选择"
+    assert p.kind == "place_grid", "LLM 中性时挂限价单仍是合法选择"
 
 
 def test_runner_console_shows_action_on_trade_rounds():
@@ -379,7 +380,7 @@ def test_runner_console_shows_action_on_trade_rounds():
     import gold_agent.runner as runner
 
     cases = [
-        ("place_grid", "LONG", "挂网格单", "做多"),
+        ("place_grid", "LONG", "挂限价单", "做多"),
         ("open_market", "SHORT", "市价开仓", "做空"),
         ("cancel_pending", "LONG", "撤销挂单", "做多"),
     ]
@@ -391,6 +392,29 @@ def test_runner_console_shows_action_on_trade_rounds():
         assert "?" not in out, f"下单轮次出现了 '?': {out!r}"
         assert zh_kind in out, f"摘要未包含动作 {zh_kind}: {out!r}"
         assert zh_dir in out, f"摘要未包含方向 {zh_dir}: {out!r}"
+
+
+def test_single_pending_order_console_format():
+    """用户要求：取消网格，只挂预测的那一单。
+
+    控制台必须直接给出**那一张**挂单的方向/入场/止损/止盈，
+    且不再出现"挂单层数"这种网格措辞。
+    """
+    import gold_agent.runner as runner
+
+    out = runner._format_summary(2287, {
+        "score": 1.48, "sigma": 0.49, "action": "place_grid",
+        "last_close": 4349.819,
+        "proposal": {"kind": "place_grid", "direction": "LONG"},
+        "risk": {"ok": True, "reason": "", "plan": {
+            "kind": "place_grid", "direction": "LONG",
+            "grid_plan": [{"level": 4349.819, "lots": 0.01,
+                           "tp": 4365.882, "sl": 4339.379}]}},
+        "execution": {"ok": True}})
+    assert "挂限价单" in out, f"未显示单张挂单: {out!r}"
+    assert "挂单层数" not in out, f"不应再出现网格措辞: {out!r}"
+    assert "做多" in out and "入场 4349.819" in out, f"缺方向/入场: {out!r}"
+    assert "止损 4339.379" in out and "止盈 4365.882" in out, f"缺止损止盈: {out!r}"
 
 
 def test_graph_sets_action_for_every_proposal_kind():
