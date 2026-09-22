@@ -64,8 +64,9 @@ class Graph:
     breakers: CircuitBreakers
     grid_state: GridState
     deal_feedback: Any = None
-    _pending_pred: dict = field(default_factory=dict)   # position_id -> 融合分符号
-    _pred_orders: dict = field(default_factory=dict)   # {order_id_str: pred_sign} 挂单→成交桥接
+    # {position_id / order_id: 预测符号} 成交→贝叶斯反馈桥接（落盘 pred_orders.json）
+    # 键统一用 position_id：平仓 deal 的 order 是新 ticket，与开仓时记的永不相等
+    _pred_orders: dict = field(default_factory=dict)
     _position_adds: dict = field(default_factory=dict)   # {position_ticket_str: 加仓次数}
     @classmethod
     def build(cls) -> "Graph":
@@ -114,14 +115,9 @@ class Graph:
             if self.deal_feedback is not None:
                 closed = await self.deal_feedback.poll(self.client, self._pred_orders)
                 if closed:
-                    # 用桥接找回的预测符号做贝叶斯 outcome 回填
+                    # poll() 已把预测符号写进 rec["pred_sign"]（position_id 键桥接）
                     for d in closed:
-                        pred_sign = self.deal_feedback.last_pred_by_position.get(
-                            str(d.get("position_id")))
-                        if pred_sign is None:
-                            pred_sign = self._pending_pred.pop(str(d.get("position_id")), 0)
-                        else:
-                            self._pending_pred.pop(str(d.get("position_id")), None)
+                        pred_sign = d.get("pred_sign")
                         actual = 1 if d.get("pnl", 0) > 0 else (-1 if d.get("pnl", 0) < 0 else 0)
                         if pred_sign in (1, -1) and actual != 0:
                             for src in ("kalman_persist", "chanlun", "openmobius_smc",
@@ -130,13 +126,18 @@ class Graph:
                             self.fusion.bayes.save()
                             trade_log({"event": "bayes_feedback", "position": d.get("position_id"),
                                        "pred": pred_sign, "actual": actual, "pnl": d.get("pnl")})
+                            log_info(f"贝叶斯反馈: 仓位 {d.get('position_id')} "
+                                     f"预测{'做多' if pred_sign > 0 else '做空'} "
+                                     f"实际{'盈利' if actual > 0 else '亏损'} "
+                                     f"盈亏 {d.get('pnl'):.2f}")
                         else:
-                            log_warn(f"交割单 {d.get('position_id')}: 无预测符号（未桥接，跳过贝叶斯）")
+                            # 符号为 0 = 开仓那轮融合分恰好为 0；或 pnl 为 0（保本平仓）
+                            why = "融合分为 0" if pred_sign == 0 else "盈亏为 0"
+                            log_warn(f"交割单 {d.get('position_id')}: 无预测符号（{why}，跳过贝叶斯）")
                         # 清理已平仓位的回吐检测峰值（防旧峰值误触发/泄漏）
                         self.engine._profit_peak.pop(str(d.get("position_id")), None)
                         self.engine._score_peak.pop(str(d.get("position_id")), None)
-                    if closed:
-                        self._save_pred_orders()
+                    self._save_pred_orders()
                     summary["deals_closed"] = len(closed)
 
             # t2 analyze (chanlun 本地 + mobius) 并发
@@ -347,16 +348,7 @@ class Graph:
             res = await self.executor.execute(req)
             if res.ok:
                 # 记录开仓时的融合分符号，平仓后用于贝叶斯反馈
-                score = st.get("fused")
-                s = float(score.result.score) if score is not None and getattr(score, "result", None) else 0.0
-                # deal Feedback 需 position_id：成交后从 positions 查最新仓
-                try:
-                    view = await self.client.get_positions()
-                    for p in view.positions:
-                        if p.magic == CFG.mt5.magic:
-                            self._pending_pred[str(p.ticket)] = (1 if s > 0 else -1 if s < 0 else 0)
-                except Exception:
-                    pass
+                self._record_pred(res, st)
             return res
         if kind == "close_position":
             # 必须带 lots：平仓请求缺 volume 会被 MT5 拒绝
@@ -389,6 +381,10 @@ class Graph:
                             idempotency_key=f"add-{plan['position_ticket']}-{int(time.time())}")
             res = await self.executor.execute(req)
             if res.ok:
+                # ⚠️ 事故修复：加仓开的是**新仓位**，原先整个分支都没有记录
+                # 预测符号 -> 加仓仓位的贝叶斯反馈永远丢失（实测 layer_added
+                # 有 10 条，bayes_feedback 有 0 条）。
+                self._record_pred(res, st)
                 key = str(plan["position_ticket"])
                 rec = self._position_adds.get(key)
                 rec = rec if isinstance(rec, dict) else {"count": int(rec or 0)}
@@ -424,13 +420,8 @@ class Graph:
                            "direction": plan.get("direction")})
             return res
         if kind == "place_grid":
-            # 单张限价挂单（用户要求：取消网格）；挂单成功后把预测符号记入
-            # _pred_orders（成交→贝叶斯反馈桥接）
-            fused = st.get("fused")
-            pred_sign = 0
-            if fused is not None and getattr(fused, "result", None):
-                s_ = float(fused.result.score)
-                pred_sign = 1 if s_ > 0 else (-1 if s_ < 0 else 0)
+            # 单张限价挂单（用户要求：取消网格）；挂单成功后记录预测符号，
+            # 成交后由 _record_pred 的 position_id 键回填贝叶斯
             last = ExecutionResult(ok=True)
             for layer in plan.get("grid_plan", []):
                 req = OrderPlan(kind="place_pending", direction=plan["direction"],
@@ -443,8 +434,7 @@ class Graph:
                 if not last.ok:
                     break
                 if last.order:
-                    self._pred_orders[str(last.order)] = pred_sign
-            self._save_pred_orders()
+                    self._record_pred(last, st)
             return last
         return ExecutionResult(ok=True, error=f"noop kind {kind}")
 
@@ -516,6 +506,38 @@ class Graph:
             "review_coverage": (round(self.llm.review_coverage, 3)
                                 if self.llm is not None else None),
         })
+
+    def _record_pred(self, res, st: GraphState) -> None:
+        """记录本次成交的**预测符号**，键为 position_id（成交→贝叶斯反馈桥接）。
+
+        ⚠️ 事故修复（用户报告「无预测符号（未桥接，跳过贝叶斯）」）
+        ----------------------------------------------------------
+        原实现有三处缺陷，导致这条闭环**从未生效**（实测 17 笔平仓
+        pred_sign 全为 None、bayes_feedback 0 条）：
+
+        1. **键不匹配**：`deal_feedback.poll()` 用平仓 deal 的 `order` 去 pop，
+           而平仓 order 是新 ticket（开仓 2557969245 / 平仓 2558130417），
+           与挂单时记的 order ticket 永远不等。
+           -> 统一改用 `position_id`（实测开仓 deal 的 order == position_id）。
+        2. **加仓漏记**：`add_layer` 开的是新仓位，但整个分支没有记录预测符号。
+        3. **不持久化**：`_pending_pred` 只是内存字典，进程重启后全部丢失；
+           而市价开仓**必须**跨轮次（开仓→若干轮后平仓）才能回填。
+           -> 统一并入 `_pred_orders` 并落盘 `pred_orders.json`。
+
+        `res.order` 是 MT5 返回的 order ticket；市价单成交后它与 position_id
+        相同（实测 6/6 成立），挂单成交时也按 order 键兜底。
+        """
+        fused = st.get("fused")
+        s = 0.0
+        if fused is not None and getattr(fused, "result", None) is not None:
+            s = float(fused.result.score)
+        sign = 1 if s > 0 else (-1 if s < 0 else 0)
+        ticket = getattr(res, "order", 0) or 0
+        if not ticket:
+            log_warn("预测符号记录跳过：成交未返回 order ticket")
+            return
+        self._pred_orders[str(ticket)] = sign
+        self._save_pred_orders()
 
     def _save_pred_orders(self) -> None:
         path = CFG.state_path.parent / "pred_orders.json"
