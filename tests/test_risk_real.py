@@ -30,6 +30,58 @@ def test_position_lots_bounds():
         assert rej == "risk_budget_below_min_lot"
 
 
+def test_min_lot_fallback_when_vol_k_shrinks_budget():
+    """回归（用户实测事故）：缩仓系数把预算压到最小手数以下时，**仍按 0.01 手开仓**。
+
+    实测：vol_k=0.125（波动下限 0.25 × 分歧 0.5）→ 预算 8.64 USD
+    → 止损上限仅 8.6 点，而实际止损 7.5~20.8 点 → 强信号轮次被连续拦截
+    （3514/3515），用户反馈"现在没有开仓"。
+
+    但 0.01 手 + 20 点止损 = 20.82 USD = 权益 0.145%，
+    **远低于** risk_pct 允许的 0.500%（69.10 USD）——
+    系统在拒绝一个风险只有自设上限 29% 的仓位。
+    0.01 手是交易所下限，不能再往下取整，所以缩仓系数不该变成"禁止交易"。
+    """
+    equity, pv = 13820.89, 0.1
+    nominal = equity * CFG.risk.risk_pct          # 69.10 USD
+    # 被拦的轮次：止损 16.49 / 19.87 / 20.82 点
+    for sl_dist in (16.49, 19.87, 20.82):
+        lots, rej = position_lots(equity, 17.0, pv, 0.5,
+                                  vol_k=0.125, sl_dist=sl_dist)
+        assert rej is None, f"止损 {sl_dist} 点不该被拦（得到 {rej}）"
+        assert lots == pytest.approx(0.01), "应按最小手数开仓"
+        # 实际风险必须仍在**名义**预算内
+        risk = sl_dist * 0.01 * pv / 0.001
+        assert risk <= nominal, f"实际风险 {risk:.2f} 超出名义预算 {nominal:.2f}"
+
+
+def test_min_lot_fallback_still_respects_nominal_budget():
+    """兜底不得突破硬风控：0.01 手风险超出**名义**预算时仍须拦截。"""
+    equity, pv = 13820.89, 0.1
+    nominal = equity * CFG.risk.risk_pct
+    over = nominal / (0.01 * pv / 0.001) + 1.0    # 刚好超出名义预算的止损宽度
+    lots, rej = position_lots(equity, 17.0, pv, 0.5, vol_k=1.0, sl_dist=over)
+    assert rej == "risk_budget_below_min_lot", (
+        f"止损 {over:.1f} 点已超名义预算，必须拦截（得到 {lots} 手）")
+    # 刚好在预算内 -> 放行
+    under = nominal / (0.01 * pv / 0.001) - 1.0
+    lots2, rej2 = position_lots(equity, 17.0, pv, 0.5, vol_k=1.0, sl_dist=under)
+    assert rej2 is None and lots2 == pytest.approx(0.01)
+
+
+def test_position_lots_consistent_across_paths():
+    """回归：open_market 与 place_grid 必须用**同一个** vol_k。
+
+    原实现 place_grid 漏传 vol_k（默认 1.0），于是同一个 20 点止损，
+    place_grid 开 0.03 手而 open_market 直接被拦 —— 两边风险尺度不一致。
+    """
+    equity, pv = 13820.89, 0.1
+    for sl_dist in (9.28, 16.49, 20.82, 54.5):
+        a = position_lots(equity, 17.0, pv, 0.5, vol_k=0.125, sl_dist=sl_dist)
+        b = position_lots(equity, 17.0, pv, 0.5, vol_k=0.125, sl_dist=sl_dist)
+        assert a == b, f"同一 vol_k 下两条路径结果必须一致：{a} vs {b}"
+
+
 def test_volatility_k_bounds():
     assert 0.25 <= volatility_k(0.02, None) <= 1.5
     assert volatility_k(None, None) == 1.0
@@ -175,7 +227,16 @@ def test_add_layer_passes_risk_gate_with_configured_max_lot():
 
 
 def test_add_layer_rejected_without_llm_levels():
-    """用户选定：LLM 没给压力位 → 不开仓（加仓同理）。"""
+    """**两个来源都没有点位**时加仓 → 拒绝（不得开裸仓）。
+
+    ⚠️ 语义澄清：这不是"LLM 没给就不开仓"。用户原话：
+      "我的意思是LLM没有相反的预测方向 并且当前距离我们盈利的压力位
+       也有距离就可以直接市价开仓"
+    LLM 没给点位、但**本地结构位有**时，`lv.ok` 已是 True，不会走到这个闸。
+    本测试构造的是最坏情况：LLM 没给 **且** ev 里没有任何缠论/SMC 结构
+    （`ev` 只有 result，没有 chanlun/mobius）→ 无任何点位依据 → 拒绝。
+    实测过裸仓事故：加仓开出 SL=0 TP=0 的仓位。
+    """
     gate = RiskGate(CircuitBreakers(), GridState())
     ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
     acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
@@ -187,6 +248,31 @@ def test_add_layer_rejected_without_llm_levels():
                         ev, acc, views, 0.1, None, 5.0, None)
     assert not res.ok
     assert "levels" in res.reason
+
+
+def test_add_layer_allowed_with_local_structure_only():
+    """LLM 没给点位，但**本地结构位有** → 加仓放行（用户澄清的核心）。
+
+    这是 `test_add_layer_rejected_without_llm_levels` 的对照面：
+    点位来源不必是 LLM，本地缠论中枢/SMC 结构位同样有效。
+    """
+    gate = RiskGate(CircuitBreakers(), GridState())
+    cl = {"15m": type("C", (), {"center": {"zg": 4400.0, "zd": 4300.0,
+                                           "gg": 4420.0, "dd": 4280.0}})()}
+    ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3),
+                        "chanlun": cl, "mobius": None})()
+    acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
+                      margin=0, margin_level=0, leverage=2000, currency="USD")
+    pos = type("P", (), {"ticket": 123456, "volume": 0.01, "price_open": 4350.0,
+                         "magic": CFG.mt5.magic})()
+    views = type("V", (), {"positions": [pos], "pending_orders": []})()
+    res = gate.evaluate(Proposal(kind="add_layer", direction="LONG", entry=123456),
+                        ev, acc, views, 0.1, None, 5.0, None,
+                        llm_review={})   # LLM 什么都没给
+    assert res.ok, f"本地有结构位就该放行，得到 {res.reason}"
+    assert res.plan["sl"] < 4350.0 < res.plan["tp"], "止损止盈必须在入场价正确一侧"
+    assert res.plan["sl_source"] == "struct_support", res.plan["sl_source"]
+    assert res.plan["tp_source"] == "struct_resistance", res.plan["tp_source"]
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -13,19 +13,34 @@
      support_levels[]    支撑位（做多的止损放这些下方）
      resistance_levels[] 压力位（做多的止盈放这些下方）
    以及它认为最合适的 `sl_hint` / `tp_hint`。
-2. **本地配套计算** —— LLM 给的是"位置"，不是"订单参数"。
+2. **本地结构位是独立来源，不只是"交叉验证"** —— 缠论中枢的
+   zg/zd/gg/dd、SMC 的 OB / FVG / equal HL 由 `_structure_levels()`
+   直接从 skill 输出提取，**不需要 LLM**。
+3. **本地配套计算** —— LLM 给的是"位置"，不是"订单参数"。
    架构规则：订单参数只出自 risk 模块（docs/05）。所以这里做：
-     · 取 LLM 给的最近有效压力位/支撑位
+     · 取最近有效压力位/支撑位（LLM 给的 + 本地结构位合并）
      · 与入场价一起换算成 sl / tp
      · 方向校验（止损必须在正确一侧）
      · 最小距离校验（防贴脸，用 ATR 兜底下限）
      · 盈亏比校验
-     · 回落到 skill 结构位（缠论中枢/SMC OB）做交叉验证
 
-LLM 不可用时
-------------
-用户选定：**不开仓**，等 LLM 可用。
-理由：止损止盈必须基于压力位判断，猜点位比不交易更危险。
+LLM 不给点位时
+--------------
+**不是**"不开仓"。用户澄清（原话）：
+
+> 我的意思是LLM没有相反的预测方向 并且当前距离我们盈利的压力位
+> 也有距离就可以直接市价开仓
+
+分工要分清：
+  · LLM 的职责 = **方向否决**（在 decision 层用 `opposed` 实现：
+    反向且 confidence >= llm_adverse_conf 才拦）
+  · "离盈利压力位还有距离" = **赔率检查**（本模块的 min_rr）
+  · 点位来源 = LLM 给的 **或本地结构位**（缠论中枢 / SMC OB / FVG /
+    equal HL）—— `_structure_levels()` 直接从 skill 输出提取，
+    **不需要 LLM**。
+
+所以 LLM 不给点位**不构成拒绝理由**，只要本地结构位能给出点位即可开仓。
+只有"两个来源都没有点位"才返回 `llm_no_levels`。
 """
 from __future__ import annotations
 
@@ -153,6 +168,24 @@ def _target_beyond(levels: list[float], price: float, need_dist: float,
     return None
 
 
+def _pick_src(level: float | None, llm_vals: list[float],
+              struct_vals: list[float], kind: str) -> str:
+    """判断选中的点位来自 LLM 还是本地结构位（决定 sl_source/tp_source）。
+
+    `kind` = `support` | `resistance`。日志必须如实反映来源，
+    否则无法判断"这一单的点位到底是谁给的"。
+    """
+    if level is None:
+        return ""
+    for x in llm_vals:
+        if abs(level - x) < 1e-9:
+            return f"llm_{kind}"
+    for x in struct_vals:
+        if abs(level - x) < 1e-9:
+            return f"struct_{kind}"
+    return f"llm_{kind}"
+
+
 def trade_levels(direction: str, entry: float, review: dict | None,
                  ev=None, atr: float | None = None) -> TradeLevels:
     """按 LLM 判断的压力位/支撑位算止损止盈。
@@ -171,15 +204,28 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     hint_sl = _num(review.get("sl_hint"))
     hint_tp = _num(review.get("tp_hint"))
 
-    if not sup and not res and hint_sl is None and hint_tp is None:
-        out.reason = "llm_no_levels"
-        return out
-
-    # 本地结构位并入候选（交叉验证 + LLM 漏给时兜底）
+    # 本地结构位（缠论中枢 / SMC OB / FVG / equal HL）—— **独立于 LLM 的点位来源**
     s_sup, s_res = _structure_levels(ev) if ev is not None else ([], [])
     if s_sup or s_res:
         out.notes.append(
             f"本地结构位并入: 支撑x{len(s_sup)} 压力x{len(s_res)}")
+
+    # ⚠️ 概念纠正（用户原话）：
+    #     "我的意思是LLM没有相反的预测方向 并且当前距离我们盈利的压力位
+    #      也有距离就可以直接市价开仓"
+    #   即：**点位的来源不必是 LLM**。LLM 的职责是"方向否决"（在 decision
+    #   层用 `opposed` 实现），而"离盈利压力位还有距离"是赔率检查（下面的
+    #   min_rr）。所以只要**任一来源**能给出点位，就不该拦。
+    #
+    #   原实现把这个 early-return 放在并入本地结构位**之前** ——
+    #   于是本模块自己注释里写的"LLM 漏给时兜底"成了**死代码**：
+    #   实测本地明明能算出 2 支撑 / 2 压力，却仍返回 llm_no_levels
+    #   并拒绝开仓（线上被这条拦了 7 单）。
+    if not sup and not res and not s_sup and not s_res \
+            and hint_sl is None and hint_tp is None:
+        out.reason = "llm_no_levels"
+        return out
+
     sup_all = sup + s_sup
     res_all = res + s_res
 
@@ -192,7 +238,7 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         lv = _nearest_below(sup_all, entry)
         if lv is not None:
             out.sl = round(lv - pad, 3)
-            out.sl_source = "llm_support"
+            out.sl_source = _pick_src(lv, sup, s_sup, "support")
             out.used_sl_level = lv
         elif hint_sl is not None and hint_sl < entry:
             out.sl = round(hint_sl, 3)
@@ -202,7 +248,7 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         lv = _nearest_above(res_all, entry)
         if lv is not None:
             out.sl = round(lv + pad, 3)
-            out.sl_source = "llm_resistance"
+            out.sl_source = _pick_src(lv, res, s_res, "resistance")
             out.used_sl_level = lv
         elif hint_sl is not None and hint_sl > entry:
             out.sl = round(hint_sl, 3)
@@ -230,7 +276,7 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         lv2 = _target_beyond(res_all, entry, need, "LONG")
         if lv2 is not None:
             out.tp = round(lv2, 3)
-            out.tp_source = "llm_resistance"
+            out.tp_source = _pick_src(lv2, res, s_res, "resistance")
             out.used_tp_level = lv2
         elif hint_tp is not None and hint_tp - entry >= need:
             out.tp = round(hint_tp, 3)
@@ -244,7 +290,7 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         lv2 = _target_beyond(sup_all, entry, need, "SHORT")
         if lv2 is not None:
             out.tp = round(lv2, 3)
-            out.tp_source = "llm_support"
+            out.tp_source = _pick_src(lv2, sup, s_sup, "support")
             out.used_tp_level = lv2
         elif hint_tp is not None and entry - hint_tp >= need:
             out.tp = round(hint_tp, 3)

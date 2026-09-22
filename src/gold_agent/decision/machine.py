@@ -103,12 +103,26 @@ class DecisionEngine:
                     cancel = self._pending_cancel(pending, s_eff, r.sigma)
                     if cancel is not None:
                         prop = cancel
-            elif pending:
-                cancel = self._pending_cancel(pending, s_eff, r.sigma)
-                prop = cancel if cancel is not None else Proposal(
-                    kind="hold", reasons=[f"已有 {len(pending)} 张挂单等待成交"])
             else:
+                # ⚠️ 挂单**不再阻塞**开仓判定（用户反馈"很难下单"）。
+                #    原实现是 `elif pending: hold("已有挂单等待成交")`，
+                #    于是挂单存在期间 `_decide_flat` 永不执行 ——
+                #    实测强信号被这条挡住 **167 轮**，而挂单 65.5% 最终被撤销
+                #    （有效期 4 小时，等于白白错过整段行情）。
+                #    现在：先问决策层该不该开仓；若它要给**市价单**，
+                #    就先撤掉旧挂单再市价进（方向由 _decide_flat 决定）。
                 prop = self._decide_flat(ctx, s_eff, r.sigma)
+                if pending and prop.kind == "open_market":
+                    # 有冲突的旧挂单 -> 先撤，下一轮再市价开
+                    cancel = self._pending_cancel(pending, s_eff, r.sigma)
+                    prop = cancel if cancel is not None else Proposal(
+                        kind="cancel_pending", direction=pending[0].type,
+                        entry=pending[0].ticket,
+                        reasons=["改走市价开仓 -> 撤掉旧挂单"])
+                elif pending and prop.kind == "place_grid":
+                    # 已有挂单就别重复挂
+                    prop = Proposal(kind="hold",
+                                    reasons=[f"已有 {len(pending)} 张挂单等待成交"])
         except Exception as e:
             decision_log({"event": "decision_error", "error": str(e),
                           "round": ctx.round_id})
@@ -179,6 +193,13 @@ class DecisionEngine:
         verdict = review.get("verdict")
         conf = float(review.get("confidence") or 0)
         want = "bullish" if direction == "LONG" else "bearish"
+        # ⚠️ `aligned` 曾是市价开仓的**唯一**条件，但它是死代码：
+        #    实测 372 个 review 的 confidence 最大值只有 0.550，
+        #    而 llm_align_conf=0.60 -> **永远不可能成立** ->
+        #    open_market 提案恒为 0，系统只会挂单（用户反馈"很难下单"）。
+        #    LLM 给低置信度是诚实的（它自报 chanlun_mode=structure_proxy、
+        #    probability_tier=very_low）。所以市价开仓改为：
+        #    **信号够强 且 LLM 没有明确反对** 即可，不再要求 confidence 达标。
         aligned = (verdict == want) and conf >= CFG.decision.llm_align_conf
         opposed = (verdict is not None and verdict != "neutral" and verdict != want
                    and conf >= CFG.decision.llm_adverse_conf)
@@ -192,21 +213,25 @@ class DecisionEngine:
             return Proposal(kind="hold",
                             reasons=reasons + [f"LLM 反对 {verdict_label(verdict)}/{conf:.2f}"])
 
-        if ctx.ev.result.regime == "mean_reverting":
-            # 均值回归 regime → 只挂限价单（用户要求：不再用网格，只挂预测的那一单）
-            return Proposal(kind="place_grid", direction=direction, entry=ctx.last_close,
-                            reasons=reasons + ["行情为均值回归 -> 改用限价挂单"])
-        if aligned:
-            # entry = 当前价：市价单的实际成交价由 executor 取 bid/ask，
-            # 这里只作为风控算止损止盈的参考锚点。
+        # ---- 仅均值回归 regime 用挂单；其余一律市价开仓（用户选定）----
+        # 用户原话："现在这种很难下单 我们要考虑用直接按照市价开仓 少用挂单"
+        # 实测挂单 65.5% 被撤销，且挂单存在期间 `_decide_flat` 不会执行
+        # -> 强信号被挂单阻塞 167 轮。
+        if CFG.decision.pending_only_in_mean_revert and \
+                ctx.ev.result.regime != "mean_reverting":
             return Proposal(kind="open_market", direction=direction,
-                            entry=ctx.last_close, reasons=reasons)
-        # 未对齐：LLM 没参与 / 说中性 / 置信不足
+                            entry=ctx.last_close,
+                            reasons=reasons + ["非均值回归行情 -> 直接市价开仓"])
+
+        if ctx.ev.result.regime == "mean_reverting":
+            # 均值回归：回踩概率高，挂限价单等更好的价
+            return Proposal(kind="place_grid", direction=direction, entry=ctx.last_close,
+                            reasons=reasons + ["行情为均值回归 -> 挂限价单等回踩"])
+
+        # 关闭了 pending_only_in_mean_revert 时的旧行为：未对齐则挂单
         if not ctx.llm_available and not CFG.decision.allow_grid_without_llm:
-            # LLM 缺失时不默认挂限价（research/20 的教训：那会让系统几乎只挂单）
             return Proposal(kind="hold",
                             reasons=reasons + ["LLM 不可用 -> 观望（不默认挂单）"])
-        # 先挂限价单（回踩位），等回踩
         return Proposal(kind="place_grid", direction=direction, entry=ctx.last_close,
                         reasons=reasons + ["LLM 未确认 -> 先挂限价单"])
 

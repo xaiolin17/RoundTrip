@@ -211,8 +211,14 @@ class RiskGate:
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
 
+            # 手数：与 open_market **用同一个 vol_k**（用户选定：统一风险尺度）。
+            # 原实现漏传 vol_k -> 默认 1.0，于是同一个 20 点止损，
+            # place_grid 开 0.03 手而 open_market 直接被拦，两边风险尺度不一致。
+            vol_k_grid = volatility_k(realized_vol, None)
+            if r.disagreement:
+                vol_k_grid *= CFG.decision.disagreement_lot_mult
             base_lots, rej = position_lots(account.equity, atr, point_value_per_lot, 0.5,
-                                           sl_dist=lv.sl_dist or None)
+                                           vol_k=vol_k_grid, sl_dist=lv.sl_dist or None)
             if rej:
                 return Approved(ok=False, reason=f"grid base: {rej}")
             order = {"level": pe.entry, "lots": base_lots,

@@ -196,6 +196,12 @@ class DecisionConfig:
     llm_adverse_conf: float = _TOML.get("decision", {}).get("llm_adverse_conf", 0.7)
     #: 未对齐 LLM 时是否仍允许挂网格（False = 直接 hold，等 LLM 明确表态）
     allow_grid_without_llm: bool = _TOML.get("decision", {}).get("allow_grid_without_llm", True)
+    #: 只在均值回归 regime 用挂单，其余一律市价开仓（用户选定）。
+    #: 用户原话："现在这种很难下单 我们要考虑用直接按照市价开仓 少用挂单"
+    #: 实测：挂单 65.5% 被撤销，且挂单存在期间 `_decide_flat` 不执行
+    #: -> 强信号被挂单阻塞 167 轮。
+    pending_only_in_mean_revert: bool = _TOML.get("decision", {}).get(
+        "pending_only_in_mean_revert", True)
 
 
 @dataclass

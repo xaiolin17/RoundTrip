@@ -29,8 +29,9 @@ BELOW = CFG.decision.open_threshold - 0.4
 def _ctx(score: float, sigma: float = 0.3, holding: list[PositionRow] | None = None,
          llm: dict | None = None, high_risk: bool = False,
          baseline: float = 0.0, vol_pct: float = 0.9,
-         llm_available: bool | None = None) -> DecisionContext:
-    ev = FusedEvidence(result=FusionResult(score=score, sigma=sigma, regime="trending",
+         llm_available: bool | None = None,
+         regime: str = "trending") -> DecisionContext:
+    ev = FusedEvidence(result=FusionResult(score=score, sigma=sigma, regime=regime,
                                            score_baseline=baseline,
                                            vol_percentile=vol_pct))
     pos = PositionsView(positions=holding or [])
@@ -70,11 +71,17 @@ def test_flat_open_market_aligned_llm():
     assert p.direction == "LONG"
 
 
-def test_flat_pending_when_not_aligned():
-    """未对齐 LLM → 挂一张限价单（用户要求：取消网格，只挂预测的那一单）。"""
+def test_flat_market_when_not_aligned():
+    """未对齐 LLM 但信号够强 → **市价开仓**（用户要求：少用挂单）。
+
+    原断言是 `place_grid`。用户反馈"很难下单"后改为市价主路径：
+    实测 `aligned` 是死代码（372 个 review 的 confidence 最大 0.550，
+    而 llm_align_conf=0.60），导致 open_market 提案恒为 0。
+    现在只要信号够强且 LLM 未明确反对，就走市价。
+    """
     e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
     p = e.decide(_ctx(score=-ABOVE, llm={"review": {"verdict": "bullish", "confidence": 0.6}}))
-    assert p.kind == "place_grid"
+    assert p.kind == "open_market"
     assert p.direction == "SHORT"
 
 
@@ -200,8 +207,10 @@ def test_holding_management_not_blocked_by_pending():
 def test_pending_cancel_uses_correct_direction():
     """回归：撤挂单的方向判定必须正确（不得把做多挂单当空单撤）。
 
-    做多挂单(BUY_LIMIT) + S_eff 为正（看涨）→ **不应**撤单。
-    做多挂单 + S_eff 强负（看跌）→ **应该**撤单。
+    ⚠️ 行为已变更（用户要求少用挂单）：**有挂单且信号够强时一律撤单改走市价**。
+    原断言"方向一致的挂单 → hold（继续等）"，现在改成撤单 —— 因为挂单
+    65.5% 最终被撤销，且会阻塞市价开仓 167 轮。但**撤单方向仍必须正确**，
+    这是本测试真正要守住的东西。
     """
     from gold_agent.mt5.client import OrderRow
     e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
@@ -216,25 +225,71 @@ def test_pending_cancel_uses_correct_direction():
         c.positions.pending_orders = [_mk(direction)]
         return c
 
-    # 做多挂单 + 看涨 → 继续等待（不撤）
-    p = e.decide(_ctx_pend(score=ABOVE, direction="LONG"))
-    assert p.kind == "hold", f"做多挂单在看涨时不该撤单，得到 {p.kind}"
+    # 四个组合都必须撤单，且方向 = 原挂单方向（不能颠倒）
+    for score, direction in ((ABOVE, "LONG"), (ABOVE, "SHORT"),
+                             (-ABOVE, "LONG"), (-ABOVE, "SHORT")):
+        p = e.decide(_ctx_pend(score=score, direction=direction))
+        assert p.kind == "cancel_pending", (
+            f"{direction} 挂单在 S_eff={score:+.2f} 时应撤单改市价，得到 {p.kind}")
+        assert p.direction == direction, (
+            f"撤单方向必须是 {direction}，得到 {p.direction}（方向颠倒）")
 
-    # 做多挂单 + 看跌 → 撤单
-    p = e.decide(_ctx_pend(score=-ABOVE, direction="LONG"))
-    assert p.kind == "cancel_pending", f"做多挂单在看跌时应撤单，得到 {p.kind}"
-    assert p.direction == "LONG", "撤单方向应为 LONG"
 
-    # 做空挂单 + 看跌 → 继续等待
-    e2 = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
-    p = e2.decide(_ctx_pend(score=-ABOVE, direction="SHORT"))
-    assert p.kind == "hold", f"做空挂单在看跌时不该撤单，得到 {p.kind}"
+def test_pending_does_not_block_market_entry():
+    """回归（用户反馈"很难下单"）：**挂单不得阻塞市价开仓**。
 
-    # 做空挂单 + 看涨 → 撤单
-    e3 = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
-    p = e3.decide(_ctx_pend(score=ABOVE, direction="SHORT"))
-    assert p.kind == "cancel_pending", f"做空挂单在看涨时应撤单，得到 {p.kind}"
+    实测事故：原实现 `elif pending: hold("已有 N 张挂单等待成交")`
+    → 挂单存在期间 `_decide_flat` 永不执行 → 强信号被挡 **167 轮**。
+    而挂单有效期 4 小时、65.5% 最终被撤销，等于白白错过整段行情。
+
+    现在：强信号 + 有挂单 → 撤掉旧挂单（下一轮市价进），而不是死等。
+    """
+    from gold_agent.mt5.client import OrderRow
+    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    pend = OrderRow(ticket=666, symbol="XAUUSDm", type="SHORT", volume=0.01,
+                    price_open=4340, sl=0, tp=0, time_setup=0, comment="",
+                    magic=CFG.mt5.magic)
+    c = _ctx(score=-ABOVE, llm={"review": {"verdict": "neutral", "confidence": 0.35}})
+    c.positions.pending_orders = [pend]
+    p = e.decide(c)
+    assert p.kind != "hold", (
+        f"强信号时挂单不该让系统死等（得到 {p.kind}）—— "
+        "这正是 open_market 提案恒为 0 的原因之一")
+    assert p.kind == "cancel_pending", "应先撤掉旧挂单改走市价"
     assert p.direction == "SHORT"
+
+
+def test_aligned_is_not_required_for_market_entry():
+    """回归：市价开仓**不再要求** confidence 达到 llm_align_conf。
+
+    实测：372 个 review 的 confidence 最大值只有 0.550，平均 0.357，
+    而 llm_align_conf=0.60 → `aligned` 永远不可能成立 →
+    **open_market 是死代码**（历史提案数 = 0）。
+    现在只要信号够强且 LLM 未明确反对即可市价开仓。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    # 实测最常见的形状：neutral / 0.35
+    p = e.decide(_ctx(score=ABOVE,
+                      llm={"review": {"verdict": "neutral", "confidence": 0.35}}))
+    assert p.kind == "open_market", "conf 未达阈值不应阻止市价开仓"
+    # 最高实测值 0.55 也不行（低于 0.60）
+    p = e.decide(_ctx(score=ABOVE,
+                      llm={"review": {"verdict": "bullish", "confidence": 0.55}}))
+    assert p.kind == "open_market"
+    # 只有 LLM **明确反对**（达 llm_adverse_conf）才拦
+    p = e.decide(_ctx(score=ABOVE,
+                      llm={"review": {"verdict": "bearish", "confidence": 0.75}}))
+    assert p.kind == "hold"
+
+
+def test_pending_only_in_mean_revert():
+    """用户选定：仅均值回归 regime 挂单，其余市价开仓。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    llm = {"review": {"verdict": "neutral", "confidence": 0.35}}
+    p = e.decide(_ctx(score=ABOVE, regime="trending", llm=llm))
+    assert p.kind == "open_market", "趋势行情应市价开仓"
+    p = e.decide(_ctx(score=ABOVE, regime="mean_reverting", llm=llm))
+    assert p.kind == "place_grid", "均值回归行情才挂限价单等回踩"
 
 
 def test_holding_exit_streak():
@@ -351,19 +406,29 @@ def test_llm_opposed_blocks_entry():
 
 
 def test_llm_unavailable_no_default_grid(monkeypatch):
-    """LLM 缺失且不允许无 LLM 挂网格 → hold（不默认放网格）。"""
+    """LLM 缺失时**不再默认挂网格**。
+
+    用户要求少用挂单后，强信号走市价开仓；`allow_grid_without_llm=False`
+    这条旧闸只影响"未对齐且非市价路径"的兜底分支。这里验证核心意图：
+    LLM 缺失不会退化成"默认挂单"。
+    """
     monkeypatch.setattr(CFG.decision, "allow_grid_without_llm", False, raising=False)
     e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
     p = e.decide(_ctx(score=ABOVE, llm=None, llm_available=False))
-    assert p.kind == "hold", "LLM 缺失时不应默认挂网格"
+    assert p.kind != "place_grid", "LLM 缺失时不应默认挂网格"
+    assert p.kind == "open_market", "强信号 + 无 LLM 反对 → 市价开仓"
 
 
-def test_llm_neutral_still_allows_pending():
-    """LLM 参与但说中性 → 仍可挂限价单（正常降级，不是缺失）。"""
+def test_llm_neutral_still_allows_entry():
+    """LLM 参与但说中性 → 信号够强就走市价（中性不是反对）。
+
+    原断言是 `place_grid`。现在中性 verdict 不再把交易降级成挂单 ——
+    实测 verdict 有 335/372 是 neutral，若中性就挂单，等于几乎只挂单。
+    """
     e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
     p = e.decide(_ctx(score=ABOVE,
                       llm={"review": {"verdict": "neutral", "confidence": 0.3}}))
-    assert p.kind == "place_grid", "LLM 中性时挂限价单仍是合法选择"
+    assert p.kind == "open_market", "LLM 中性时强信号应市价开仓"
 
 
 def test_runner_console_shows_action_on_trade_rounds():
