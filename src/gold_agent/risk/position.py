@@ -203,10 +203,16 @@ def conservative_win_rate(wins: int, n: int, fallback: float = 0.5,
 def position_lots(equity: float, atr: float, point_value_per_lot: float,
                   win_rate: float, vol_k: float = 1.0,
                   volume_min: float = 0.01, volume_step: float = 0.01,
-                  volume_max: float = 10.0) -> tuple[float, str | None]:
-    """ATR 风险预算 + Half-Kelly 上限 + 波动率目标系数。
+                  volume_max: float = 10.0,
+                  sl_dist: float | None = None) -> tuple[float, str | None]:
+    """风险预算 + Half-Kelly 上限 + 波动率目标系数。
 
     返回 (lots, reject_reason)。
+
+    `sl_dist`：**实际**止损距离（价格单位）。缠论结构定价启用后，止损宽度
+    由 0.618 回调位决定，与 ATR 无关；仓位必须按同一个距离反推，
+    否则单笔风险会随止损加宽等比放大（实测 4h 分型两倍 149 → 单笔
+    风险 1.49% 而非预算的 0.5%）。传 None 时退回 ATR 距离（旧行为）。
     """
     if atr is None or atr <= 0:
         return 0.0, "no_atr"
@@ -218,7 +224,9 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     risk_usd = min(risk_usd, kelly_cap_usd) if kelly_cap_usd > 0 else risk_usd
     # 波动率目标系数（外部传入 vol_k）
     risk_usd *= vol_k
-    sl_points = CFG.risk.sl_atr_mult * atr / 0.001      # XAUUSDm point=0.001
+    if sl_dist is None:
+        sl_dist = CFG.risk.sl_atr_mult * atr          # 旧行为：按 ATR
+    sl_points = sl_dist / 0.001                        # XAUUSDm point=0.001
     per_lot_risk = sl_points * point_value_per_lot
     if per_lot_risk <= 0:
         return 0.0, "bad_point_value"

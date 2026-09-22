@@ -272,6 +272,8 @@ class Graph:
 
             # t7 risk
             wr = self.deal_feedback.current_win_rate() if self.deal_feedback is not None else 0.5
+            # LLM 判断的压力位/支撑位要传进风控 —— 止损止盈按它算
+            _rev = ((st.get("llm") or {}).get("review") or None)
             approved: Approved = self.gate.evaluate(
                 Proposal(kind=prop.kind, direction=prop.direction, entry=prop.entry,
                          tp_struct=prop.tp_struct, reasons=prop.reasons, evidence_ids=[]),
@@ -281,9 +283,15 @@ class Graph:
                 realized_vol=st["fused"].indicators.realized_vol_daily
                 if st["fused"].indicators else None,
                 win_rate=wr,
-                position_adds=self._position_adds)
+                position_adds=self._position_adds,
+                llm_review=_rev,
+                # 自研回调检测需要小周期 K 线（缠论代理在小周期上不准）
+                frames=st["bundle"].frames)
             st["approved"] = approved
-            summary["risk"] = {"ok": approved.ok, "reason": approved.reason}
+            # plan 必须放进 summary：控制台要靠它显示方向/入场/止损/止盈
+            # （只放 ok/reason 的话，显示层读不到价位，会打出 "None手"）
+            summary["risk"] = {"ok": approved.ok, "reason": approved.reason,
+                               "plan": approved.plan}
             if not approved.ok:
                 trade_log({"event": "risk_reject", "round": round_id,
                            "kind": prop.kind, "reason": approved.reason,
@@ -351,16 +359,19 @@ class Graph:
                     pass
             return res
         if kind == "close_position":
+            # 必须带 lots：平仓请求缺 volume 会被 MT5 拒绝
             req = OrderPlan(kind="close_position", direction=plan.get("direction"),
+                            lots=float(plan["lots"]),
                             position_ticket=int(plan["position_ticket"]),
                             comment="goldagent-close",
                             idempotency_key=f"close-{plan['position_ticket']}-{int(time.time())}")
             return await self.executor.execute(req)
         if kind == "modify_sltp":
-            # 保护性移损：TP 保持原位（None = 不动），SL 推到锁盈位（tp_struct 携带新 SL）
+            # 保护性移损：SL 推到锁盈位（tp_struct 携带新 SL）；
+            # TP 保持原位（keep_tp 由风控从原持仓带出，None 才不动）
             req = OrderPlan(kind="modify_sltp", direction=plan.get("direction"),
                             position_ticket=int(plan["position_ticket"]),
-                            sl=float(plan["new_sl"]), tp=None,
+                            sl=float(plan["new_sl"]), tp=plan.get("keep_tp"),
                             comment="goldagent-lock",
                             idempotency_key=f"lock-{plan['position_ticket']}-{int(time.time())}")
             res = await self.executor.execute(req)
@@ -370,7 +381,8 @@ class Graph:
                            "direction": plan.get("direction")})
             return res
         if kind == "add_layer":
-            # 顺势加仓：固定 0.01 手，同向市价；成功后计数+1、记录分数/置信/基础差值（指数阶梯）
+            # 顺势加仓：固定 0.01 手，同向市价；自带 ATR 算出的 SL/TP
+            # （原实现不带 tp/sl → 加仓开成裸仓）
             req = OrderPlan(kind="open_market", direction=plan["direction"],
                             lots=float(plan["lots"]), tp=plan.get("tp"),
                             sl=plan.get("sl"), comment="goldagent-add",
@@ -494,6 +506,13 @@ class Graph:
             "invalidation": review.get("invalidation"),
             "next_observation": review.get("next_observation"),
             "risk_flags": review.get("risk_flags"),
+            # 压力位/支撑位 —— 止损止盈的定价依据，必须留痕可审计
+            "support_levels": review.get("support_levels"),
+            "resistance_levels": review.get("resistance_levels"),
+            "sl_hint": review.get("sl_hint"),
+            "tp_hint": review.get("tp_hint"),
+            "level_reason": review.get("level_reason"),
+            "key_levels": review.get("key_levels"),
             "review_coverage": (round(self.llm.review_coverage, 3)
                                 if self.llm is not None else None),
         })

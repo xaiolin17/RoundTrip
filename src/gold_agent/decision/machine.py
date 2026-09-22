@@ -197,7 +197,10 @@ class DecisionEngine:
             return Proposal(kind="place_grid", direction=direction, entry=ctx.last_close,
                             reasons=reasons + ["行情为均值回归 -> 改用限价挂单"])
         if aligned:
-            return Proposal(kind="open_market", direction=direction, reasons=reasons)
+            # entry = 当前价：市价单的实际成交价由 executor 取 bid/ask，
+            # 这里只作为风控算止损止盈的参考锚点。
+            return Proposal(kind="open_market", direction=direction,
+                            entry=ctx.last_close, reasons=reasons)
         # 未对齐：LLM 没参与 / 说中性 / 置信不足
         if not ctx.llm_available and not CFG.decision.allow_grid_without_llm:
             # LLM 缺失时不默认挂限价（research/20 的教训：那会让系统几乎只挂单）
@@ -298,9 +301,19 @@ class DecisionEngine:
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
                             reasons=[f"持仓 {age_h:.1f} 小时且亏损"])
         # ---- 保护性移损（用户规则：利润 > $10 时，把 SL 推到盈利 $2 处，锁底搏上限）----
-        point_value = getattr(ctx, "point_value_per_lot", 1.0) * pos.volume
-        profit_locked_sl = (pos.price_open + 2.0 / max(point_value, 1e-9) if direction == "LONG"
-                            else pos.price_open - 2.0 / max(point_value, 1e-9))
+        # `point_value_per_lot` 的单位是「每 **point**(0.001) / 每手」的美元数
+        # （XAUUSDm = 0.1，见 position_lots 里 `sl_points * point_value_per_lot`）。
+        # 要把它换算成「每 1.0 价格单位 / 每手」须再除以 point(0.001)：
+        #     每手每 1.0 价格单位 = 0.1 / 0.001 = $100
+        # ⚠️ 原实现写 `2.0 / (point_value_per_lot * volume)`，漏了 /point，
+        #    算出 SL = 开仓价 + 2000（远超现价）→ MT5 报 'Invalid stops'，
+        #    移损从未成功过一次。
+        _POINT = 0.001                      # XAUUSDm point
+        usd_per_price_unit = (getattr(ctx, "point_value_per_lot", 1.0)
+                              / _POINT * pos.volume)
+        profit_locked_sl = (pos.price_open + 2.0 / max(usd_per_price_unit, 1e-9)
+                            if direction == "LONG"
+                            else pos.price_open - 2.0 / max(usd_per_price_unit, 1e-9))
         sl_still_open = (pos.sl is not None and pos.sl > 0 and
                          ((direction == "LONG" and pos.sl < pos.price_open) or
                           (direction == "SHORT" and pos.sl > pos.price_open)))

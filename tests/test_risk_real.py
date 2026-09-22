@@ -14,6 +14,7 @@ from gold_agent.risk.grid import GridState
 from gold_agent.risk.position import (CircuitBreakers, conservative_win_rate,
                                       position_lots, volatility_k, wilson_lower)
 from gold_agent.risk.shrink import reachable_tp, shrink_for_pending, shrink_sl, shrink_tp
+from gold_agent.risk.structure import RETRACE_FAR, RETRACE_NEAR
 
 
 def test_position_lots_bounds():
@@ -94,11 +95,18 @@ def test_risk_gate_reject_paths():
 # ══════════════════════════════════════════════════════════════════
 # 单张限价挂单（用户要求：取消网格）
 # ══════════════════════════════════════════════════════════════════
+def _llm_rev(support, resistance):
+    """构造一个最小可用的 LLM review（压力位/支撑位）。"""
+    return {"verdict": "bullish", "confidence": 0.7,
+            "support_levels": list(support), "resistance_levels": list(resistance),
+            "level_reason": "测试用"}
+
+
 def test_place_grid_now_emits_single_pending_order():
-    """取消网格：`place_grid` 只产出**一张**挂单，且入场价是回踩 0.8×ATR。
+    """取消网格：`place_grid` 只产出**一张**挂单，入场价 = 0.618 回调带。
 
     实测问题：原实现按 `CFG.risk.grid_layers`（=2）挂多层，是网格行为。
-    用户要求只挂预测的那一单。
+    用户要求只挂预测的那一单；入场价改为回调带（回调到位反弹概率大）。
     """
     gate = RiskGate(CircuitBreakers(), GridState())
     ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
@@ -108,13 +116,25 @@ def test_place_grid_now_emits_single_pending_order():
     atr, close = 12.339, 4350.0
     df5 = pd.DataFrame({"high": [close] * 10, "low": [close] * 10,
                         "close": [close] * 10})
+    # 缠论兜底路径（不传 frames → 走缠论）
+    up = {"id": "segment:15m:1", "direction": "up",
+          "start_price": close - 30.0, "end_price": close - 5.0}
+    ev.chanlun = {"15m": type("C", (), {
+        "status": "ok", "center": None,
+        "raw": {"layers": {"segments": [up], "strokes": [], "fractals": []}}})()}
+    rev = _llm_rev([close - 25.0], [close + 40.0])
     res = gate.evaluate(Proposal(kind="place_grid", direction="LONG", entry=close),
-                        ev, acc, views, 0.1, df5, atr, None)
+                        ev, acc, views, 0.1, df5, atr, None, llm_review=rev)
     assert res.ok, f"应放行: {res.reason}"
     layers = res.plan["grid_plan"]
     assert len(layers) == 1, f"应只有一张挂单，实际 {len(layers)} 张（网格未取消）"
-    # 入场价 = 收盘价 - 0.8×ATR（做多回踩）
-    assert layers[0]["level"] == pytest.approx(close - CFG.risk.grid_atr_mult * atr, abs=0.5)
+    # 入场价落在回调带内（0.5~0.618），且在市价下方（做多限价单必须如此）
+    lo = up["end_price"] - RETRACE_FAR * (up["end_price"] - up["start_price"])
+    hi = up["end_price"] - RETRACE_NEAR * (up["end_price"] - up["start_price"])
+    assert min(lo, hi) <= layers[0]["level"] <= max(lo, hi), "入场价应在回调带内"
+    assert layers[0]["level"] < close, "做多限价单必须在市价下方"
+    assert res.plan["entry_source"] == "chanlun_segment"
+    assert res.plan["pullback_tf"] == "15m"
     # 必须带止损止盈，否则控制台看不到点位
     assert layers[0]["sl"] and layers[0]["tp"]
 
@@ -134,16 +154,168 @@ def test_max_lot_allows_configured_adds():
 
 
 def test_add_layer_passes_risk_gate_with_configured_max_lot():
-    """方案 A 验收：持 1 笔 0.01 手时，第 1 次加仓应能通过风控。"""
+    """方案 A 验收：持 1 笔 0.01 手时，第 1 次加仓应能通过风控。
+
+    注意 `add_layer` 的 `prop.entry` 装的是**持仓 ticket**（不是价格），
+    gate 靠它找到持仓、再用 `price_open` 作定价锚点。
+    """
     gate = RiskGate(CircuitBreakers(), GridState())
     ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
     acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
                       margin=0, margin_level=0, leverage=2000, currency="USD")
-    pos = type("P", (), {"volume": 0.01, "magic": CFG.mt5.magic})()
+    pos = type("P", (), {"ticket": 123456, "volume": 0.01, "price_open": 4350.0,
+                         "magic": CFG.mt5.magic})()
+    views = type("V", (), {"positions": [pos], "pending_orders": []})()
+    # 加仓也要有 LLM 压力位才能算止损止盈（用户要求）
+    res = gate.evaluate(Proposal(kind="add_layer", direction="LONG", entry=123456),
+                        ev, acc, views, 0.1, None, 5.0, None,
+                        llm_review=_llm_rev([4340.0], [4420.0]))
+    assert res.ok, f"第 1 次加仓不应被拦: {res.reason}"
+    assert res.plan["sl"] < 4350.0 < res.plan["tp"], "止损止盈必须在入场价正确一侧"
+
+
+def test_add_layer_rejected_without_llm_levels():
+    """用户选定：LLM 没给压力位 → 不开仓（加仓同理）。"""
+    gate = RiskGate(CircuitBreakers(), GridState())
+    ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
+    acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
+                      margin=0, margin_level=0, leverage=2000, currency="USD")
+    pos = type("P", (), {"ticket": 123456, "volume": 0.01, "price_open": 4350.0,
+                         "magic": CFG.mt5.magic})()
     views = type("V", (), {"positions": [pos], "pending_orders": []})()
     res = gate.evaluate(Proposal(kind="add_layer", direction="LONG", entry=123456),
                         ev, acc, views, 0.1, None, 5.0, None)
-    assert res.ok, f"第 1 次加仓不应被拦: {res.reason}"
+    assert not res.ok
+    assert "levels" in res.reason
+
+
+# ══════════════════════════════════════════════════════════════════
+# 执行层回归（4 个实测事故）
+# ══════════════════════════════════════════════════════════════════
+def _pos(ticket=123456, vol=0.01, sl=0.0, tp=0.0, price_open=4350.0):
+    from gold_agent.mt5.client import PositionRow
+    return PositionRow(ticket=ticket, symbol="XAUUSDm", type="LONG", volume=vol,
+                       price_open=price_open, sl=sl, tp=tp, profit=15.0,
+                       swap=0.0, time=0, comment="", magic=CFG.mt5.magic)
+
+
+def _views(poss):
+    return type("V", (), {"positions": poss, "pending_orders": []})()
+
+
+def _acc():
+    return AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
+                       margin=0, margin_level=0, leverage=2000, currency="USD")
+
+
+def _ev():
+    return type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
+
+
+class _FakeSI:
+    filling_mode = 2
+    ask, bid = 4350.00, 4349.80
+
+
+class _FakeClient:
+    def symbol_info(self):
+        return _FakeSI()
+
+
+def test_close_position_request_carries_volume():
+    """事故：平仓请求缺 volume → MT5 `(-2, 'Invalid "volume" argument')`。
+
+    实测后果：连续 100+ 轮平仓 100% 失败，信号翻空后仓位仍挂着。
+    """
+    from gold_agent.mt5.executor import Executor, OrderPlan
+
+    ex = Executor(_FakeClient())
+    req = ex._build_request(OrderPlan(kind="close_position", direction="LONG",
+                                      position_ticket=123456, lots=0.01))
+    assert req.get("volume") == 0.01, "平仓请求必须带 volume，否则 MT5 拒绝"
+    # 缺手数必须显式报错，而不是发出无效请求
+    with pytest.raises(Exception):
+        ex._build_request(OrderPlan(kind="close_position", direction="LONG",
+                                    position_ticket=123456))
+
+
+def test_close_position_plan_includes_lots():
+    """风控层必须把持仓手数带进 plan（executor 才有 volume 可用）。"""
+    gate = RiskGate(CircuitBreakers(), GridState())
+    res = gate.evaluate(Proposal(kind="close_position", direction="LONG", entry=123456),
+                        _ev(), _acc(), _views([_pos(vol=0.02)]), 0.1, None, 12.0, None)
+    assert res.ok, res.reason
+    assert res.plan["lots"] == 0.02, "plan 必须带原持仓手数"
+
+
+def test_modify_sltp_keeps_existing_tp():
+    """事故：TRADE_ACTION_SLTP 是整体覆盖，tp 传 0.0 = 删掉止盈 + 报 Invalid stops。"""
+    from gold_agent.mt5.executor import Executor, OrderPlan
+
+    ex = Executor(_FakeClient())
+    req = ex._build_request(OrderPlan(kind="modify_sltp", direction="LONG",
+                                      position_ticket=123456, sl=4330.0, tp=4360.0))
+    assert req.get("tp") == 4360.0, "移损不得抹掉原有止盈"
+    # 原持仓本来就没有 TP → 不带该键（不动），而不是写 0.0
+    req2 = ex._build_request(OrderPlan(kind="modify_sltp", direction="LONG",
+                                       position_ticket=123456, sl=4330.0, tp=None))
+    assert "tp" not in req2, "原持仓无 TP 时不应传 tp=0.0"
+
+    gate = RiskGate(CircuitBreakers(), GridState())
+    res = gate.evaluate(Proposal(kind="modify_sltp", direction="LONG", entry=123456,
+                                 tp_struct=4352.0),
+                        _ev(), _acc(), _views([_pos(tp=4360.0)]), 0.1, None, 12.0, None)
+    assert res.plan["keep_tp"] == 4360.0, "plan 必须带出原持仓的 TP"
+
+
+def test_add_layer_carries_atr_sl_tp():
+    """事故：加仓 plan 不含 tp/sl → 新仓位是 SL=0 TP=0 的裸仓。
+
+    实测 3 个裸仓全部来自加仓（magic 相同，comment='goldagent-add'）。
+    现在 SL/TP 来自 LLM 判断的压力位/支撑位。
+    """
+    gate = RiskGate(CircuitBreakers(), GridState())
+    atr = 12.339
+    res = gate.evaluate(Proposal(kind="add_layer", direction="LONG", entry=123456),
+                        _ev(), _acc(), _views([_pos(price_open=4350.0)]),
+                        0.1, None, atr, None,
+                        llm_review=_llm_rev([4340.0], [4420.0]))
+    assert res.ok, res.reason
+    pl = res.plan
+    assert pl.get("sl") and pl.get("tp"), "加仓必须自带止损止盈，否则是裸仓"
+    assert pl["sl"] < pl["entry"] < pl["tp"], "做多加仓：SL < 入场 < TP"
+    # 止损 = 下方支撑位让开 pad；止盈 = 上方压力位
+    pad = CFG.risk.level_pad_atr * atr
+    assert pl["sl"] == pytest.approx(4340.0 - pad, abs=0.01)
+    assert pl["tp"] == pytest.approx(4420.0, abs=0.01)
+    assert pl["sl_source"].startswith("llm_support")
+    assert pl["tp_source"] == "llm_resistance"
+
+
+def test_profit_lock_sl_distance_is_sane():
+    """事故：移损 SL 算成 开仓价+2000（漏除 point），MT5 报 Invalid stops。
+
+    point_value_per_lot=0.1（每 point/手），point=0.001 →
+    每 1.0 价格单位/本仓位 = 0.1/0.001*0.01 = $1.0。
+    锁定 $2 → 距离 2.0 个价格单位（旧实现是 2000.0）。
+    """
+    _POINT = 0.001
+    pv_per_lot, volume, price_open = 0.1, 0.01, 4350.0
+    usd_per_unit = pv_per_lot / _POINT * volume
+    new_sl = price_open + 2.0 / usd_per_unit
+    assert usd_per_unit == pytest.approx(1.0, abs=1e-9)
+    assert new_sl - price_open == pytest.approx(2.0, abs=1e-6), (
+        f"锁定 $2 的距离应为 2.0 个价格单位，实际 {new_sl - price_open}")
+
+
+def test_summary_exposes_plan_for_console():
+    """回归：graph 必须把 plan 放进 summary['risk']，否则控制台打出 'None手'。"""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1]
+           / "src" / "gold_agent" / "agent" / "graph.py").read_text(encoding="utf-8")
+    assert '"plan": approved.plan' in src, (
+        "graph.py 未把 approved.plan 放进 summary['risk'] —— "
+        "控制台会显示 'None手' 且看不到止损止盈")
 
 
 # ══════════════════════════════════════════════════════════════════
