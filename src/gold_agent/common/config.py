@@ -118,6 +118,47 @@ class RiskConfig:
     # 用户指定：市价单 TP 缩 40%、SL 缩 （与挂单一致）
     market_tp_shrink: float = _TOML.get("risk", {}).get("market_tp_shrink", 0.6)
     market_sl_shrink: float = _TOML.get("risk", {}).get("market_sl_shrink", 0.65)
+    # ---- 缠论结构定价（用户要求：用 0.618 回调 / 分型两倍 / 1.618 扩展）----
+    # 用哪个周期的结构定 SL/TP。用户选定 15m（实测分型两倍≈33.8，
+    # 1h 是 73.8、4h 是 149.0，差 4.4 倍）。
+    structure_tf: str = _TOML.get("risk", {}).get("structure_tf", "15m")
+    # 是否启用结构定价（关掉则退回纯 ATR，行为与旧版一致）
+    structure_enabled: bool = _TOML.get("risk", {}).get("structure_enabled", True)
+    # 结构止损的宽度上下限（×ATR）：防贴脸止损与过宽止损
+    structure_sl_min_atr: float = _TOML.get("risk", {}).get("structure_sl_min_atr", 0.5)
+    structure_sl_max_atr: float = _TOML.get("risk", {}).get("structure_sl_max_atr", 2.5)
+    # 分型区间两倍的占比上下限：结构止损须落在 [0.2, 1.0]×分型两倍内
+    structure_frac_lo: float = _TOML.get("risk", {}).get("structure_frac_lo", 0.2)
+    structure_frac_hi: float = _TOML.get("risk", {}).get("structure_frac_hi", 1.0)
+    # ---- 压力位/支撑位定价（用户要求：止损止盈看压力位，由 LLM 判断）----
+    # 止损放在支撑/压力位之外时额外让开的距离（×ATR），防贴边被扫
+    level_pad_atr: float = _TOML.get("risk", {}).get("level_pad_atr", 0.25)
+    # 最小盈亏比：止盈距离 < 止损距离 × 该值 → 不开仓
+    min_rr: float = _TOML.get("risk", {}).get("min_rr", 1.2)
+    # LLM 没给出可用压力位时是否仍允许开仓
+    # 用户选定 False：**不开仓，等 LLM 可用**（猜点位比不交易更危险）
+    allow_trade_without_llm_levels: bool = _TOML.get("risk", {}).get(
+        "allow_trade_without_llm_levels", False)
+    # ---- 自研回调检测（用户要求：非严格缠论要加上我们直接的处理）----
+    # 实测缠论代理引擎在 1m 图上返回的是 15m 级别的段（1m 报的段与 15m
+    # 完全相同），导致入场位离现价 12~32 点、几乎不成交。所以自己算摆动。
+    # 扫这些小周期，选"入场带离现价最近"的那个（用户要求小周期判断、
+    # 加大入场次数）。
+    pullback_tfs: tuple[str, ...] = tuple(_TOML.get("risk", {}).get(
+        "pullback_tfs", ["1m", "2m", "5m", "10m", "15m", "30m"]))
+    #: 摆动确认根数（左右各 k 根）；多试几个 k 提高候选覆盖
+    pullback_swing_k: tuple[int, ...] = tuple(_TOML.get("risk", {}).get(
+        "pullback_swing_k", [1, 2, 3]))
+    #: 段幅度噪音门槛（×ATR）：实测 1m k=1 会给出 2.8 点的纯噪音段，
+    #: 0.25×ATR 能正确滤掉
+    pullback_min_leg_atr: float = _TOML.get("risk", {}).get(
+        "pullback_min_leg_atr", 0.25)
+    #: 回调带两条边（用户选定"0.5~0.618 挂单带，带内挂一单"）
+    #: 实测成交率提升：2m 79.6%->86.7%，15m 73.8%->86.2%
+    pullback_band_near: float = _TOML.get("risk", {}).get(
+        "pullback_band_near", 0.5)
+    pullback_band_far: float = _TOML.get("risk", {}).get(
+        "pullback_band_far", 0.618)
     daily_loss_stop_pct: float = _TOML.get("risk", {}).get("daily_loss_stop_pct", 0.03)
     consecutive_loss_cooloff_h: float = _TOML.get("risk", {}).get("consecutive_loss_cooloff_h", 4.0)
     consecutive_loss_n: int = _TOML.get("risk", {}).get("consecutive_loss_n", 4)

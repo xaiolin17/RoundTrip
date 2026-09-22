@@ -70,6 +70,35 @@ def _fmt_price(v) -> str:
         return str(v)
 
 
+def _src_suffix(plan: dict) -> str:
+    """标出止损止盈的定价来源（LLM 压力位 / 结构位 / ATR 兜底）。
+
+    用户要求止损止盈看压力位，由 LLM 判断 —— 必须让人一眼看出
+    这一轮的价位到底来自哪里，不能含糊。
+    """
+    src = plan.get("sl_source") or ""
+    tp = plan.get("tp_source") or ""
+    if not src and not tp:
+        return ""
+    parts = []
+    for s in (src, tp):
+        if s.startswith("llm_support"):
+            parts.append("支撑位")
+        elif s.startswith("llm_resistance"):
+            parts.append("压力位")
+        elif s.startswith("llm_hint"):
+            parts.append("LLM建议")
+        elif s.startswith("chanlun"):
+            parts.append("缠论结构")
+        elif s.startswith("atr"):
+            parts.append("ATR兜底")
+    uniq = []
+    for x in parts:
+        if x not in uniq:
+            uniq.append(x)
+    return "（" + "/".join(uniq) + "）" if uniq else ""
+
+
 def _order_lines(summary: dict) -> list[str]:
     """把本轮**可执行的价位**渲染成缩进的多行文本。
 
@@ -81,7 +110,8 @@ def _order_lines(summary: dict) -> list[str]:
       · `open_market` —— `risk.plan` 里有 tp/sl，但**入场价是执行时
                          才由 executor 取 bid/ask**，所以 plan 里没有 entry；
                          这里回退用 `summary["last_close"]` 作为参考价；
-      · `add_layer`   —— 加仓单不带 tp/sl（沿用原持仓的），只有手数。
+      · `add_layer`   —— 加仓单自带结构 SL/TP（原实现不带，会开成裸仓），
+                        入场用原持仓开仓价作参考。
 
     ⚠️ 被风控拦截时没有 `risk.plan`，此时返回空列表 ——
     不能拿 proposal 里的价位冒充"将要下单的价位"。
@@ -97,11 +127,21 @@ def _order_lines(summary: dict) -> list[str]:
         layers = plan.get("grid_plan") or []
         if len(layers) == 1:
             # 用户要求：取消网格，只挂预测的那一单
+            # 入场价 = 0.618 回调带（回调到位、反弹概率大）
             ly = layers[0]
+            tf = plan.get("pullback_tf") or ""
+            bn, bf = plan.get("band_near"), plan.get("band_far")
+            if tf and bn is not None and bf is not None:
+                tag = "（%s 回调带 %.3f~%.3f）" % (tf, min(bn, bf), max(bn, bf))
+            elif plan.get("entry_source") == "own_swing":
+                tag = "（自研回调带）"
+            else:
+                tag = ""
             out.append(f"    挂限价单 {d} {ly.get('lots')}手 "
-                       f"入场 {_fmt_price(ly.get('level'))} "
+                       f"入场 {_fmt_price(ly.get('level'))}{tag} "
                        f"止损 {_fmt_price(ly.get('sl'))} "
-                       f"止盈 {_fmt_price(ly.get('tp'))}")
+                       f"止盈 {_fmt_price(ly.get('tp'))}"
+                       + _src_suffix(plan))
             return out
         out.append(f"    挂单层数: {len(layers)}")
         for i, ly in enumerate(layers, 1):
@@ -117,12 +157,20 @@ def _order_lines(summary: dict) -> list[str]:
         out.append(f"    {d} {plan.get('lots')}手 入场 市价"
                    + (f"（参考 {_fmt_price(ref)}）" if ref is not None else "")
                    + f" 止损 {_fmt_price(plan.get('sl'))} "
-                     f"止盈 {_fmt_price(plan.get('tp'))}")
+                     f"止盈 {_fmt_price(plan.get('tp'))}"
+                   + _src_suffix(plan))
         return out
 
     if kind == "add_layer":
-        out.append(f"    {d} {plan.get('lots')}手 市价加仓"
-                   f"（止损止盈沿用原持仓）")
+        # 加仓现在自带结构止损止盈（原实现不带 → 裸仓）
+        if plan.get("sl") or plan.get("tp"):
+            out.append(f"    {d} {plan.get('lots')}手 市价加仓"
+                       f" 止损 {_fmt_price(plan.get('sl'))} "
+                       f"止盈 {_fmt_price(plan.get('tp'))}"
+                       + _src_suffix(plan))
+        else:
+            out.append(f"    {d} {plan.get('lots')}手 市价加仓"
+                       f"（止损止盈沿用原持仓）")
         return out
 
     if kind == "modify_sltp":

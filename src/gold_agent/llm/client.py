@@ -48,10 +48,24 @@ REVIEW_SCHEMA = {
             },
         },
         "key_levels": {"type": "array", "items": {"type": "number"}},
+        # ---- 压力位/支撑位（用户要求：止损止盈看压力位，由 LLM 判断）----
+        # LLM 只给"位置"，不给订单参数（订单参数只出自 risk 模块）。
+        # 本地 risk/levels.py 再用这些位算出 sl/tp。
+        "support_levels": {"type": "array", "items": {"type": "number"}},
+        "resistance_levels": {"type": "array", "items": {"type": "number"}},
+        "sl_hint": {"type": "number"},
+        "tp_hint": {"type": "number"},
+        "level_reason": {"type": "string"},
         "risk_flags": {"type": "array", "items": {"type": "string"}},
         "invalidation": {"type": "string"},
         "next_observation": {"type": "string"},
     },
+    # 注意：support_levels / resistance_levels **不放进 required**。
+    # 原因：这里的校验是"全有或全无"（缺任一 required 字段就整条 review 作废）。
+    # 若把它们设为 required，LLM 偶尔漏给时会把 verdict/confidence 一起丢掉，
+    # 而**平仓判断依赖 verdict**（adverse_llm）—— 那是安全逻辑，不能被定价
+    # 字段的缺失连累。开仓的安全性由 risk/levels.py 的 gate 兜住：
+    # 拿不到压力位就不开仓（用户选定），但持仓的退出判断照常工作。
     "required": ["verdict", "confidence", "rationale"],
 }
 

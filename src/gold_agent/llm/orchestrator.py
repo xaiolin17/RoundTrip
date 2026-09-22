@@ -105,6 +105,22 @@ _REVIEW_SYSTEM = """你是资深黄金（XAUUSD）交易评审员，同时执行
 概率档位只用这 5 个词，**不要暴露内部百分比**：
 very_high / high / medium / low / very_low
 
+═══ 压力位/支撑位（决定止损止盈，必须认真给）═══
+止损止盈**看压力位/支撑位**，不看 ATR。你必须基于上面两个 skill 的输出，
+显式给出价位（只允许引用输入里出现过的数字，或由它们直接推得的价位）：
+
+- `support_levels`：**支撑位**列表，按离现价从近到远排。
+  来源优先级：SMC bull Order Block 下沿 > bull FVG 下沿 > equal lows
+  > 缠论中枢 zd/dd。
+- `resistance_levels`：**压力位**列表，同样从近到远。
+  来源优先级：SMC bear Order Block 上沿 > bear FVG 上沿 > equal highs
+  > 缠论中枢 zg/gg。
+- `sl_hint` / `tp_hint`：你认为最合适的止损/止盈价（可选，但强烈建议给）。
+- `level_reason`：一句话说明这些位是怎么选出来的（点名用了哪个 skill 的哪一步）。
+
+⚠️ 你的输出是**位置建议**，不是订单指令。本地风控会据此配套计算最终
+sl/tp 并做方向、最小距离、盈亏比校验；你**不要**输出手数。
+
 ═══ 输出 ═══
 严格 JSON（structuredOutputs）：
 {"verdict":"bullish|bearish|neutral",
@@ -119,6 +135,11 @@ very_high / high / medium / low / very_low
                 "order_blocks":"...","fvg":"...","equal_hl":"...","zone":"..."},
    "probability_tier":"very_high|high|medium|low|very_low",
    "caveats_disclosed":true|false},
+ "support_levels":[数字...],
+ "resistance_levels":[数字...],
+ "sl_hint":数字,
+ "tp_hint":数字,
+ "level_reason":"...",
  "key_levels":[...],
  "risk_flags":[...],
  "invalidation":"...",

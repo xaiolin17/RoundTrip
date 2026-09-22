@@ -112,7 +112,11 @@ class Executor:
                 sl=plan.sl or 0.0,
             )
         elif plan.kind == "close_position":
-            pos = next((p for p in [] if False), None)  # 调用方需先查持仓
+            # 平仓必须带 volume —— 缺失时 MT5 返回
+            # (-2, 'Invalid "volume" argument')，平仓会 100% 失败。
+            if not plan.lots:
+                raise Mt5Error(
+                    f"close_position 缺少手数（position={plan.position_ticket}）")
             base.update(
                 action=mt5.TRADE_ACTION_DEAL,
                 position=plan.position_ticket,
@@ -121,12 +125,17 @@ class Executor:
                 price=si.bid if plan.direction == "LONG" else si.ask,
             )
         elif plan.kind == "modify_sltp":
-            base.update(
-                action=mt5.TRADE_ACTION_SLTP,
-                position=plan.position_ticket,
-                sl=plan.sl or 0.0,
-                tp=plan.tp or 0.0,
-            )
+            # ⚠️ TRADE_ACTION_SLTP 是**整体覆盖**：tp 传 0.0 = 删除止盈，
+            # 且 MT5 会因此报 'Invalid stops'。
+            # 原实现无条件 `tp=plan.tp or 0.0`，把止盈抹掉了。
+            req = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": plan.position_ticket,
+                "sl": plan.sl or 0.0,
+            }
+            if plan.tp:
+                req["tp"] = plan.tp
+            base.update(req)
         elif plan.kind == "place_pending":
             order_type = (mt5.ORDER_TYPE_BUY_LIMIT if plan.direction == "LONG"
                           else mt5.ORDER_TYPE_SELL_LIMIT)
