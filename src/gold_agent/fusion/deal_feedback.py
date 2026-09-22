@@ -136,6 +136,7 @@ class DealFeedback:
                 self.cursor = max(d["time"] for d in deals)
                 self._save()
             return []
+        enriched: list[dict] = []
         for d in new:
             pnl = d["profit"] + d["swap"] + d["commission"] + d.get("fee", 0.0)
             self.stats.total += 1
@@ -152,16 +153,36 @@ class DealFeedback:
             direction = _deal_direction(d)
             self.breakers.on_trade_closed(pnl, max(eq, 10000.0), direction=direction)
             rec["direction"] = direction
-            # 预测符号：优先 order 桥接（网格单），其次 position 桥（市价单，由 graph 注入 rec["pred"]）
+            # 预测符号：优先 order 桥接（挂单成交），其次 position 桥（市价/加仓）
+            #
+            # ⚠️ 事故修复：原实现只查 `pred_orders.pop(str(d["order"]))`，
+            #    而 d 是**平仓 deal**，其 order 是平仓那一刻新生成的 ticket
+            #    （实测：开仓 order=2557969245 / 平仓 order=2558130417），
+            #    与挂单时记录的 order ticket 永远不等 -> 永远 pop 不到。
+            #    实测后果：17 笔已平仓交易 pred_sign 全为 None，
+            #    `bayes_feedback` 记录 0 条 —— 这条闭环**从未生效过**，
+            #    贝叶斯池一直靠先验在跑。
+            #    正确键是 position_id（实测开仓 deal 的 order == position_id）。
             pred = d.get("pred")
             if pred is None and pred_orders:
-                pred = pred_orders.pop(str(d.get("order")), None)
+                pid = str(d.get("position_id"))
+                # 1) 持仓维度（市价开仓 / 加仓 / 挂单成交后统一按 position_id 记）
+                pred = pred_orders.pop(pid, None)
+                # 2) 兼容旧键：挂单 ticket（部分经纪商 order != position_id）
+                if pred is None:
+                    pred = pred_orders.pop(str(d.get("order")), None)
+                # 3) 兼容旧格式：{"sign": 1, "pos": "..."} 字典值
+                if isinstance(pred, dict):
+                    pred = pred.get("sign")
             rec["pred_sign"] = pred
             self.last_pred_by_position[str(d.get("position_id"))] = pred
+            enriched.append(rec)
         self.cursor = max(d["time"] for d in new)
         self._save()
         log_info(f"交割单反馈: 新增 {len(new)} 笔已平仓交易，统计={self.stats.to_dict()}")
-        return new
+        # ⚠️ 返回**增强后的 rec**（含 pnl / direction / pred_sign），不是原始 deal：
+        #    调用方要读 rec["pred_sign"] 做贝叶斯回填，返回原始 deal 会 KeyError/None。
+        return enriched
 
     # ---------- 胜率反馈给仓位 ----------
     def current_win_rate(self, fallback: float = 0.5) -> float:
