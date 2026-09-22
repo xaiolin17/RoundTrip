@@ -213,10 +213,28 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     由 0.618 回调位决定，与 ATR 无关；仓位必须按同一个距离反推，
     否则单笔风险会随止损加宽等比放大（实测 4h 分型两倍 149 → 单笔
     风险 1.49% 而非预算的 0.5%）。传 None 时退回 ATR 距离（旧行为）。
+
+    最小手数兜底（用户选定）
+    ------------------------
+    原实现是：算出的手数 < volume_min 就返回 `risk_budget_below_min_lot`
+    **拒绝开仓**。但 0.01 手是交易所下限，**不能再往下取整** ——
+    于是缩仓系数（vol_k）在仓位已到地板时，从"让仓位变小"变成了
+    "不许交易"。
+
+    实测事故：vol_k=0.125（波动下限 0.25 × 分歧 0.5）→ 预算 8.64 USD
+    → 止损上限仅 8.6 点，而实际止损 7.5~20.8 点 → 强信号轮次被连续拦截
+    （3514/3515）。而 0.01 手 + 20 点止损 = 20.82 USD = 权益的 0.145%，
+    **远低于** risk_pct 允许的 0.500%（69.10 USD）——
+    系统在拒绝一个风险只有自设上限 29% 的仓位。
+
+    现在：只要 **0.01 手的实际风险仍在名义预算内**（不受 vol_k 压缩影响），
+    就按最小手数开仓。缩仓系数不再能阻止交易，硬风控（熔断、Kelly、
+    名义预算）依然生效。
     """
     if atr is None or atr <= 0:
         return 0.0, "no_atr"
-    risk_usd = equity * CFG.risk.risk_pct
+    nominal_risk_usd = equity * CFG.risk.risk_pct   # 名义预算（不含 vol_k）
+    risk_usd = nominal_risk_usd
     # Half-Kelly 上限
     b = CFG.risk.tp_atr_mult / CFG.risk.sl_atr_mult
     f_half = half_kelly(win_rate, b)
@@ -234,6 +252,11 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     lots = math.floor(raw_lots / volume_step) * volume_step
     lots = round(lots, 2)
     if lots < volume_min:
+        # ---- 最小手数兜底：0.01 手能否被**名义**预算容纳 ----
+        min_lot_risk = volume_min * per_lot_risk
+        if min_lot_risk <= nominal_risk_usd:
+            # 风险可接受，只是缩仓系数把它压到了地板以下 → 按最小手数开
+            return round(volume_min, 2), None
         return 0.0, "risk_budget_below_min_lot"
     lots = min(lots, volume_max, CFG.max_lot if CFG.trade_mode == "live" else volume_max)
     return lots, None

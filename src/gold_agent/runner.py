@@ -86,6 +86,10 @@ def _src_suffix(plan: dict) -> str:
             parts.append("支撑位")
         elif s.startswith("llm_resistance"):
             parts.append("压力位")
+        elif s.startswith("struct_support"):
+            parts.append("本地支撑位")
+        elif s.startswith("struct_resistance"):
+            parts.append("本地压力位")
         elif s.startswith("llm_hint"):
             parts.append("LLM建议")
         elif s.startswith("chanlun"):

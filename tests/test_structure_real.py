@@ -366,15 +366,42 @@ def test_stop_is_padded_beyond_level():
     assert lv.sl == pytest.approx(4342.626 - pad, abs=0.01)
 
 
-def test_no_llm_levels_is_rejected():
-    """LLM 没给任何压力位/支撑位 -> 必须拒绝（用户选定：不开仓等 LLM）。"""
+def test_no_llm_levels_falls_back_to_local_structure():
+    """LLM 没给点位时，**本地结构位兜底**（用户澄清后的正确语义）。
+
+    用户原话：
+    > 我的意思是LLM没有相反的预测方向 并且当前距离我们盈利的压力位
+    > 也有距离就可以直接市价开仓
+
+    即：**点位的来源不必是 LLM**。LLM 管"方向否决"（decision 层的
+    `opposed`），"离盈利压力位有距离"是赔率检查（min_rr）。
+    所以只要任一来源能给点位，就不该拦。
+
+    原实现把这个 early-return 放在并入本地结构位**之前**，导致本模块
+    注释里写的"LLM 漏给时兜底"是**死代码** —— 线上被 llm_no_levels
+    拦掉 7 单。
+    """
+    cl = {"15m": _CL(center={"zg": 4376.0, "zd": 4342.0,
+                             "gg": 4400.0, "dd": 4300.0})}
+    ev = type("E", (), {"chanlun": cl, "mobius": None})()
+    lv = trade_levels("LONG", 4350.0, {}, ev, atr=18.0)
+    assert lv.ok, f"本地有结构位就该能开仓，得到 {lv.reason}"
+    assert lv.used_sl_level == 4342.0, "止损应取本地支撑位"
+    assert lv.used_tp_level == 4376.0, "止盈应取本地压力位"
+    # 来源必须如实标注为本地结构位，不能冒充 LLM
+    assert lv.sl_source == "struct_support", lv.sl_source
+    assert lv.tp_source == "struct_resistance", lv.tp_source
+
+
+def test_no_levels_at_all_is_rejected():
+    """LLM 没给点位 **且** 本地也没有结构位 -> 才拒绝。"""
     lv = trade_levels("LONG", 4350.0, {}, None, atr=18.0)
     assert not lv.ok
     assert lv.reason == "llm_no_levels"
     assert lv.sl is None and lv.tp is None
 
 
-def test_none_llm_review_is_rejected():
+def test_none_llm_review_is_rejected_without_structure():
     lv = trade_levels("LONG", 4350.0, None, None, atr=18.0)
     assert not lv.ok and lv.reason == "llm_no_levels"
 
@@ -478,10 +505,10 @@ def test_structure_levels_survives_bad_mobius():
 
 
 def test_config_flags():
-    """用户选定的配置必须生效。"""
-    assert CFG.risk.allow_trade_without_llm_levels is False, (
-        "LLM 无压力位时必须不开仓")
-    assert CFG.risk.min_rr >= 1.0
+    """关键配置必须生效。"""
+    # 用户澄清：点位的来源不必是 LLM。LLM 管方向否决，
+    # 本地结构位（缠论中枢/SMC）负责兜底给点位。
+    assert CFG.risk.min_rr >= 1.0, "必须有赔率下限（'离盈利压力位有距离'）"
     # 自研检测：小周期 + 噪音门槛 + 回调带
     assert "1m" in CFG.risk.pullback_tfs and "2m" in CFG.risk.pullback_tfs
     assert CFG.risk.pullback_min_leg_atr > 0
