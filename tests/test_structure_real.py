@@ -414,8 +414,12 @@ def test_missing_support_rejected():
 
 
 def test_rr_filter_rejects_poor_trade():
-    """盈亏比不足 -> 拒绝（止盈太近、止损太远）。"""
-    rev = {"support_levels": [4300.0], "resistance_levels": [4352.0]}
+    """盈亏比不足 -> 拒绝（止盈太近、止损太远）。
+
+    注：压力位必须离入场 > 1×ATR，否则先触发 fusion_vs_levels_conflict
+    （这是另一个新规则：紧贴压力位追多不进场）。
+    """
+    rev = {"support_levels": [4300.0], "resistance_levels": [4370.0]}
     lv = trade_levels("LONG", 4350.0, rev, None, atr=18.0)
     assert not lv.ok
     assert "rr_below" in lv.reason, lv.reason
@@ -426,7 +430,7 @@ def test_no_target_above_distinguished_from_poor_rr():
     lv1 = trade_levels("LONG", 4350.0, {"support_levels": [4300.0]}, None, atr=18.0)
     assert lv1.reason == "no_resistance_above"
     lv2 = trade_levels("LONG", 4350.0,
-                       {"support_levels": [4300.0], "resistance_levels": [4352.0]},
+                       {"support_levels": [4300.0], "resistance_levels": [4370.0]},
                        None, atr=18.0)
     assert lv2.reason.startswith("rr_below")
 

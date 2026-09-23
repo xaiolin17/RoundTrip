@@ -183,7 +183,13 @@ class DecisionConfig:
     open_threshold: float = _TOML.get("decision", {}).get("open_threshold", 1.6)
     exit_threshold: float = _TOML.get("decision", {}).get("exit_threshold", 1.2)
     exit_persist_rounds: int = _TOML.get("decision", {}).get("exit_persist_rounds", 3)
-    # 利润回吐检测（用户要求：超短期有利润回吐时主动平仓）
+    # 利润回吐检测（用户选定：改用移动止损锁盈，不再砍掉浮盈）
+    # ⚠️ 事故复盘：旧逻辑「浮盈回吐 50% 就平仓」实测砍掉 30%~75% 浮盈
+    #    （2558982555 MFE$11.63 -> 平$2.96），实际 RR 0.64 < 计划 1.28。
+    #    现在浮盈达 lock_profit_min_usd 后把 SL 推到保本上方 lock_profit_gap_usd，
+    #    让利润奔跑；仅当浮盈从峰值回落到保本线以下才离场。
+    lock_profit_min_usd: float = _TOML.get("decision", {}).get("lock_profit_min_usd", 8.0)
+    lock_profit_gap_usd: float = _TOML.get("decision", {}).get("lock_profit_gap_usd", 2.0)
     reserve_min_profit: float = _TOML.get("decision", {}).get("reserve_min_profit", 5.0)
     reserve_drop_score: float = _TOML.get("decision", {}).get("reserve_drop_score", 0.6)
     loop_interval_s: float = _TOML.get("decision", {}).get("loop_interval_s", 60.0)

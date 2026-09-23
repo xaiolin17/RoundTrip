@@ -828,7 +828,7 @@ def test_primed_score_spread_crosses_open_threshold(hist_15m):
         f"系统永远无法开仓（这是失败的改动）")
 
 
-def test_oos_open_rate_is_acceptable():
+def test_oos_open_rate_is_acceptable(monkeypatch):
     """**最终验收**：复刻实盘流程，测样本外开仓率。
 
     用户明确的验收标准：**开不了仓 / 开仓次数极低 = 失败的改动**。
@@ -840,68 +840,88 @@ def test_oos_open_rate_is_acceptable():
 
     ⚠️ 与 `research/24_oos_open_rate.py` 同源；那边跑多个预热点，
     这里跑 2 个以控制测试时长。
+
+    ⚠️ **实盘状态隔离**：`FusionEngine` 的 `BayesianPool` 会读
+    `data/bayes_state.json`（git 跟踪、agent 实时写入）。交割单反馈
+    闭环启用后，这个文件积累了真实胜负（8胜13负），贝叶斯证据会
+    改变融合分 → 开仓率被实盘运气左右 → 测试变得**不可复现**。
+    这里把 project_root 指到临时目录，强制测试用空先验，只测**机器**。
     """
-    import numpy as np
-    d1m = Path(__file__).resolve().parents[1] / "data" / "cache" / "XAUUSDm_1m.parquet"
-    if not d1m.exists():
-        pytest.skip("无 1m 缓存数据")
-    d = pd.read_parquet(d1m)
-    d["time"] = pd.to_datetime(d["time"], utc=True)
-    d = d.sort_values("time").reset_index(drop=True)
+    import json
+    import shutil
+    from pathlib import Path as _P
 
-    from gold_agent.decision.machine import DecisionEngine, DecisionContext
-    from gold_agent.mt5.client import PositionsView
-    from gold_agent.risk.gate import RiskGate
-    from gold_agent.risk.position import CircuitBreakers
-    from gold_agent.risk.grid import GridState
-    from gold_agent.news.collector import NewsView
+    # 本机 tmp_path 固定名目录被拒（WinError 5），用项目内临时目录隔离
+    _iso = _P(CFG.project_root) / "_oos_iso"
+    shutil.rmtree(_iso, ignore_errors=True)
+    (_iso / "data").mkdir(parents=True, exist_ok=True)
+    (_iso / "data" / "bayes_state.json").write_text(
+        json.dumps({"saved_at": 0, "stats": {}, "recent": {}}), encoding="utf-8")
+    monkeypatch.setattr(CFG, "project_root", _iso)
+    try:
+        import numpy as np
+        d1m = Path(__file__).resolve().parents[1] / "data" / "cache" / "XAUUSDm_1m.parquet"
+        if not d1m.exists():
+            pytest.skip("无 1m 缓存数据")
+        d = pd.read_parquet(d1m)
+        d["time"] = pd.to_datetime(d["time"], utc=True)
+        d = d.sort_values("time").reset_index(drop=True)
 
-    PAYLOAD, ROUNDS = 600, 300
+        from gold_agent.decision.machine import DecisionEngine, DecisionContext
+        from gold_agent.mt5.client import PositionsView
+        from gold_agent.risk.gate import RiskGate
+        from gold_agent.risk.position import CircuitBreakers
+        from gold_agent.risk.grid import GridState
+        from gold_agent.news.collector import NewsView
 
-    def _payload(i):
-        w = d.iloc[max(0, i - PAYLOAD):i].set_index("time")
-        return {"1m": _frame_like(_resample(w, "1min")),
-                "5m": _frame_like(_resample(w, "5min")),
-                "15m": _frame_like(_resample(w, "15min")),
-                "1h": _frame_like(_resample(w, "1h"))}
+        PAYLOAD, ROUNDS = 600, 300
 
-    last = len(d) - ROUNDS - 10
-    points = [last, last // 2]
-    all_l, all_s, rates = 0, 0, []
-    for t0 in points:
-        engine = _plumbing_engine()
-        engine.prime_history(_payload(t0), n_steps=300, step_bars=1)
-        assert engine.normalizer.warm("kalman_persist"), "预热必须生效"
+        def _payload(i):
+            w = d.iloc[max(0, i - PAYLOAD):i].set_index("time")
+            return {"1m": _frame_like(_resample(w, "1min")),
+                    "5m": _frame_like(_resample(w, "5min")),
+                    "15m": _frame_like(_resample(w, "15min")),
+                    "1h": _frame_like(_resample(w, "1h"))}
 
-        de = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
-        opens = 0
-        for i in range(t0 + 1, t0 + 1 + ROUNDS):
-            fr = _payload(i)
-            cl = {tf: analyze_tf(fr[tf], tf) for tf in ("5m", "15m", "1h")}
-            ev = engine.fuse_all(fr, cl, {}, obs_id=90_000_000 + i)
-            ctx = DecisionContext(
-                ev=ev, positions=PositionsView(positions=[]),
-                news=NewsView(high_risk_window=False), llm=None,
-                last_close=float(fr["1m"]["close"].iloc[-1]),
-                atr=17.3, realized_vol=0.008, round_id=i, llm_available=False)
-            pr = de.decide(ctx)
-            if pr.kind in ("open_market", "place_grid"):
-                opens += 1
-                if pr.direction == "LONG":
-                    all_l += 1
-                elif pr.direction == "SHORT":
-                    all_s += 1
-        rates.append(opens / ROUNDS)
+        last = len(d) - ROUNDS - 10
+        points = [last, last // 2]
+        all_l, all_s, rates = 0, 0, []
+        for t0 in points:
+            engine = _plumbing_engine()
+            engine.prime_history(_payload(t0), n_steps=300, step_bars=1)
+            assert engine.normalizer.warm("kalman_persist"), "预热必须生效"
 
-    assert min(rates) >= 0.10, (
-        f"样本外开仓率 {[f'{r:.1%}' for r in rates]} —— 最低 {min(rates):.1%} < 10%。"
-        f"用户标准：开仓次数极低 = 失败的改动")
+            de = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+            opens = 0
+            for i in range(t0 + 1, t0 + 1 + ROUNDS):
+                fr = _payload(i)
+                cl = {tf: analyze_tf(fr[tf], tf) for tf in ("5m", "15m", "1h")}
+                ev = engine.fuse_all(fr, cl, {}, obs_id=90_000_000 + i)
+                ctx = DecisionContext(
+                    ev=ev, positions=PositionsView(positions=[]),
+                    news=NewsView(high_risk_window=False), llm=None,
+                    last_close=float(fr["1m"]["close"].iloc[-1]),
+                    atr=17.3, realized_vol=0.008, round_id=i, llm_available=False)
+                pr = de.decide(ctx)
+                if pr.kind in ("open_market", "place_grid"):
+                    opens += 1
+                    if pr.direction == "LONG":
+                        all_l += 1
+                    elif pr.direction == "SHORT":
+                        all_s += 1
+            rates.append(opens / ROUNDS)
 
-    # 方向：合计不得结构性偏置（允许随行情在某窗口偏多/偏空）
-    tot = all_l + all_s
-    if tot >= 20:
-        pooled = all_l / tot
-        assert 0.25 <= pooled <= 0.75, (
-            f"合计 LONG 占比 {pooled:.1%}（{all_l}/{tot}）—— "
-            f"结构性单边押注，多半是基线尺度错配")
+        assert min(rates) >= 0.10, (
+            f"样本外开仓率 {[f'{r:.1%}' for r in rates]} —— 最低 {min(rates):.1%} < 10%。"
+            f"用户标准：开仓次数极低 = 失败的改动")
+
+        # 方向：合计不得结构性偏置（允许随行情在某窗口偏多/偏空）
+        tot = all_l + all_s
+        if tot >= 20:
+            pooled = all_l / tot
+            assert 0.25 <= pooled <= 0.75, (
+                f"合计 LONG 占比 {pooled:.1%}（{all_l}/{tot}）—— "
+                f"结构性单边押注，多半是基线尺度错配")
+    finally:
+        shutil.rmtree(_iso, ignore_errors=True)
 

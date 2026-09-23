@@ -294,23 +294,51 @@ class DecisionEngine:
                             reasons=[f"加仓 第{adds_count + 1}/{CFG.risk.max_adds_per_position}次 "
                                      f"S_eff={s:+.2f} (需>={required:.2f} 上次={last_score}) "
                                      f"置信={conf_cur:.2f} (上次={last_conf})"])
-        # ---- 超短期利润回吐检测（用户要求：识别到利润会回吐就主动平仓）----
+        # ---- 超短期利润回吐检测（用户选定：改用移动止损锁盈，不再砍掉浮盈）----
+        # ⚠️ 事故复盘：原实现是「浮盈从峰值回吐 50% 就**主动平仓**」，
+        #    实测把 30%~75% 的浮盈砍掉：
+        #       2558982555  MFE $11.63 -> 平在 $2.96（砍 75%）
+        #       2558998545  MFE $10.14 -> 平在 $3.09（砍 70%）
+        #       2558970297  MFE $12.29 -> 平在 $5.46（砍 56%）
+        #    计划 RR 1.28 被实际 RR 0.64 取代，50% 胜率下期望为负。
+        #    现在改为：浮盈达到门槛后**推 SL 锁盈**（让利润奔跑），
+        #    只有在浮盈从峰值回落到**保本线以下**时才强制离场。
         key_pos = str(pos.ticket)
         peak = self._profit_peak.get(key_pos, 0.0)
         cur_profit = pos.profit
         self._profit_peak[key_pos] = max(peak, cur_profit)
+        _POINT = 0.001                      # XAUUSDm point
+        usd_per_price_unit = (getattr(ctx, "point_value_per_lot", 1.0)
+                              / _POINT * pos.volume)
+        lock_gap = CFG.decision.lock_profit_gap_usd / max(usd_per_price_unit, 1e-9)
+        locked_sl = (pos.price_open + lock_gap
+                     if direction == "LONG"
+                     else pos.price_open - lock_gap)
+        # 浮盈已达门槛 -> 推 SL 到保本上方（锁盈）
+        if cur_profit >= CFG.decision.lock_profit_min_usd and pos.profit > 0:
+            sl_is_old = (pos.sl is None or
+                         (direction == "LONG" and pos.sl < locked_sl) or
+                         (direction == "SHORT" and pos.sl > locked_sl))
+            if sl_is_old:
+                return Proposal(kind="modify_sltp", direction=direction, entry=pos.ticket,
+                                tp_struct=locked_sl, reasons=[
+                                    f"移动止损锁盈：浮盈 ${cur_profit:.2f}，"
+                                    f"止损推至 {locked_sl:.3f}（锁 ${CFG.decision.lock_profit_gap_usd:.0f}）"])
+        # 浮盈曾达门槛但已回吐到保本下方 -> 离场（防止盈利单变亏损单）
+        if (self._profit_peak[key_pos] >= CFG.decision.lock_profit_min_usd
+                and cur_profit < 0):
+            return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
+                            reasons=[f"锁盈回吐：峰值 ${self._profit_peak[key_pos]:.2f} "
+                                     f"-> 现 ${cur_profit:.2f}，保本离场"])
+        # 信号回吐检测保留（信号本身转弱时平仓，与移动止损互补）
         score_peak = self._score_peak.get(key_pos, 0.0)
         same_dir_score = s if direction == "LONG" else -s     # 顺持仓方向的信号分
         self._score_peak[key_pos] = max(score_peak, same_dir_score)
         reserve_drop = CFG.decision.reserve_drop_score
-        profit_giveback = (self._profit_peak[key_pos] > CFG.decision.reserve_min_profit
-                           and cur_profit < 0.5 * self._profit_peak[key_pos])
         signal_giveback = (self._score_peak[key_pos] >= CFG.decision.open_threshold
                            and same_dir_score <= self._score_peak[key_pos] - reserve_drop)
-        if profit_giveback or signal_giveback:
-            why = (f"利润回吐：峰值 ${self._profit_peak[key_pos]:.2f} -> ${cur_profit:.2f}"
-                   if profit_giveback else
-                   f"信号回吐：峰值 S={self._score_peak[key_pos]:+.2f} -> {same_dir_score:+.2f}")
+        if signal_giveback:
+            why = (f"信号回吐：峰值 S={self._score_peak[key_pos]:+.2f} -> {same_dir_score:+.2f}")
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
                             reasons=[why])
         # 新闻反向减仓
