@@ -244,6 +244,16 @@ def trade_levels(direction: str, entry: float, review: dict | None,
             out.sl = round(hint_sl, 3)
             out.sl_source = "llm_hint"
             out.used_sl_level = hint_sl
+        # ---- 融合分与压力位矛盾检测（用户选定）----
+        # 做多但**上方紧贴压力位** -> 进场就是买在压力位下方，随时被压回。
+        # 判定：最近上方压力位距入场 < 1×ATR -> 结构不支持追多 -> 不开仓。
+        near_res = _nearest_above(res_all, entry)
+        if near_res is not None and atr and near_res - entry < atr:
+            out.reason = "fusion_vs_levels_conflict"
+            out.notes.append(
+                f"做多但紧贴压力位 {near_res:.3f}（距入场 {near_res - entry:.3f} "
+                f"< 1×ATR {atr:.2f}）-> 结构不支持追多")
+            return out
     else:
         lv = _nearest_above(res_all, entry)
         if lv is not None:
@@ -254,6 +264,16 @@ def trade_levels(direction: str, entry: float, review: dict | None,
             out.sl = round(hint_sl, 3)
             out.sl_source = "llm_hint"
             out.used_sl_level = hint_sl
+        # ---- 融合分与压力位矛盾检测（用户选定）----
+        # 做空但**下方紧贴支撑位** -> 进场就是卖在支撑位上方，随时被弹回。
+        # 判定：最近下方支撑位距入场 < 1×ATR -> 结构不支持追空 -> 不开仓。
+        near_sup = _nearest_below(sup_all, entry)
+        if near_sup is not None and atr and entry - near_sup < atr:
+            out.reason = "fusion_vs_levels_conflict"
+            out.notes.append(
+                f"做空但紧贴支撑位 {near_sup:.3f}（距入场 {entry - near_sup:.3f} "
+                f"< 1×ATR {atr:.2f}）-> 结构不支持追空")
+            return out
 
     # ---- 先定止损，再据此选"够赔率"的止盈压力位 ----
     if out.sl is None:

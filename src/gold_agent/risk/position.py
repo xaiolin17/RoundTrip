@@ -46,6 +46,17 @@ class CircuitBreakers:
             self.day_key = today
         if self.direction_bias_halt:
             return f"direction_bias_halt: {self.direction_bias_reason}"
+        # ---- 连续亏损熔断：冷却到期自动恢复（用户选定）----
+        # ⚠️ 事故修复：原实现 cooloff 到期后只放行 cooloff 检查，
+        #    但 consecutive_losses 仍 >= n -> 落到下面 L51 永远拦截，
+        #    且只有**平仓**才改这个计数器 -> 拦截开仓 -> 无新交易 ->
+        #    无平仓 -> 计数器永不归零 -> **永久死锁**。
+        #    实测：3958 轮触发后 400+ 轮全部被拦，agent 完全停止交易。
+        #    现在：cooloff 到期 -> 连亏计数归零 -> 自动恢复交易。
+        if self.cooloff_until and now >= self.cooloff_until:
+            log_warn(f"熔断冷却到期：连亏计数 {self.consecutive_losses} 归零，恢复交易")
+            self.cooloff_until = 0.0
+            self.consecutive_losses = 0
         if now < self.cooloff_until:
             return f"cooloff_until {time.strftime('%H:%M', time.localtime(self.cooloff_until))}"
         if self.consecutive_losses >= CFG.risk.consecutive_loss_n:

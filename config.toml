@@ -34,8 +34,14 @@ exit_persist_rounds = 3
 #      改用 1h ATR 定止损后，成本只占 2.5%，净 NW-t 从 -30 改善到 -1.4。
 #    → 所以保留 1m 决策周期，把止损宽度交给高级别（见 [risk] sl_atr_mult）。
 loop_interval_s = 60.0
-# 利润回吐检测（用户要求）
-reserve_min_profit = 5.0
+# 移动止损锁盈（用户选定，替代旧"回吐平仓"）
+# ⚠️ 旧逻辑"浮盈回吐 50% 就平仓"实测砍掉 30%~75% 浮盈：
+#    2558982555 MFE$11.63 -> 平$2.96；实际 RR 0.64 << 计划 1.28。
+# 现在：浮盈 >= lock_profit_min_usd 后，把 SL 推到开仓价上方 lock_profit_gap_usd
+# 锁盈（让利润奔跑）；仅当浮盈从峰值回落到保本线以下才离场。
+lock_profit_min_usd = 8.0
+lock_profit_gap_usd = 2.0
+# 信号回吐检测（信号本身转弱时平仓，与移动止损互补）
 reserve_drop_score = 0.6
 # P1-2 波动 regime 闸：只在 σ 位于滚动高分位时开仓
 # （research/12_levers.py C1：≥90% 分位时毛边际 +171%、净 NW-t 改善 7 倍）
