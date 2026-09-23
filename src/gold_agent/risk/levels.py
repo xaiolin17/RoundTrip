@@ -87,11 +87,18 @@ def _levels(raw) -> list[float]:
     return out
 
 
-def _structure_levels(ev) -> tuple[list[float], list[float]]:
+def _structure_levels(ev, atr: float | None = None) -> tuple[list[float], list[float]]:
     """从本地 skill 结构里取支撑/压力候选（交叉验证用）。
 
     缠论：中枢 zg（上沿=压力）/ zd（下沿=支撑）
     SMC ：bear OB 上沿=压力；bull OB 下沿=支撑
+
+    ⚠️ 聚合去重（用户报告 fusion_vs_levels_conflict 拦得太重）：
+    多个 TF（1m/5m/15m/1h/4h）的缠论中枢 + SMC OB/FVG/equal HL 全部
+    堆进一个列表 -> 实测 196 支撑 / 195 压力，且 1m 的 SMC 位极密
+    （同一区域常有几个位挤在 1 点内）。`_nearest_below` 取最近那个
+    会命中 0.3 点外的 1m 噪音位 -> 做空被"紧贴支撑 0.34 点"误拦 13 次。
+    这里把间距 < 0.25×ATR 的邻居合并（取均值），只留下**显著位**。
     """
     sup: list[float] = []
     res: list[float] = []
@@ -134,7 +141,33 @@ def _structure_levels(ev) -> tuple[list[float], list[float]]:
                     sup.append(v)
         except Exception:
             continue
+    # ---- 聚合：间距 < 0.25×ATR 的邻居合并（无 ATR 时按 1.0 点保守合并）----
+    gap = (0.25 * atr) if atr else 1.0
+    if gap > 0:
+        sup = _cluster(sup, gap)
+        res = _cluster(res, gap)
     return sup, res
+
+
+def _cluster(levels: list[float], gap: float) -> list[float]:
+    """把相距 < gap 的位合并为均值簇，只返回**显著位**。
+
+    196 个未聚合位 -> 合并后通常只剩几十个真正独立的位，
+    `_nearest_below` 不会再命中 0.3 点外的 1m 噪音位。
+    """
+    if not levels:
+        return []
+    vals = sorted(set(round(x, 3) for x in levels))
+    out: list[float] = []
+    cur: list[float] = [vals[0]]
+    for v in vals[1:]:
+        if v - cur[-1] < gap:
+            cur.append(v)
+        else:
+            out.append(round(sum(cur) / len(cur), 3))
+            cur = [v]
+    out.append(round(sum(cur) / len(cur), 3))
+    return out
 
 
 def _nearest_below(levels: list[float], price: float) -> float | None:
@@ -205,7 +238,9 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     hint_tp = _num(review.get("tp_hint"))
 
     # 本地结构位（缠论中枢 / SMC OB / FVG / equal HL）—— **独立于 LLM 的点位来源**
-    s_sup, s_res = _structure_levels(ev) if ev is not None else ([], [])
+    # ⚠️ 聚合去重（0.25×ATR）：196 个未聚合位会堆出 0.3 点外的 1m 噪音位，
+    #    让"紧贴支撑/压力"误判（用户报告 fusion_vs_levels_conflict 拦太重）。
+    s_sup, s_res = _structure_levels(ev, atr) if ev is not None else ([], [])
     if s_sup or s_res:
         out.notes.append(
             f"本地结构位并入: 支撑x{len(s_sup)} 压力x{len(s_res)}")
@@ -246,13 +281,19 @@ def trade_levels(direction: str, entry: float, review: dict | None,
             out.used_sl_level = hint_sl
         # ---- 融合分与压力位矛盾检测（用户选定）----
         # 做多但**上方紧贴压力位** -> 进场就是买在压力位下方，随时被压回。
-        # 判定：最近上方压力位距入场 < 1×ATR -> 结构不支持追多 -> 不开仓。
-        near_res = _nearest_above(res_all, entry)
-        if near_res is not None and atr and near_res - entry < atr:
+        # ⚠️ 只对 **LLM 给的位** 判定（用户语义：LLM 读 skill 输出判断的
+        # 压力位/支撑位）。本地结构位（缠论/SMC）196 个未聚合位太密，
+        # 1m 的 SMC 位常距价格 0.3 点——实测 10 轮被拦 8 轮拦错
+        # （价格直接穿过"支撑"继续下跌，做空本可获利 0.8~4.1 点）。
+        # 阈值 1×ATR：LLM 位 5~17 点间隔，1×ATR(≈15) 下几乎总会命中。
+        # 收紧到 0.3×ATR（≈4.4 点）：只挡"真贴脸"（1m 内），
+        # 不挡"还有空间"的位。
+        near_res = _nearest_above(res, entry)
+        if near_res is not None and atr and near_res - entry < 0.3 * atr:
             out.reason = "fusion_vs_levels_conflict"
             out.notes.append(
                 f"做多但紧贴压力位 {near_res:.3f}（距入场 {near_res - entry:.3f} "
-                f"< 1×ATR {atr:.2f}）-> 结构不支持追多")
+                f"< 0.3×ATR {0.3 * atr:.2f}，LLM位）-> 结构不支持追多")
             return out
     else:
         lv = _nearest_above(res_all, entry)
@@ -266,13 +307,14 @@ def trade_levels(direction: str, entry: float, review: dict | None,
             out.used_sl_level = hint_sl
         # ---- 融合分与压力位矛盾检测（用户选定）----
         # 做空但**下方紧贴支撑位** -> 进场就是卖在支撑位上方，随时被弹回。
-        # 判定：最近下方支撑位距入场 < 1×ATR -> 结构不支持追空 -> 不开仓。
-        near_sup = _nearest_below(sup_all, entry)
-        if near_sup is not None and atr and entry - near_sup < atr:
+        # ⚠️ 只对 LLM 给的位判定（原因见做多分支注释；本地 1m SMC 位
+        # 是噪音，实测 8/10 拦错）。
+        near_sup = _nearest_below(sup, entry)
+        if near_sup is not None and atr and entry - near_sup < 0.3 * atr:
             out.reason = "fusion_vs_levels_conflict"
             out.notes.append(
                 f"做空但紧贴支撑位 {near_sup:.3f}（距入场 {entry - near_sup:.3f} "
-                f"< 1×ATR {atr:.2f}）-> 结构不支持追空")
+                f"< 0.3×ATR {0.3 * atr:.2f}，LLM位）-> 结构不支持追空")
             return out
 
     # ---- 先定止损，再据此选"够赔率"的止盈压力位 ----

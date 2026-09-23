@@ -56,35 +56,58 @@ def _ev(center: dict):
 
 
 def test_long_conflict_when_resistance_too_close():
-    """做多但紧贴上方压力位（< 1×ATR）-> 结构不支持追多 -> 拒。"""
-    ev = _ev({"zg": 4340.0, "zd": 4324.0, "gg": 4360.0, "dd": 4320.0})
-    lv = trade_levels("LONG", 4338.0, {}, ev, atr=12.0)
+    """做多但紧贴**LLM 压力位**（< 0.3×ATR）-> 结构不支持追多 -> 拒。
+
+    ⚠️ 2026-09-23 修正：冲突检测只对 LLM 给的位判定。原实现对
+    本地结构位（缠论/SMC）也判，但 196 个未聚合位太密，1m SMC 位
+    常距价格 0.3 点——实测 10 轮被拦 8 轮拦错（价格穿过"支撑"
+    继续下跌，做空本可获利 0.8~4.1 点）。
+    """
+    rev = {"support_levels": [4324.0], "resistance_levels": [4338.5]}
+    lv = trade_levels("LONG", 4338.0, rev, None, atr=12.0)
     assert not lv.ok and lv.reason == "fusion_vs_levels_conflict"
 
 
 def test_long_allowed_when_resistance_far():
-    ev = _ev({"zg": 4340.0, "zd": 4300.0, "gg": 4360.0, "dd": 4296.0})
-    lv = trade_levels("LONG", 4316.0, {}, ev, atr=12.0)
+    """做多但 LLM 压力位离得远（> 0.3×ATR）-> 放行。"""
+    rev = {"support_levels": [4300.0], "resistance_levels": [4340.0]}
+    lv = trade_levels("LONG", 4316.0, rev, None, atr=12.0)
     assert lv.ok
 
 
 def test_short_conflict_when_support_too_close():
-    """做空但紧贴下方支撑位（< 1×ATR）-> 结构不支持追空 -> 拒。"""
-    ev = _ev({"zg": 4348.0, "zd": 4330.0, "gg": 4360.0, "dd": 4328.0})
-    lv = trade_levels("SHORT", 4332.0, {}, ev, atr=12.0)
+    """做空但紧贴**LLM 支撑位**（< 0.3×ATR）-> 结构不支持追空 -> 拒。"""
+    rev = {"support_levels": [4330.5], "resistance_levels": [4348.0]}
+    lv = trade_levels("SHORT", 4332.0, rev, None, atr=12.0)
     assert not lv.ok and lv.reason == "fusion_vs_levels_conflict"
 
 
 def test_short_allowed_when_support_far():
-    ev = _ev({"zg": 4350.0, "zd": 4300.0, "gg": 4360.0, "dd": 4296.0})
-    lv = trade_levels("SHORT", 4330.0, {}, ev, atr=12.0)
+    """做空但 LLM 支撑位离得远（> 0.3×ATR）-> 放行。"""
+    rev = {"support_levels": [4300.0], "resistance_levels": [4350.0]}
+    lv = trade_levels("SHORT", 4330.0, rev, None, atr=12.0)
     assert lv.ok
+
+
+def test_conflict_ignores_local_structure_noise():
+    """回归：本地结构位（缠论/SMC 噪音）不再触发冲突检测。
+
+    实测事故：4364-4376 轮做空，入场 4335-4339，本地 1m SMC 位
+    4335.20/4338.77（距入场 0.13~3.0 点）被当成"紧贴支撑"拦截，
+    但价格直接穿过继续下跌 0.8~4.1 点——8/10 拦错。
+    现在只对 LLM 给的位判定，这些轮次应放行。
+    """
+    ev = _ev({"zg": 4348.0, "zd": 4335.0, "gg": 4360.0, "dd": 4330.0})
+    rev = {"support_levels": [4328.82, 4322.83, 4310.16],
+           "resistance_levels": [4348.48, 4357.06]}
+    lv = trade_levels("SHORT", 4336.0, rev, ev, atr=14.8)
+    assert lv.ok, "本地结构位 4335 不应触发冲突，LLM 位 4328.82 距入场够远"
 
 
 def test_conflict_check_ignored_without_atr():
     """无 ATR 数据时不做矛盾检测（无法判定距离），走原有校验路径。"""
-    ev = _ev({"zg": 4340.0, "zd": 4324.0, "gg": 4360.0, "dd": 4320.0})
-    lv = trade_levels("LONG", 4338.0, {}, ev, atr=None)
+    rev = {"support_levels": [4324.0], "resistance_levels": [4338.5]}
+    lv = trade_levels("LONG", 4338.0, rev, None, atr=None)
     assert lv.reason != "fusion_vs_levels_conflict", "无 ATR 不应触发矛盾检测"
 
 
