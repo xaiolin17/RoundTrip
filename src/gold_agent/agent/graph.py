@@ -118,7 +118,22 @@ class Graph:
                     # poll() 已把预测符号写进 rec["pred_sign"]（position_id 键桥接）
                     for d in closed:
                         pred_sign = d.get("pred_sign")
-                        actual = 1 if d.get("pnl", 0) > 0 else (-1 if d.get("pnl", 0) < 0 else 0)
+                        # ⚠️ 事故修复：actual 是**实际价格走势方向**，不是"盈利=方向对"。
+                        #    原实现 `actual = 1 if pnl > 0 else -1`：做空单盈利时
+                        #    pnl>0 → actual=+1，但价格实际**下跌**（方向=-1），
+                        #    pred=-1 ≠ actual=+1 → 盈利做空单全被误判"未命中"。
+                        #    实测最近 5 笔盈利做空单（+2.22/+9.04/+2.50/+4.36/+6.61）
+                        #    全部被记成未命中 → 贝叶斯池 p 被压到 0.31 → 反向压分。
+                        #    正确：actual = 持仓方向 × 盈亏符号
+                        #    （做空盈利=价格下跌=-1；做多盈利=价格上涨=+1）
+                        pnl = d.get("pnl", 0)
+                        direction = d.get("direction") or 0
+                        if pnl > 0:
+                            actual = direction
+                        elif pnl < 0:
+                            actual = -direction
+                        else:
+                            actual = 0
                         if pred_sign in (1, -1) and actual != 0:
                             for src in ("kalman_persist", "chanlun", "openmobius_smc",
                                         "classic_indicators"):
@@ -128,7 +143,7 @@ class Graph:
                                        "pred": pred_sign, "actual": actual, "pnl": d.get("pnl")})
                             log_info(f"贝叶斯反馈: 仓位 {d.get('position_id')} "
                                      f"预测{'做多' if pred_sign > 0 else '做空'} "
-                                     f"实际{'盈利' if actual > 0 else '亏损'} "
+                                     f"实际{'做多' if actual > 0 else '做空'} "
                                      f"盈亏 {d.get('pnl'):.2f}")
                         else:
                             # 符号为 0 = 开仓那轮融合分恰好为 0；或 pnl 为 0（保本平仓）

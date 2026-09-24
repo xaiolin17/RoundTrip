@@ -788,44 +788,61 @@ def test_prime_slice_is_monotonic_in_time(hist_15m):
         f"窗口右端未随时间单调前移：{positions}")
 
 
-def test_primed_score_spread_crosses_open_threshold(hist_15m):
+def test_primed_score_spread_crosses_open_threshold(hist_15m, monkeypatch):
     """预热后的分数分布必须**真的能越过 open_threshold**（不是理论上的）。
 
     只在"分布够宽"时才算通过 —— 若分数永远落在阈值以内，
     系统虽然"有分"但仍然不开仓，等于没修好。
+
+    ⚠️ **实盘状态隔离**：`_plumbing_engine()` 里的 `BayesianPool()`
+    会读 `data/bayes_state.json`（git 跟踪、agent 实时写入），
+    实测 9胜20负 -> 21负，贝叶斯证据持续变化会左右测试结果。
     """
-    engine = _plumbing_engine()
-    df = hist_15m
-    if len(df) < 900:
-        pytest.skip("历史数据不足")
-    window = df.iloc[-900:]
+    import json
+    import shutil
+    from pathlib import Path as _P
 
-    def _frames(w):
-        return {"1m": _frame_like(_resample(w, "1min")),
-                "5m": _frame_like(_resample(w, "5min")),
-                "15m": _frame_like(w),
-                "1h": _frame_like(_resample(w, "1h"))}
+    _iso = _P(CFG.project_root) / "_primed_iso"
+    shutil.rmtree(_iso, ignore_errors=True)
+    (_iso / "data").mkdir(parents=True, exist_ok=True)
+    (_iso / "data" / "bayes_state.json").write_text(
+        json.dumps({"saved_at": 0, "stats": {}, "recent": {}}), encoding="utf-8")
+    monkeypatch.setattr(CFG, "project_root", _iso)
+    try:
+        engine = _plumbing_engine()
+        df = hist_15m
+        if len(df) < 900:
+            pytest.skip("历史数据不足")
+        window = df.iloc[-900:]
 
-    frames = _frames(window)
-    engine.prime_history(frames, n_steps=300, step_bars=1)
+        def _frames(w):
+            return {"1m": _frame_like(_resample(w, "1min")),
+                    "5m": _frame_like(_resample(w, "5min")),
+                    "15m": _frame_like(w),
+                    "1h": _frame_like(_resample(w, "1h"))}
 
-    thr = CFG.decision.open_threshold
-    scores = []
-    # 在预热窗口上滚动推进，收集分数分布
-    for i in range(500, len(window), 20):
-        sub = _frames(window.iloc[max(0, i - 400):i])
-        cl = {tf: analyze_tf(sub[tf], tf) for tf in ("5m", "15m", "1h")}
-        ev = engine.fuse_all(sub, cl, {}, obs_id=20_000_000 + i)
-        scores.append(ev.result.score)
-    if not scores:
-        pytest.skip("无有效分数")
-    import numpy as np
-    arr = np.asarray(scores, dtype=float)
-    nonzero = np.mean(np.abs(arr) > 1e-9)
-    assert nonzero > 0.5, f"预热后非零分占比仅 {nonzero:.0%}，融合链路仍有阻塞"
-    assert np.abs(arr).max() >= thr, (
-        f"分数最大幅值 {np.abs(arr).max():.2f} < open_threshold={thr} → "
-        f"系统永远无法开仓（这是失败的改动）")
+        frames = _frames(window)
+        engine.prime_history(frames, n_steps=300, step_bars=1)
+
+        thr = CFG.decision.open_threshold
+        scores = []
+        # 在预热窗口上滚动推进，收集分数分布
+        for i in range(500, len(window), 20):
+            sub = _frames(window.iloc[max(0, i - 400):i])
+            cl = {tf: analyze_tf(sub[tf], tf) for tf in ("5m", "15m", "1h")}
+            ev = engine.fuse_all(sub, cl, {}, obs_id=20_000_000 + i)
+            scores.append(ev.result.score)
+        if not scores:
+            pytest.skip("无有效分数")
+        import numpy as np
+        arr = np.asarray(scores, dtype=float)
+        nonzero = np.mean(np.abs(arr) > 1e-9)
+        assert nonzero > 0.5, f"预热后非零分占比仅 {nonzero:.0%}，融合链路仍有阻塞"
+        assert np.abs(arr).max() >= thr, (
+            f"分数最大幅值 {np.abs(arr).max():.2f} < open_threshold={thr} → "
+            f"系统永远无法开仓（这是失败的改动）")
+    finally:
+        shutil.rmtree(_iso, ignore_errors=True)
 
 
 def test_oos_open_rate_is_acceptable(monkeypatch):

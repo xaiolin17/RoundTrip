@@ -85,6 +85,13 @@ class FusionConfig:
     hurst_window: int = _TOML.get("fusion", {}).get("hurst_window", 500)
     bayes_window: int = _TOML.get("fusion", {}).get("bayes_window", 300)
     sigma_max: float = _TOML.get("fusion", {}).get("sigma_max", 0.8)
+    #: 贝叶斯证据**负向钳制**（用户选定：表现差的源不能无限反打）。
+    #: 事故背景：贝叶斯池 9胜20负（p=0.32）-> evidence() 的 logit=-0.74
+    #: -> 分数为正时每个源被压 -0.94，4 源叠加把融合分拉低 0.3~0.5，
+    #:    加上信号源本身走弱，508 轮无一达到开仓阈值 1.3。
+    #: 现在：负证据最多压到 -evidence_floor，避免"越亏越反向"的自我强化。
+    #: 正证据不钳制（表现好的源应充分投票）。
+    bayes_evidence_floor: float = _TOML.get("fusion", {}).get("bayes_evidence_floor", 0.3)
     # ---- P0-1 源去均值（滚动 z-score）----
     norm_window: int = _TOML.get("fusion", {}).get("norm_window", 1440)
     norm_min_periods: int = _TOML.get("fusion", {}).get("norm_min_periods", 240)

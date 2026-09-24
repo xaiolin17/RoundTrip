@@ -101,11 +101,23 @@ class BayesianPool:
         return st.n if st else 0
 
     def evidence(self, source: str, score: float, strength: float) -> float:
-        """对数域证据：w · log(p/(1-p)) · sign · strength。"""
+        """对数域证据：w · log(p/(1-p)) · sign · strength。
+
+        ⚠️ 负向钳制（用户选定）：表现差的源（p<0.5）会给负证据，
+        实测 9胜20负（p=0.32）时 logit=-0.74，分数为正时每个源压
+        -0.94，4 源叠加把融合分拉低 0.3~0.5，配合信号源走弱导致
+        508 轮无一达到开仓阈值。现在负证据最多压到
+        -`bayes_evidence_floor`，避免"越亏越反向投票"的自我强化；
+        正证据不钳制（表现好的源应充分投票）。
+        """
         st = self._stats.get(source)
         if st is None or st.n < 20 or score == 0:
             return 0.0
         p = st.p()
         logit = math.log(p / (1 - p))
         sign = 1.0 if score > 0 else -1.0
-        return self.weight(source) * logit * sign * min(abs(strength), 1.0)
+        raw = self.weight(source) * logit * sign * min(abs(strength), 1.0)
+        # 负证据钳制：最多反向压 evidence_floor（正证据不限）
+        if raw < 0:
+            return float(max(raw, -CFG.fusion.bayes_evidence_floor))
+        return float(raw)
