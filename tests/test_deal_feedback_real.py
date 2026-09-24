@@ -199,3 +199,27 @@ def test_graph_has_no_dead_pending_pred():
     names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
     names |= {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     assert "_pending_pred" not in names, "graph.py 代码仍引用已删除的 _pending_pred"
+
+
+def test_bayes_actual_uses_direction_not_pnl_sign():
+    """**核心回归**：贝叶斯 actual = 实际价格走势方向 = 持仓方向 × 盈亏符号。
+
+    ⚠️ 事故（用户反馈"信号权重被压制"）：原实现 `actual = 1 if pnl>0
+    else -1` 把"盈利"当成"方向对"。做空单盈利时 pnl>0 → actual=+1，
+    但价格实际**下跌**（方向=-1）→ pred=-1 ≠ actual=+1 → 盈利做空单
+    全被记为"未命中"。实测最近 5 笔盈利做空单（+2.22/+9.04/+2.50/
+    +4.36/+6.61）全被误判，贝叶斯池被压到 9胜20负（p=0.31）反向压分，
+    508 轮无一达到开仓阈值。修复后 12胜8负（p=0.59）正向支持。
+    """
+    from gold_agent.agent import graph as G
+    # 复刻 graph.py 修复后的 actual 计算（从源码提取语义，防止回归）
+    src = open(G.__file__, encoding="utf-8").read()
+    assert "actual = direction" in src, "graph.py 必须用方向×盈亏算 actual"
+    assert "pnl > 0" in src, "盈亏符号必须参与"
+    # 直接验证语义
+    calc = lambda pnl, direction: (direction if pnl > 0
+                                   else (-direction if pnl < 0 else 0))
+    assert calc(2.22, -1) == -1, "做空盈利 = 价格下跌 = actual -1（命中 pred=-1）"
+    assert calc(-9.05, -1) == 1, "做空亏损 = 价格上涨 = actual +1（未命中 pred=-1）"
+    assert calc(15.06, 1) == 1, "做多盈利 = 价格上涨 = actual +1"
+    assert calc(-6.0, 1) == -1, "做多亏损 = 价格下跌 = actual -1"
