@@ -82,6 +82,39 @@ def test_short_conflict_when_support_too_close():
     assert not lv.ok and lv.reason == "fusion_vs_levels_conflict"
 
 
+def test_entangled_resistance_skips_conflict():
+    """回归（用户报告"怎么一直在拦截"）：LLM 位支撑/压力纠缠 = 噪音区，
+    贴脸判定必须跳过（不再是 fusion_vs_levels_conflict）。
+
+    事故：5586 轮做多 4286.141，上方 1.7 点压力 4287.87，但下方 0.44 点
+    就有支撑 4287.43（支撑/压力交错仅 0.26 点）——密集噪音位，用它判
+    "贴脸压力"误伤（价格刚突破纠缠区就该追多）。
+
+    ⚠️ 纠缠跳过后仍可能被**独立的** RR/止损检查拒绝（取决于是否有够
+    赔率的远处目标位），本测试只验证"贴脸误拦"被消除。
+    """
+    rev = {"support_levels": [4287.43, 4287.61, 4282.87],
+           "resistance_levels": [4287.87, 4288.33, 4289.83]}
+    lv = trade_levels("LONG", 4286.141, rev, None, atr=14.8)
+    assert lv.reason != "fusion_vs_levels_conflict", "纠缠噪音位不应触发贴脸拦截"
+    assert any("纠缠" in n for n in lv.notes), "notes 应说明跳过原因"
+
+
+def test_isolated_resistance_still_blocks():
+    """孤立压力位（下方无支撑纠缠）且贴脸 < 0.3×ATR -> 仍拦截。"""
+    rev = {"support_levels": [4282.87], "resistance_levels": [4287.87]}
+    lv = trade_levels("LONG", 4286.141, rev, None, atr=14.8)
+    assert not lv.ok and lv.reason == "fusion_vs_levels_conflict", "孤立真贴脸应拦"
+
+
+def test_entangled_support_skips_conflict_short():
+    """做空同理：支撑与压力纠缠 -> 跳过贴脸判定放行。"""
+    rev = {"support_levels": [4330.5, 4330.2], "resistance_levels": [4330.8, 4331.0]}
+    lv = trade_levels("SHORT", 4332.0, rev, None, atr=12.0)
+    # 支撑 4330.2/4330.5 与压力 4330.8 纠缠 -> 跳过；若后续 RR 不足则 rr 拒绝
+    assert lv.reason != "fusion_vs_levels_conflict", "纠缠位不应触发贴脸拦截"
+
+
 def test_short_allowed_when_support_far():
     """做空但 LLM 支撑位离得远（> 0.3×ATR）-> 放行。"""
     rev = {"support_levels": [4300.0], "resistance_levels": [4350.0]}
