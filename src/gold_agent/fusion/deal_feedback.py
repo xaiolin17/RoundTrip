@@ -164,17 +164,26 @@ class DealFeedback:
             #    贝叶斯池一直靠先验在跑。
             #    正确键是 position_id（实测开仓 deal 的 order == position_id）。
             pred = d.get("pred")
+            src_preds: dict[str, int] = {}
             if pred is None and pred_orders:
                 pid = str(d.get("position_id"))
                 # 1) 持仓维度（市价开仓 / 加仓 / 挂单成交后统一按 position_id 记）
-                pred = pred_orders.pop(pid, None)
+                raw = pred_orders.pop(pid, None)
                 # 2) 兼容旧键：挂单 ticket（部分经纪商 order != position_id）
-                if pred is None:
-                    pred = pred_orders.pop(str(d.get("order")), None)
+                if raw is None:
+                    raw = pred_orders.pop(str(d.get("order")), None)
                 # 3) 兼容旧格式：{"sign": 1, "pos": "..."} 字典值
-                if isinstance(pred, dict):
-                    pred = pred.get("sign")
+                if isinstance(raw, dict):
+                    # 新格式 {"fused": 符号, "src": {源: 符号}} 优先；
+                    # 旧格式 {"sign": ...} 兜底
+                    pred = raw.get("fused")
+                    if pred is None:
+                        pred = raw.get("sign")
+                    src_preds = raw.get("src") or {}
+                else:
+                    pred = raw
             rec["pred_sign"] = pred
+            rec["src_preds"] = src_preds
             self.last_pred_by_position[str(d.get("position_id"))] = pred
             enriched.append(rec)
         self.cursor = max(d["time"] for d in new)

@@ -20,6 +20,7 @@ from gold_agent.common.logging_util import (decision_log, log_error, log_info,
                                             log_warn, trade_log)
 from gold_agent.decision.machine import DecisionContext, DecisionEngine, Proposal
 from gold_agent.fusion.engine import FusionEngine, _mobius_score
+from gold_agent.fusion.weights import DECISION_SOURCES
 from gold_agent.llm.orchestrator import Orchestrator
 from gold_agent.mt5.client import MT5Client, Mt5Error
 from gold_agent.mt5.executor import ExecutionResult, Executor, OrderPlan
@@ -135,12 +136,43 @@ class Graph:
                         else:
                             actual = 0
                         if pred_sign in (1, -1) and actual != 0:
-                            for src in ("kalman_persist", "chanlun", "openmobius_smc",
-                                        "classic_indicators"):
-                                self.fusion.bayes.record_outcome(src, pred_sign, actual)
+                            # ---- 按源调权重（用户选定方案）----
+                            # 各源优先用**自己开仓时的分数符号**记账（src_preds）。
+                            #
+                            # 源名取自 fusion.weights.DECISION_SOURCES（单一出处），
+                            # 不要硬编码：漏掉某个源 -> 它进了快照却永远不被记账。
+                            #
+                            # ⚠️ 快照为空 vs 快照缺键，语义完全不同，不能混为一谈：
+                            #   · src_preds 为空 = **旧数据**（新格式上线前开仓，无 src 快照）
+                            #     -> 退回融合分符号，保证历史记录也能记账、不丢数据。
+                            #   · src_preds 非空但缺某源 = 该源**当轮没参与**（未验证/被
+                            #     excluded/status=unavailable，gaussian.fuse 会把它整个
+                            #     移出 per_source；news 更是只在 news_score!=0 时才加入）。
+                            #     -> 必须跳过：它当轮没有方向判断，拿融合分顶替等于
+                            #        把别的源的方向算到它头上，会污染它的命中率。
+                            src_preds = d.get("src_preds") or {}
+                            hit_map = {}
+                            if src_preds:
+                                # 新格式：各源用**自己**的符号，缺键即未参与 -> 跳过
+                                preds = {s: src_preds.get(s) for s in DECISION_SOURCES}
+                            else:
+                                # 旧数据兜底：**只喂有 IR 权重的源**。
+                                # ⚠️ 不能把 DECISION_SOURCES 整个喂进去：`news` 未验证、
+                                #    IR 表权重为 0，但它一旦在本池攒够 min 样本，
+                                #    `bayes.evidence()`（用的是池内权重，不是 IR 表权重）
+                                #    就会开始给它产生证据 —— 那就违背了
+                                #    weights.py 的硬规则"没有实测 IR 的源 = 0 权重"。
+                                #    用融合分兜底时更要守这条：兜底填的是别人的方向。
+                                preds = {s: pred_sign for s in DECISION_SOURCES
+                                         if self.fusion.weights.weight(s) > 0}
+                            for src, p_src in preds.items():
+                                if p_src in (1, -1):
+                                    self.fusion.bayes.record_outcome(src, p_src, actual)
+                                    hit_map[src] = 1 if p_src == actual else 0
                             self.fusion.bayes.save()
                             trade_log({"event": "bayes_feedback", "position": d.get("position_id"),
-                                       "pred": pred_sign, "actual": actual, "pnl": d.get("pnl")})
+                                       "pred": pred_sign, "actual": actual, "pnl": d.get("pnl"),
+                                       "src_preds": src_preds, "src_hits": hit_map})
                             log_info(f"贝叶斯反馈: 仓位 {d.get('position_id')} "
                                      f"预测{'做多' if pred_sign > 0 else '做空'} "
                                      f"实际{'做多' if actual > 0 else '做空'} "
@@ -541,17 +573,41 @@ class Graph:
 
         `res.order` 是 MT5 返回的 order ticket；市价单成交后它与 position_id
         相同（实测 6/6 成立），挂单成交时也按 order 键兜底。
+
+        ⚠️ 按源调权重（用户选定方案）：
+        原实现只存融合分符号，平仓时 4 源喂同一个 pred_sign -> 4 源 stats
+        永远相同 -> 权重永远相同，贝叶斯只是"整体信任度"。
+        现在同时快照**各源自己开仓时的分数符号**（per_source），
+        平仓时各源用**自己的预测方向**记账 -> 命中率独立 ->
+        权重自动偏向表现好的源。
+        值格式: {"fused": 融合分符号, "src": {源名: 该源分数符号(0=无方向)}}
         """
         fused = st.get("fused")
         s = 0.0
+        per_source: list[dict] = []
         if fused is not None and getattr(fused, "result", None) is not None:
             s = float(fused.result.score)
-        sign = 1 if s > 0 else (-1 if s < 0 else 0)
+            per_source = getattr(fused.result, "per_source", None) or []
+        fused_sign = 1 if s > 0 else (-1 if s < 0 else 0)
+        src_preds: dict[str, int] = {}
+        for ps in per_source:
+            name = ps.get("name")
+            if not name:
+                continue
+            # 被排除的源（zero_weight / 未验证）不给方向 -> 符号 0 -> 不计入贝叶斯
+            if ps.get("excluded"):
+                src_preds[name] = 0
+                continue
+            try:
+                sc = float(ps.get("score") or 0.0)
+            except (TypeError, ValueError):
+                sc = 0.0
+            src_preds[name] = 1 if sc > 0 else (-1 if sc < 0 else 0)
         ticket = getattr(res, "order", 0) or 0
         if not ticket:
             log_warn("预测符号记录跳过：成交未返回 order ticket")
             return
-        self._pred_orders[str(ticket)] = sign
+        self._pred_orders[str(ticket)] = {"fused": fused_sign, "src": src_preds}
         self._save_pred_orders()
 
     def _save_pred_orders(self) -> None:

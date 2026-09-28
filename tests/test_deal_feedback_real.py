@@ -68,7 +68,10 @@ class _FakeClient:
 
 
 def _feedback(state_dir) -> DealFeedback:
-    fb = DealFeedback(BayesianPool(), CircuitBreakers(), state_dir=state_dir)
+    """注意：贝叶斯池用 state_dir 下的隔离文件，避免读写实盘
+    `data/bayes_state.json`（git 跟踪文件），否则断言依赖实盘历史、且会污染。"""
+    fb = DealFeedback(BayesianPool(state_path=Path(state_dir) / "bayes.json"),
+                      CircuitBreakers(), state_dir=state_dir)
     fb.cursor = 0.0
     return fb
 
@@ -142,7 +145,11 @@ def test_bayes_pool_updated_from_bridged_outcome(state_dir):
 
 
 def test_record_pred_persists_by_order_ticket(state_dir, monkeypatch):
-    """graph._record_pred：成交后按 order ticket 落盘（跨轮次/重启可回填）。"""
+    """graph._record_pred：成交后按 order ticket 落盘（跨轮次/重启可回填）。
+
+    ⚠️ 按源调权重（用户选定方案）后，值从 int 升级为
+    {"fused": 融合分符号, "src": {源名: 该源分数符号}}。
+    """
     from gold_agent.agent import graph as G
 
     written: dict = {}
@@ -164,7 +171,233 @@ def test_record_pred_persists_by_order_ticket(state_dir, monkeypatch):
             score = -1.66
 
     _G._record_pred(g, _Res(), {"fused": _Fused()})
-    assert written == {"2557969245": -1}, "应按 order ticket 记为做空(-1)"
+    assert written["2557969245"]["fused"] == -1, "融合分符号应记为做空(-1)"
+    assert written["2557969245"]["src"] == {}, "无 per_source 时 src 快照为空字典"
+
+
+def _snapshot(per_source, score=-1.66, ticket=2557969245):
+    """构造 _record_pred 输入并返回落盘快照（复用 _G 拦截落盘）。"""
+    from gold_agent.agent import graph as G
+
+    written: dict = {}
+
+    class _G(G.Graph):
+        def _save_pred_orders(self) -> None:
+            written.clear()
+            written.update(self._pred_orders)
+
+    g = _G.__new__(_G)
+    g._pred_orders = {}
+
+    class _Res:
+        ok = True
+        order = ticket
+
+    class _Result:
+        pass
+
+    _Result.score = score
+    _Result.per_source = per_source
+
+    class _Fused:
+        result = _Result()
+
+    _G._record_pred(g, _Res(), {"fused": _Fused()})
+    return written
+
+
+def test_per_source_pred_snapshot(state_dir):
+    """**核心**：快照必须记录**每个源自己**的分数符号，而非融合分符号。
+
+    原实现只存融合分符号 -> 平仓时 4 源喂同一个 pred_sign ->
+    4 源 stats 永远相同 -> 权重永远相同，贝叶斯只是"整体信任度"。
+    """
+    snap = _snapshot([
+        {"name": "kalman_persist", "score": -1.2, "w": 0.5},
+        {"name": "chanlun", "score": 0.4, "w": 0.3},          # 与融合分相反
+        {"name": "openmobius_smc", "score": 0.0, "w": 0.2},   # 无方向
+    ])["2557969245"]
+    assert snap["fused"] == -1
+    assert snap["src"]["kalman_persist"] == -1
+    assert snap["src"]["chanlun"] == 1, "与融合分方向相反的源必须保留自己的符号"
+    assert snap["src"]["openmobius_smc"] == 0, "分数 0 -> 无方向 -> 不计入"
+
+
+def test_zero_score_source_skipped(state_dir):
+    """被排除（zero_weight/未验证）的源不给方向，符号记 0 -> 不计入贝叶斯。"""
+    snap = _snapshot([
+        {"name": "kalman_persist", "score": 1.0, "w": 0.5},
+        {"name": "classic_indicators", "score": 0.9, "w": 0.0,
+         "excluded": "zero_weight"},
+    ])["2557969245"]
+    assert snap["src"]["kalman_persist"] == 1
+    assert snap["src"]["classic_indicators"] == 0, "excluded 源不得给方向"
+
+
+def test_poll_passes_src_preds_through(state_dir):
+    """poll() 必须把 src_preds 透传给调用方（否则按源记账拿不到每源符号）。"""
+    fb = _feedback(state_dir)
+    snap = {"fused": -1, "src": {"kalman_persist": -1, "chanlun": 1}}
+    closed = asyncio.run(fb.poll(_FakeClient(CLOSE_DEAL), {"2557969245": snap}))
+    d = closed[0]
+    assert d["pred_sign"] == -1, "pred_sign 取 fused（兼容旧逻辑）"
+    assert d["src_preds"] == snap["src"], "src_preds 必须原样透传"
+
+
+def test_bayes_per_source_independent(state_dir):
+    """**核心**：两个源方向不同 -> 平仓后命中率分化（这正是用户要的行为）。
+
+    `CLOSE_DEAL` 是**平掉一笔盈利多单**（type=1=sell 平仓 -> 原持仓 LONG），
+    pnl>0 -> actual = 持仓方向 = +1（价格上涨）。
+    kalman 预测 -1（未命中）、chanlun 预测 +1（命中）-> stats 必须不同。
+    """
+    fb = _feedback(state_dir)
+    snap = {"fused": -1, "src": {"kalman_persist": -1, "chanlun": 1}}
+    closed = asyncio.run(fb.poll(_FakeClient(CLOSE_DEAL), {"2557969245": snap}))
+    d = closed[0]
+    pnl, direction = d["pnl"], d["direction"]
+    actual = direction if pnl > 0 else (-direction if pnl < 0 else 0)
+    assert direction == 1, "平仓 deal type=1(sell) -> 原持仓为做多"
+    assert actual == 1, "做多盈利 -> 价格上涨 -> actual +1"
+    for src in ("kalman_persist", "chanlun"):
+        pred = d["src_preds"].get(src)
+        assert pred in (1, -1), f"{src} 当轮应有方向"
+        fb.bayes.record_outcome(src, pred, actual)
+    k = fb.bayes._stats["kalman_persist"]
+    c = fb.bayes._stats["chanlun"]
+    assert (k.hits, k.misses) == (0, 1), "kalman 预测做空但价格上涨 -> 未命中"
+    assert (c.hits, c.misses) == (1, 0), "chanlun 预测做多且价格上涨 -> 命中"
+    assert (k.hits, k.misses) != (c.hits, c.misses), "各源命中率必须独立分化"
+
+
+def test_old_int_value_backward_compat(state_dir):
+    """旧纯 int 值（`{"ticket": 1}`）平仓仍能记账，src_preds 为空。"""
+    fb = _feedback(state_dir)
+    closed = asyncio.run(fb.poll(_FakeClient(CLOSE_DEAL), {"2557969245": -1}))
+    assert closed[0]["pred_sign"] == -1
+    assert closed[0]["src_preds"] == {}
+
+
+def test_old_dict_value_backward_compat(state_dir):
+    """旧 `{"sign": ...}` 字典值平仓仍能记账（新格式无 sign 键也能兜底）。"""
+    fb = _feedback(state_dir)
+    closed = asyncio.run(fb.poll(_FakeClient(CLOSE_DEAL),
+                                 {"2557969245": {"sign": -1, "pos": "2557969245"}}))
+    assert closed[0]["pred_sign"] == -1
+    assert closed[0]["src_preds"] == {}
+
+
+def test_legacy_pred_falls_back_to_fused_per_source(state_dir):
+    """旧数据无 src 快照 -> 只给**有 IR 权重**的源退回融合分记账，不丢数据。
+
+    ⚠️ 兜底不能覆盖全部 DECISION_SOURCES：`news`/`openmobius_smc` 未验证、
+    IR 表权重为 0，一旦在本池攒够样本，`bayes.evidence()`（用池内权重，
+    非 IR 表权重）就会开始给它们产生证据 —— 违背 weights.py 的硬规则
+    "没有实测 IR 的源 = 0 权重"。兜底填的还是**别的源的方向**，更要守住。
+    """
+    from gold_agent.fusion.engine import FusionEngine
+    from gold_agent.fusion.weights import DECISION_SOURCES
+
+    fb = _feedback(state_dir)
+    closed = asyncio.run(fb.poll(_FakeClient(CLOSE_DEAL), {"2557969245": -1}))
+    d = closed[0]
+    src_preds = d["src_preds"] or {}
+    assert src_preds == {}, "旧 int 值应无 src 快照"
+
+    engine = FusionEngine()          # 真实 IR 权重表
+    weighted = [s for s in DECISION_SOURCES if engine.weights.weight(s) > 0]
+    unweighted = [s for s in DECISION_SOURCES if engine.weights.weight(s) <= 0]
+    assert unweighted, "本用例前提：存在未验证/0 权重源（news、openmobius_smc）"
+
+    actual = 1                       # 平掉盈利多单 -> 价格上涨
+    expected = {s: d["pred_sign"] for s in weighted}   # 旧数据兜底：用融合分
+    for src, p in expected.items():
+        if p in (1, -1):
+            fb.bayes.record_outcome(src, p, actual)
+
+    assert set(fb.bayes._stats) == set(weighted), \
+        "旧记录应只更新有 IR 权重的源（不丢数据，且不给 0 权重源喂样本）"
+    for s in unweighted:
+        assert s not in fb.bayes._stats, f"0 权重源 {s} 不得被兜底记账"
+
+
+def test_source_names_use_decision_sources_not_hardcoded():
+    """graph.py 的记账源名必须取自 DECISION_SOURCES，不得硬编码。
+
+    ⚠️ 为什么：原实现硬编码 4 个源名，而 `DECISION_SOURCES` 有 5 个
+    （多一个 `news`）。一旦 `news` 拿到非零权重，它会进入开仓快照
+    （per_source 里有），却因为不在硬编码元组里而**永远不被记账**
+    -> 该源的贝叶斯统计永远停在先验，权重永远不更新。
+    单一出处可以避免这种"加了源忘了改记账"的漂移。
+    """
+    import ast
+
+    from gold_agent.agent import graph as G
+    from gold_agent.fusion.weights import DECISION_SOURCES
+
+    src = open(G.__file__, encoding="utf-8").read()
+    assert '"kalman_persist", "chanlun"' not in src, \
+        "不得再硬编码源名元组（会漏掉 news）"
+    # news 必须在决策源里（否则上面的漂移论证不成立）
+    assert "news" in DECISION_SOURCES, "DECISION_SOURCES 应包含 news"
+
+    # DECISION_SOURCES 必须被真正引用两次：新格式遍历 + 旧数据兜底过滤
+    tree = ast.parse(src)
+    refs = [n for n in ast.walk(tree)
+            if isinstance(n, ast.Name) and n.id == "DECISION_SOURCES"]
+    assert len(refs) >= 2, \
+        "新格式与旧数据兜底两条路径都必须引用 DECISION_SOURCES"
+
+
+def test_legacy_fallback_filters_zero_weight_sources():
+    """**关键**：旧数据兜底必须按 IR 权重过滤，0 权重源永不被喂样本。
+
+    这是行为约束而非实现细节，所以直接断言源码里的过滤条件存在，
+    并配合 test_legacy_pred_falls_back_to_fused_per_source 验证语义。
+    """
+    from gold_agent.agent import graph as G
+
+    src = open(G.__file__, encoding="utf-8").read()
+    assert "self.fusion.weights.weight(s) > 0" in src, \
+        ("旧数据兜底必须只喂有 IR 权重的源；"
+         "否则 news/openmobius_smc 攒够样本后会产生证据，"
+         "违背 weights.py '未验证源 = 0 权重' 的硬规则")
+
+
+def test_missing_key_in_nonempty_snapshot_is_skipped(state_dir):
+    """**关键语义**：快照非空但缺某源 = 该源当轮没参与 -> 跳过，不兜底。
+
+    与"快照为空 = 旧数据 -> 兜底"是两回事。若这里也兜底，等于把融合分
+    （别的源的合成方向）算到该源头上，会污染它的命中率。
+    """
+    from gold_agent.fusion.weights import DECISION_SOURCES
+
+    fb = _feedback(state_dir)
+    # 快照非空，但只有 kalman / chanlun 参与（news 当轮 news_score==0 未加入，
+    # classic 可能被 excluded）
+    snap = {"fused": -1, "src": {"kalman_persist": -1, "chanlun": 1}}
+    closed = asyncio.run(fb.poll(_FakeClient(CLOSE_DEAL), {"2557969245": snap}))
+    d = closed[0]
+    src_preds = d["src_preds"]
+    assert src_preds, "本场景快照非空"
+    actual = 1
+    # 镜像 graph.py 的新格式分支：缺键 -> None -> 跳过
+    preds = {s: src_preds.get(s) for s in DECISION_SOURCES}
+    for src, p in preds.items():
+        if p in (1, -1):
+            fb.bayes.record_outcome(src, p, actual)
+    assert set(fb.bayes._stats) == {"kalman_persist", "chanlun"}, \
+        "未参与的源不得被记账（否则命中率被污染）"
+
+
+def test_snapshot_covers_news_source(state_dir):
+    """`_record_pred` 快照的 src 键应覆盖 per_source 提供的每个源（含 news）。"""
+    snap = _snapshot([
+        {"name": "kalman_persist", "score": 1.0, "w": 0.5},
+        {"name": "news", "score": -0.7, "w": 0.3},
+    ])["2557969245"]
+    assert snap["src"]["news"] == -1, "news 若参与必须有独立符号"
+    assert snap["src"]["kalman_persist"] == 1
 
 
 def test_record_pred_skips_without_ticket(state_dir):
