@@ -166,6 +166,19 @@ class RiskConfig:
         "pullback_band_near", 0.5)
     pullback_band_far: float = _TOML.get("risk", {}).get(
         "pullback_band_far", 0.618)
+    # ---- 中枢位置闸（用户反馈"单子经常挂在中枢中部"）----
+    #: 是否禁止在中枢**中部**开新仓（用户选定：先加硬闸）
+    zhongshu_gate: bool = _TOML.get("risk", {}).get("zhongshu_gate", True)
+    #: 判定"贴边"的归一化带宽（两端各此值，中间为禁止区）
+    #: 0.30 -> 中部 40% 为禁区。放宽到 0.5 会等于禁止一切非突破入场。
+    zhongshu_edge_band: float = _TOML.get("risk", {}).get(
+        "zhongshu_edge_band", 0.30)
+    #: 优先取哪个周期的中枢（用户选定：5m 为主，1m 兜底）
+    zhongshu_tfs: tuple = tuple(_TOML.get("risk", {}).get(
+        "zhongshu_tfs", ["5m", "1m"]))
+    #: 中枢宽度下限（×ATR）；低于此值视为退化/噪音中枢，不作为判据
+    zhongshu_min_width_atr: float = _TOML.get("risk", {}).get(
+        "zhongshu_min_width_atr", 0.25)
     daily_loss_stop_pct: float = _TOML.get("risk", {}).get("daily_loss_stop_pct", 0.03)
     consecutive_loss_cooloff_h: float = _TOML.get("risk", {}).get("consecutive_loss_cooloff_h", 4.0)
     consecutive_loss_n: int = _TOML.get("risk", {}).get("consecutive_loss_n", 4)
@@ -215,6 +228,26 @@ class DecisionConfig:
     #: -> 强信号被挂单阻塞 167 轮。
     pending_only_in_mean_revert: bool = _TOML.get("decision", {}).get(
         "pending_only_in_mean_revert", True)
+    # ---- news「独立证据」通道（用户选定：不抢方向权重，做事件风险闸）----
+    #
+    # ⚠️ 为什么不是给 news 加方向权重：`weights.py` 的硬规则是
+    #    「没有实测 IR 数字的源 = 0 权重」。news 从未做过 IR 校准，
+    #    给它方向权重等于用未验证信号做方向 —— 正是该规则要禁止的。
+    #
+    # 但 news 现在**完全没用上**：实测 7874 轮里 news 从未进入 per_source，
+    #    因为权重 0 被 gaussian.fuse 排除；LLM 的 news_assessment 拿到后
+    #    触发一次 `fuse_all` 重融合，实测融合分一字不变（news_score 从
+    #    0 → +1.5 → -1.5，融合分恒为 +1.438195），纯空操作。
+    #
+    # 所以把 news 做成**事件风险闸**：它不影响方向，只影响"要不要开/开多大"。
+    #    这与它「未验证」的定位一致，且立刻产生实际作用。
+    #: LLM 新闻影响度 >= 此值 → 不开新仓（等事件过去）
+    news_impact_block: float = _TOML.get("decision", {}).get("news_impact_block", 0.70)
+    #: LLM 新闻影响度 >= 此值 → 新仓手数 × news_impact_lot_mult
+    news_impact_reduce: float = _TOML.get("decision", {}).get("news_impact_reduce", 0.40)
+    #: 事件降级时的手数系数
+    news_impact_lot_mult: float = _TOML.get("decision", {}).get(
+        "news_impact_lot_mult", 0.5)
 
 
 @dataclass

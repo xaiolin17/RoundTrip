@@ -227,6 +227,22 @@ def _audit_gates(raw: dict, structure: str | None, signals: list[dict],
 
     # ---- 6) trigger_gate：低级别触发 ----
     # 我们只有本周期数据，无法递归到更低级别 → 如实标注 trigger_missing
+    #
+    # ⚠️ 澄清（早先的说明有误，此处更正）：
+    #    本门**不影响** `output_mode` 与分数。`output_mode`（下方第 8 门）
+    #    只由 `structure_gate` / `type_gate` + vendor 的 `definition_mode`
+    #    决定。实测：两门都过、`failed == []`、`all_passed is True` 时，
+    #    `output_mode` 仍是 `structure_proxy` —— 因为 vendor 引擎自报
+    #    `definition_mode = "research_proxy"`（见 `raw["meta"]`），
+    #    而 L250 的降级规则把它压到 structure_proxy。
+    #    `trigger_gate` 在代码里**从未被读取**（grep 全仓库无消费点），
+    #    它只是对外的能力披露。
+    #
+    # 能不能实现：能，但**不在本函数内**。`analyze_tf` 只接收一个周期的
+    # frame，拿不到更低级别；而调用方 `graph.py` 同时持有
+    # 1m/5m/15m/1h/4h（L193-194 各调一次 analyze_tf），所以低级别触发
+    # 只能在 graph 层做（本周期出信号、低周期确认方向后回填）。
+    # 属于跨模块改动，未在本轮实施。
     g.trigger_gate = False
     g.notes.append(f"trigger_missing: 未递归到 {levels.get('trigger_level')} 低级别确认"
                    f"（SKILL.md 要求显式标注）")

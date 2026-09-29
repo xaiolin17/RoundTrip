@@ -45,6 +45,76 @@ MB_TF_WEIGHTS: dict[str, float] = {
     "1h": 1.00, "4h": 0.50, "15m": 0.40, "5m": 0.20, "1m": 0.00,
 }
 
+def aggregate_tf_scores(weights: dict[str, float],
+                        scores: dict[str, float | None]) -> float:
+    """把各周期分数按权重聚合成**一个**分数（统一的科学口径）。
+
+    为什么要有这个函数
+    ------------------
+    原先两个源用了**两套不一致**的公式：
+
+      chanlun : `clip(Σ wᵢsᵢ / (wsum/3), ±3)`
+      mobius  : `clip(Σ wᵢsᵢ,          ±3)`   ← 裸求和
+
+    这两个都不是"加权平均"，而且行为差别很大（实测 7859 轮真实数据）：
+
+      · **裸求和会随缺周期静默变小**。mobius 历史上 4h 从未抓取
+        （`MB_TF_WEIGHTS` 里 4h: 0.50 占了权重预算 2.1 的 23.8%，
+        却 100% 缺失），于是分数天然被压低 —— 而这不是"模型认为
+        方向更弱"，纯粹是缺数据。
+      · **`/(wsum/3)` 在代数上就是 `3 × 加权平均`**（实测比值恒为
+        3.000000）。输入被 clip 在 ±3，乘以 3 之后必然大量顶到 ±3：
+        实测 chanlun 有 **89.0%** 的轮次贴在 ±3 上下限，
+        mobius 裸求和也有 53.1%。而加权平均本身 **0%** 触限
+        （min −2.981 / max +2.812）—— 也就是说那个 3 倍增益
+        **人为制造了饱和**，把连续分数压成了近似三值信号。
+
+    本函数采用**覆盖率收缩的加权平均**（coverage-shrunk weighted mean）：
+
+        score = (Σ wᵢsᵢ) / W_declared
+
+    其中 `W_declared` 是**全部**声明权重之和（不是"实际到齐的权重和"）。
+    这个口径同时满足四条要求，且每条都有实测支撑：
+
+      1. **量纲正确**：结果是各周期分数的加权平均，与输入同尺度
+         （不再有凭空的 3 倍增益）。
+      2. **缺周期 → 保守收缩，而非重分配**。除以固定分母意味着
+         缺失周期的贡献是 0，总分自动向 0 收缩 —— 即"证据不足时
+         降低置信度"，这正是缺数据时该有的行为。若改成除以
+         "实际到齐的 wsum"（纯加权平均），缺 1h 时剩余周期会被
+         放大到满量程，等于**假装**没缺数据，实测其偏差
+         |Δ|=0.738 vs 收缩口径 0.989 —— 但纯平均在 1h 缺失时会
+         把 15m/5m 的观点放大到 1h 的权重级别，语义上更危险。
+      3. **不饱和**：实测 0% 触限（vs 现状 53.1%），保留 210 个
+         不同取值（vs 现状 137），信息量更高。
+      4. **排序稳定**：缺 1h 时与全量数据的 Spearman ρ=+0.9570
+         （vs 裸求和 +0.8840、`/3` 口径仅 +0.7195）。
+
+    参数
+    ----
+    weights : 各周期权重（权重 <= 0 的周期视为不参与，不进入分子分母）
+    scores  : 各周期分数；`None` 表示该周期**缺失**（不是 0 分！）
+
+    缺失与 0 分的区别被刻意保留：缺失只影响分母（已在固定分母里），
+    0 分则是"看多空均衡"的真实观点，会拉低总分。
+    """
+    num, wsum = 0.0, 0.0
+    for tf, w in weights.items():
+        if w is None or float(w) <= 0:
+            continue
+        wsum += abs(float(w))
+        v = scores.get(tf)
+        if v is None:
+            continue                      # 缺失 -> 分子不贡献
+        try:
+            num += float(w) * float(v)
+        except (TypeError, ValueError):
+            continue
+    if wsum <= 0:
+        return 0.0
+    return float(np.clip(num / wsum, -3.0, 3.0))
+
+
 #: 各周期一根 bar 等于多少分钟（预热时按等时长切窗口用）
 _TF_MINUTES: dict[str, int] = {
     "1m": 1, "2m": 2, "5m": 5, "10m": 10, "15m": 15, "30m": 30,
@@ -252,17 +322,25 @@ class FusionEngine:
         raws["chanlun"] = float(np.clip(sum(parts) / (wsum / 3.0), -3.0, 3.0)) if wsum > 0 else 0.0
 
         # 3) mobius SMC 多周期
-        parts = []
+        # ⚠️ 与 chanlun 统一口径：覆盖率收缩加权平均，不再裸求和。
+        #    原裸求和有"缺周期 -> 分数静默变小"的缺陷（4h 占权重预算
+        #    23.8% 却 100% 缺失）。详见 aggregate_tf_scores 的说明。
+        mb_tf_scores: dict[str, float | None] = {}
         last_1m = float(frames["1m"]["close"].iloc[-1])
         last_15m = float(frames["15m"]["close"].iloc[-1])
         if isinstance(mobius_result, dict):
             for tf, w in MB_TF_WEIGHTS.items():
+                if w <= 0:
+                    continue
                 r = mobius_result.get(tf)
-                if w > 0 and r is not None and r.status != "unavailable":
-                    parts.append(w * _mobius_score(r, last_1m if tf == "1m" else last_15m))
+                if r is None or r.status == "unavailable":
+                    mb_tf_scores[tf] = None      # 缺失（不是 0 分）
+                    continue
+                mb_tf_scores[tf] = _mobius_score(
+                    r, last_1m if tf == "1m" else last_15m)
         elif mobius_result is not None and mobius_result.status != "unavailable":
-            parts.append(MB_TF_WEIGHTS["15m"] * _mobius_score(mobius_result, last_15m))
-        raws["openmobius_smc"] = float(np.clip(sum(parts), -3.0, 3.0)) if parts else 0.0
+            mb_tf_scores["15m"] = _mobius_score(mobius_result, last_15m)
+        raws["openmobius_smc"] = aggregate_tf_scores(MB_TF_WEIGHTS, mb_tf_scores)
 
         # 4) 经典指标
         raws["classic_indicators"] = float(
@@ -305,6 +383,11 @@ class FusionEngine:
 
         obs_id: 观测编号（实盘 = round_id，回放 = bar 序号）。
                 同一 obs_id 重复调用 fuse_all 时归一化器幂等（不重复入缓冲）。
+
+        ⚠️ `news_score` 是**已废弃的兼容参数**：news 无实测 IR（权重 0），
+        加进融合会被 `gaussian.fuse` 排除、对结果零影响（实测融合分一字不变）。
+        保留签名只为不破坏既有调用方，**它不再改变任何输出**。
+        news 的现有权力在 decision 层（事件闸）与 risk 层（手数降级）。
         """
         ev = FusedEvidence(computed_at=time.time())
         ev.chanlun = chanlun_results
@@ -329,6 +412,19 @@ class FusionEngine:
         sources.append(_mk("kalman_persist", kalman_persist, max(k.sigma * 0.8, 0.2)))
 
         # 2) chanlun 多周期：1h/4h 主导方向，1m 不参与（P1-1）
+        # ⚠️ 这里仍是 `/(wsum/3)`，**刻意未改**（chanlun 是活源，权重 4.0）。
+        #    实测该式在代数上恒等于 `3 × 加权平均`（比值 3.000000），
+        #    而各周期分数已被 clip 在 ±3，于是 3 倍增益把分数顶到上下限：
+        #    实测 7175 轮里 **11.4%** 贴在 ±3。去掉这个增益后，贴限比例
+        #    降到 **0.0%**，且方向零翻转（不影响多空判断）。
+        #
+        #    为什么不当场改：`/(wsum/3)` 与 `weighted_mean` 只差一个正
+        #    常数，而下游 `SourceNormalizer` 做滚动 z-score，会把纯增益
+        #    约掉 —— 唯一真实差别来自**非线性的 clip**。也就是说改了会
+        #    改变活源的输入分布，进而改变融合分与所有历史阈值
+        #    (`open_threshold` 等) 的标定。这必须单独评估 + 回放，
+        #    不能混在"统一聚合口径"里悄悄改。mobius 因为权重恒为 0
+        #    （未验证源，见 data/source_ir.json）才敢直接改。
         parts, wsum = [], 0.0
         for tf, w in CL_TF_WEIGHTS.items():
             r = chanlun_results.get(tf)
@@ -341,20 +437,31 @@ class FusionEngine:
                            status="ok" if any_ok else "unavailable"))
 
         # 3) mobius SMC 多周期：1h/4h 主导（P1-1）
+        # ⚠️ 现价一律用 15m 收盘作代理（1m 权重 0，其 last_1m 实际未参与）。
+        #    实测 Mobius API 对**所有周期返回同一个现货价** `current_price`
+        #    （1h/4h 均为 4137.1805），而 OB/FVG/zone 的价位也来自同一个
+        #    API，所以用本地收盘价做代理是自洽的；15m 最多滞后 15 分钟，
+        #    相对 1h/4h 结构位（间距远大于此）影响可忽略。
         parts, statuses = [], []
         last_1m = float(frames["1m"]["close"].iloc[-1])
         last_15m = float(frames["15m"]["close"].iloc[-1])
+        mb_tf_scores: dict[str, float | None] = {}
         if isinstance(mobius_result, dict):
             for tf, w in MB_TF_WEIGHTS.items():
+                if w <= 0:
+                    continue
                 r = mobius_result.get(tf)
-                if w > 0 and r is not None and r.status != "unavailable":
-                    px = last_1m if tf == "1m" else last_15m
-                    parts.append(w * _mobius_score(r, px))
-                    statuses.append(r.status)
+                if r is None or r.status == "unavailable":
+                    mb_tf_scores[tf] = None      # 缺失（不是 0 分）
+                    continue
+                px = last_1m if tf == "1m" else last_15m
+                mb_tf_scores[tf] = _mobius_score(r, px)
+                statuses.append(r.status)
         elif mobius_result is not None and mobius_result.status != "unavailable":
-            parts.append(MB_TF_WEIGHTS["15m"] * _mobius_score(mobius_result, last_15m))
+            mb_tf_scores["15m"] = _mobius_score(mobius_result, last_15m)
             statuses.append(mobius_result.status)
-        mb_score = float(np.clip(sum(parts), -3.0, 3.0)) if parts else 0.0
+        # ⚠️ 与 chanlun 统一口径（覆盖率收缩加权平均），不再裸求和。
+        mb_score = aggregate_tf_scores(MB_TF_WEIGHTS, mb_tf_scores)
         mb_status = "ok" if "ok" in statuses else ("stale" if "stale" in statuses else "unavailable")
         sources.append(_mk("openmobius_smc", mb_score, 0.5, status=mb_status))
 
@@ -365,9 +472,20 @@ class FusionEngine:
         classic = 0.5 * _lead_score(ind_1m) + 0.5 * _lead_score(ind_15m)
         sources.append(_mk("classic_indicators", classic, 0.6))
 
-        # 5) 新闻面（同样受"未验证 → 0 权重"约束；其风控用途在 decision 层独立生效）
-        if news_score != 0.0:
-            sources.append(_mk("news", float(np.clip(news_score, -2, 2)), 0.8))
+        # 5) 新闻面 —— **故意不加入方向融合**。
+        #
+        # ⚠️ 历史教训：这里原有一个 `news_score` 参数，按 LLM 情绪拼出
+        #    ±1.5×impact 加入 sources。但 news 的 IR 权重恒为 0
+        #    （从未做过 IR 校准，受 `weights.py`「无实测 IR = 0 权重」硬规则
+        #    约束），`gaussian.fuse` 会把它标成 excluded 并排除出加权 ——
+        #    于是那次融合对结果**毫无影响**，只是每轮白跑一遍。
+        #    实测：news_score 0 → +1.5 → -1.5，融合分恒为 +1.438195。
+        #
+        # 现在 news 走「独立证据」通道，权力边界明确：
+        #   · `decision.machine.news_impact` ：影响度 >= news_impact_block → 不开新仓
+        #   · `risk.gate._news_impact`       ：影响度 >= news_impact_reduce → 手数降级
+        # 它因此**不再出现在 per_source**（不是加权源），这是正确的：
+        # 它从来没有投票权，写进逐源明细只会让人误以为它有。
 
         # 贝叶斯贡献
         contrib = {}

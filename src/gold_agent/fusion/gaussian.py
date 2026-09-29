@@ -137,7 +137,16 @@ def fuse(sources: list[SourceView], bayes_contrib: dict[str, float],
     out.sigma = float(min(3.0, 1.0 / np.sqrt(total_w)))
     out.bayes_log_odds = float(sum(bayes_contrib.values()))
     # 分歧检测
+    # ⚠️ 只统计**真正参与加权**的源（w>0）。零权重源（未验证，如
+    #    openmobius_smc）不贡献方向，却曾在这里触发 disagreement：
+    #    实测 7874 轮里 3235 轮是它单独把 disagreement 拉成 True，
+    #    其中 **767 轮（9.7%）没有任何加权源分歧** —— 纯粹由它造成。
+    #    disagreement 会让手数 ×0.5（risk/gate.py L103/L109），
+    #    等于让一个权重为 0 的源**实际影响了下单规模**，
+    #    这恰恰是"未验证源不得影响决策"要禁止的事。
     for s in usable:
+        if s.weight is None or float(s.weight) <= 0:
+            continue                      # 零权重源无方向发言权
         if abs(s.score - out.score) > 2.0 * max(out.sigma, 0.3):
             out.disagreement = True
             break

@@ -50,6 +50,34 @@ VERDICT_LABELS: dict[str, str] = {
     "neutral": "中性",
 }
 
+#: 信号源名 → 中文（`fusion/engine.py` 构造的 `SourceView.name`）
+#: 控制台逐源打印分数/权重时必须用它，否则又出现英文缩写（AGENTS.md §二）。
+SOURCE_LABELS: dict[str, str] = {
+    "kalman_persist": "卡尔曼趋势",
+    "chanlun": "缠论",
+    "openmobius_smc": "SMC结构",
+    "classic_indicators": "经典指标",
+    "news": "新闻面",
+}
+
+#: 行情 regime → 中文（`fusion/gaussian.py` 按 Hurst 判定）。
+#: 实测随行情变（trending/transition/mean_reverting 按天迁移），
+#: 且 mean_reverting 会改变下单方式（挂单 vs 市价），值得逐轮显示。
+REGIME_LABELS: dict[str, str] = {
+    "trending": "趋势",
+    "mean_reverting": "均值回归",
+    "transition": "过渡",
+    "unknown": "未知",
+}
+
+#: 新闻情绪 → 中文（LLM `news_assessment.sentiment`）。
+#: news 走「独立证据」通道：不投方向票，只作事件风险闸。
+SENTIMENT_LABELS: dict[str, str] = {
+    "bullish": "利多",
+    "bearish": "利空",
+    "neutral": "中性",
+}
+
 
 def kind_label(kind: str | None) -> str:
     """动作类型的中文名；未知类型原样返回（便于发现新增枚举未登记）。"""
@@ -77,3 +105,24 @@ def verdict_label(verdict: str | None) -> str:
     if not verdict:
         return "未评审"
     return VERDICT_LABELS.get(verdict, verdict)
+
+
+def source_label(source: str | None) -> str:
+    """信号源的中文名；未知源原样返回（便于发现新增源未登记）。"""
+    if not source:
+        return "未知源"
+    return SOURCE_LABELS.get(source, source)
+
+
+def regime_label(regime: str | None) -> str:
+    """行情 regime 的中文名；未知原样返回。"""
+    if not regime:
+        return "未知"
+    return REGIME_LABELS.get(regime, regime)
+
+
+def sentiment_label(sentiment: str | None) -> str:
+    """新闻情绪的中文名；空/未知返回"未评估"。"""
+    if not sentiment:
+        return "未评估"
+    return SENTIMENT_LABELS.get(sentiment, sentiment)

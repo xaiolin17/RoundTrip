@@ -99,6 +99,19 @@ def _structure_levels(ev, atr: float | None = None) -> tuple[list[float], list[f
     （同一区域常有几个位挤在 1 点内）。`_nearest_below` 取最近那个
     会命中 0.3 点外的 1m 噪音位 -> 做空被"紧贴支撑 0.34 点"误拦 13 次。
     这里把间距 < 0.25×ATR 的邻居合并（取均值），只留下**显著位**。
+
+    ⚠️ 来源标签（`_structure_levels_tagged`）
+    ----------------------------------------
+    `_cluster` 返回裸浮点，聚合后无法分辨某个位来自缠论中枢还是 SMC。
+    实测 127 笔真实单子里 `struct_*` 出现 35 次、`chanlun_*` 出现 **0 次**
+    —— 不是 `_pick_src` 匹配失败（它拿到的就是聚合后的列表，能匹配上），
+    而是来源信息在聚合前就丢了。
+
+    `_structure_levels_tagged` 保留标签（合并簇取并集），数值与
+    `_structure_levels` **完全一致**，只用于 `level_notes` 审计。
+    实测（5m 走查，仅缠论输入）：被选中的止损位 **13/13 (100%)**
+    来自缠论中枢、止盈位 12/13 (92%) 来自缠论中枢 —— 即缠论结构
+    其实一直在决定订单的止损止盈，只是日志报不出来。
     """
     sup: list[float] = []
     res: list[float] = []
@@ -149,25 +162,111 @@ def _structure_levels(ev, atr: float | None = None) -> tuple[list[float], list[f
     return sup, res
 
 
+def _structure_levels_tagged(
+        ev, atr: float | None = None) -> tuple[list[tuple[float, str]],
+                                              list[tuple[float, str]]]:
+    """同 `_structure_levels`，但每个位带**来源标签**（缠论 / SMC）。
+
+    返回值 `[(价格, 标签), ...]`，标签形如 `chanlun` / `smc` / `chanlun+smc`
+    （合并簇取并集）。用途：`level_notes` 审计 —— 回答"这一单的止损
+    到底是缠论中枢给的，还是 SMC 的 OB 给的"。
+
+    刻意与 `_structure_levels` **分开实现**而不是改它的返回类型：
+    后者是既有接口（`tests/test_structure_real.py`、
+    `tests/test_risk_real.py` 都直接断言 `struct_support` 等标签），
+    改签名会破坏契约。本函数只用于审计展示。
+    """
+    sup_t: list[tuple[float, str]] = []
+    res_t: list[tuple[float, str]] = []
+    for cr in (getattr(ev, "chanlun", None) or {}).values():
+        c = getattr(cr, "center", None)
+        if not c:
+            continue
+        for k, bucket in (("zg", res_t), ("gg", res_t),
+                          ("zd", sup_t), ("dd", sup_t)):
+            v = _num(c.get(k))
+            if v is not None:
+                bucket.append((v, "chanlun"))
+    mob = getattr(ev, "mobius", None)
+    items = (mob.items() if isinstance(mob, dict)
+             else ((("15m", mob),) if mob is not None else ()))
+    for _tf, mr in items:
+        if mr is None or getattr(mr, "status", "") == "unavailable":
+            continue
+        try:
+            for o in mr.active_order_blocks("swing"):
+                bot, top = _num(o.get("bottom")), _num(o.get("top"))
+                bias = str(o.get("bias") or "").lower()
+                if bias.startswith("bear") and top is not None:
+                    res_t.append((top, "smc"))
+                elif bias.startswith("bull") and bot is not None:
+                    sup_t.append((bot, "smc"))
+            for f in mr.active_fvgs():
+                bot, top = _num(f.get("bottom")), _num(f.get("top"))
+                bias = str(f.get("bias") or "").lower()
+                if bias.startswith("bear") and top is not None:
+                    res_t.append((top, "smc"))
+                elif bias.startswith("bull") and bot is not None:
+                    sup_t.append((bot, "smc"))
+            for e in getattr(mr, "equal_highs", []) or []:
+                v = _num(e.get("level"))
+                if v is not None:
+                    res_t.append((v, "smc"))
+            for e in getattr(mr, "equal_lows", []) or []:
+                v = _num(e.get("level"))
+                if v is not None:
+                    sup_t.append((v, "smc"))
+        except Exception:
+            continue
+    gap = (0.25 * atr) if atr else 1.0
+    if gap > 0:
+        sup_t = _cluster_tagged(sup_t, gap)
+        res_t = _cluster_tagged(res_t, gap)
+    return sup_t, res_t
+
+
 def _cluster(levels: list[float], gap: float) -> list[float]:
     """把相距 < gap 的位合并为均值簇，只返回**显著位**。
 
     196 个未聚合位 -> 合并后通常只剩几十个真正独立的位，
     `_nearest_below` 不会再命中 0.3 点外的 1m 噪音位。
     """
+    return [v for v, _ in _cluster_tagged([(x, "") for x in levels], gap)]
+
+
+def _cluster_tagged(levels: list[tuple[float, str]],
+                    gap: float) -> list[tuple[float, str]]:
+    """同 `_cluster`，但**保留来源标签**（证明某个位是谁给的）。
+
+    ⚠️ 为什么需要它：`_cluster` 返回裸浮点，聚合后无法分辨某个位来自
+    缠论中枢还是 SMC。实测 127 笔真实单子里 `struct_*` 出现 35 次、
+    `chanlun_*` 出现 0 次 —— 来源信息在聚合前就丢了，导致无法回答
+    "这一单的止损是缠论中枢定的吗"。
+
+    合并规则与 `_cluster` 完全一致（间距 < gap 归为一簇、取均值），
+    标签取簇内**所有来源的并集**（排序去重后以 `+` 连接），
+    这样合并后仍能看出"这个位是缠论和 SMC 共同给出的"。
+    """
     if not levels:
         return []
-    vals = sorted(set(round(x, 3) for x in levels))
-    out: list[float] = []
-    cur: list[float] = [vals[0]]
-    for v in vals[1:]:
-        if v - cur[-1] < gap:
-            cur.append(v)
+    vals = sorted(set((round(float(x), 3), str(t)) for x, t in levels))
+    out: list[tuple[float, str]] = []
+    cur: list[tuple[float, str]] = [vals[0]]
+    for v, t in vals[1:]:
+        if v - cur[-1][0] < gap:
+            cur.append((v, t))
         else:
-            out.append(round(sum(cur) / len(cur), 3))
-            cur = [v]
-    out.append(round(sum(cur) / len(cur), 3))
+            out.append(_merge_cluster(cur))
+            cur = [(v, t)]
+    out.append(_merge_cluster(cur))
     return out
+
+
+def _merge_cluster(cur: list[tuple[float, str]]) -> tuple[float, str]:
+    """把一簇 (值, 标签) 合成 (均值, 并集标签)。"""
+    mean = round(sum(v for v, _ in cur) / len(cur), 3)
+    tags = sorted({t for _, t in cur if t})
+    return mean, "+".join(tags)
 
 
 def _nearest_below(levels: list[float], price: float) -> float | None:
@@ -259,6 +358,16 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     if s_sup or s_res:
         out.notes.append(
             f"本地结构位并入: 支撑x{len(s_sup)} 压力x{len(s_res)}")
+        # 来源可审计（原先聚合后来源丢失，无法回答"止损是谁给的"）
+        try:
+            t_sup, t_res = _structure_levels_tagged(ev, atr)
+            n_ch = sum(1 for _, t in list(t_sup) + list(t_res) if "chanlun" in t)
+            n_sm = sum(1 for _, t in list(t_sup) + list(t_res) if "smc" in t)
+            if n_ch or n_sm:
+                out.notes.append(
+                    f"结构位来源: 缠论中枢x{n_ch} SMCx{n_sm}")
+        except Exception:
+            pass
 
     # ⚠️ 概念纠正（用户原话）：
     #     "我的意思是LLM没有相反的预测方向 并且当前距离我们盈利的压力位

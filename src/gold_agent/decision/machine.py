@@ -30,12 +30,13 @@ from enum import Enum
 
 from gold_agent.common.config import CFG
 from gold_agent.common.logging_util import decision_log
-from gold_agent.common.zh import direction_label, verdict_label
+from gold_agent.common.zh import direction_label, sentiment_label, verdict_label
 from gold_agent.fusion.engine import FusedEvidence
 from gold_agent.llm.orchestrator import Orchestrator
 from gold_agent.mt5.client import PositionsView
 from gold_agent.news.collector import NewsView
 from gold_agent.risk.gate import Proposal, RiskGate
+from gold_agent.risk.zhongshu import center_of, edge_side
 
 
 class State(str, Enum):
@@ -69,6 +70,30 @@ class DecisionContext:
 def effective_score(s: float, baseline: float) -> float:
     """P1-3：融合分零点校正。S_eff = S − S0。"""
     return float(s) - float(baseline)
+
+
+def news_impact(ctx: "DecisionContext") -> tuple[float, str]:
+    """提取 LLM 新闻评估的影响度与情绪（news 的**独立证据**通道）。
+
+    返回 `(impact, sentiment)`；无评估时 `(0.0, "")`。
+
+    ⚠️ 为什么 news 走这里而不是走融合权重：
+    `weights.py` 的硬规则是「没有实测 IR 数字的源 = 0 权重」，news 从未
+    做过 IR 校准，给方向权重就是用未验证信号做方向。但它现在**完全没用**：
+    实测 7874 轮 news 从未进入 `per_source`（权重 0 被 `gaussian.fuse`
+    排除），LLM 拿到情绪后触发的那次重融合实测融合分一字不变
+    （news_score 0 → +1.5 → -1.5，融合分恒为 +1.438195），是空操作。
+
+    所以：**news 不影响方向，只影响要不要开、开多大** —— 这是它作为
+    「未验证但有时效性的外部信息」应有的权力边界。
+    """
+    na = ((ctx.llm or {}).get("news_assessment") or {})
+    try:
+        impact = float(na.get("impact") or 0.0)
+    except (TypeError, ValueError):
+        impact = 0.0
+    impact = max(0.0, min(1.0, impact))
+    return impact, str(na.get("sentiment") or "")
 
 
 class DecisionEngine:
@@ -178,6 +203,15 @@ class DecisionEngine:
         if ctx.news.high_risk_window:
             return Proposal(kind="hold", reasons=["新闻高危窗口"])
 
+        # ---- news「独立证据」通道：重大事件 → 不开新仓 ----
+        # 不影响方向（news 无实测 IR，不得投票），只做事件风险闸。
+        imp, senti = news_impact(ctx)
+        if imp >= CFG.decision.news_impact_block:
+            return Proposal(kind="hold",
+                            reasons=[f"新闻事件影响度 {imp:.2f} >= "
+                                     f"{CFG.decision.news_impact_block}"
+                                     f"（{sentiment_label(senti)}）→ 等事件过去"])
+
         # ---- P1-2 波动 regime 闸（唯一不依赖方向预测的杠杆）----
         vol_pct = getattr(ctx.ev.result, "vol_percentile", 0.5)
         if vol_pct < CFG.decision.vol_pct_min:
@@ -219,6 +253,23 @@ class DecisionEngine:
         # -> 强信号被挂单阻塞 167 轮。
         if CFG.decision.pending_only_in_mean_revert and \
                 ctx.ev.result.regime != "mean_reverting":
+            # ---- 中枢位置闸（用户反馈"经常在中枢中部下单"）----
+            # 实测：123/127 笔真实单子走的就是这一行（entry=市价），
+            # 而入场价与中枢完全无关 -> 择时在统计上等价于随机时刻入场。
+            # 用户选定先加**硬闸**：中部不开仓，只允许贴边或突破。
+            # ⚠️ 取不到有效中枢时**放行**（保守）：宁可维持现状，
+            #    也不因为拿不到中枢数据而把系统变成不开仓。
+            if CFG.risk.zhongshu_gate:
+                cv = center_of(getattr(ctx.ev, "chanlun", None),
+                               ctx.last_close, ctx.atr,
+                               tfs=tuple(CFG.risk.zhongshu_tfs))
+                side = edge_side(cv, direction)
+                if side == "mid":
+                    return Proposal(kind="hold", reasons=reasons + [
+                        f"中枢中部禁止开仓：现价 {ctx.last_close:.2f} 位于 "
+                        f"{cv.tf} 中枢 [{cv.zd:.2f}, {cv.zg:.2f}] 的 "
+                        f"{cv.pos:.0%} 处（到最近边界仅 {cv.dist_edge:.2f} 点）"
+                        f"→ 等回到两端或突破"])
             return Proposal(kind="open_market", direction=direction,
                             entry=ctx.last_close,
                             reasons=reasons + ["非均值回归行情 -> 直接市价开仓"])

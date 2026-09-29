@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 from gold_agent.common.config import CFG
 from gold_agent.common.logging_util import decision_log, trade_log
+from gold_agent.common.zh import sentiment_label
 from gold_agent.fusion.engine import FusedEvidence
 from gold_agent.mt5.client import AccountInfo, PositionsView
 from gold_agent.risk.grid import GridGroup, GridLayer, GridState
@@ -32,6 +33,24 @@ class Approved:
     ok: bool
     reason: str = ""
     plan: dict | None = None       # {kind, direction, lots, entry, tp, sl, grid_plan}
+
+
+def _news_impact(llm_review: dict | None) -> tuple[float, str]:
+    """从 LLM 评审结果里取新闻影响度与情绪。
+
+    返回 `(impact, sentiment)`；缺失时 `(0.0, "")`。
+
+    ⚠️ news **不参与方向投票**（无实测 IR → 0 权重，见 `fusion/weights.py`
+    硬规则）。它只按 LLM 给出的事件影响度调整**仓位大小**：
+    影响度 >= `news_impact_reduce` → 手数降级；
+    >= `news_impact_block` → 已在 `decision.machine` 直接 hold（不开新仓）。
+    """
+    na = (llm_review or {}).get("news_assessment") or {}
+    try:
+        imp = float(na.get("impact") or 0.0)
+    except (TypeError, ValueError):
+        imp = 0.0
+    return max(0.0, min(1.0, imp)), str(na.get("sentiment") or "")
 
 
 class RiskGate:
@@ -107,6 +126,15 @@ class RiskGate:
             vol_k = volatility_k(realized_vol, None)
             if r.disagreement:
                 vol_k *= CFG.decision.disagreement_lot_mult
+            # ---- news「独立证据」通道：重大事件 → 手数降级 ----
+            # news 不影响方向（无实测 IR，不投票），只按 LLM 给出的
+            # 事件影响度收缩仓位。影响度更高的档位已在 decision 层直接 hold。
+            na_imp, na_senti = _news_impact(llm_review)
+            if na_imp >= CFG.decision.news_impact_reduce:
+                vol_k *= CFG.decision.news_impact_lot_mult
+                reasons.append(
+                    f"新闻事件影响度 {na_imp:.2f}（{sentiment_label(na_senti)}）"
+                    f" -> lots x{CFG.decision.news_impact_lot_mult}")
             win_rate = win_rate if win_rate is not None else 0.5   # 交割单胜率（样本≥10）；否则冷启动 0.5
             entry = prop.entry   # 市价由 executor 取当前 bid/ask
             # ---- 止损止盈看压力位/支撑位（LLM 判断 + 本地配套计算）----

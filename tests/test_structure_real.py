@@ -508,6 +508,73 @@ def test_structure_levels_survives_bad_mobius():
     assert sup == [] and res == []
 
 
+def test_tagged_levels_preserve_provenance():
+    """来源可审计：聚合后必须能分辨某个位是缠论中枢还是 SMC 给的。
+
+    背景：实测 127 笔真实单子里 `struct_*` 出现 35 次、`chanlun_*` 出现
+    **0 次**。根因不是 `_pick_src` 匹配失败（它拿到的正是聚合后的列表，
+    能匹配上），而是 `_structure_levels` 返回**裸浮点**，
+    `_cluster` 合并后来源信息就没了 —— 无法回答"这一单的止损是谁给的"。
+    `_structure_levels_tagged` 保留标签，且**数值与旧实现完全一致**
+    （订单参数路径不受影响）。
+    """
+    from gold_agent.risk.levels import (_structure_levels,
+                                        _structure_levels_tagged)
+    cl = {"5m": _CL(center={"zg": 4140.02, "zd": 4120.0,
+                            "gg": 4145.0, "dd": 4115.0})}
+    mob = {
+        "5m": type("M", (), {
+            "status": "ok",
+            "active_order_blocks": lambda s, k: [
+                {"bottom": 4110.0, "top": 4112.0, "bias": "bull"}],
+            "active_fvgs": lambda s: [],
+            "equal_highs": [{"level": 4160.0}],
+            "equal_lows": [{"level": 4105.0}],
+        })(),
+    }
+    ev = type("E", (), {"chanlun": cl, "mobius": mob})()
+    sup, res = _structure_levels(ev, atr=10.0)
+    t_sup, t_res = _structure_levels_tagged(ev, atr=10.0)
+
+    # 1) 数值必须完全一致（不能改变下单用的点位）
+    assert sorted(v for v, _ in t_sup) == sorted(sup), (t_sup, sup)
+    assert sorted(v for v, _ in t_res) == sorted(res), (t_res, res)
+    # 2) 缠论与 SMC 都必须被标出来
+    tags = {t for _, t in list(t_sup) + list(t_res)}
+    assert any("chanlun" in t for t in tags), f"缺缠论标签: {tags}"
+    assert any("smc" in t for t in tags), f"缺 SMC 标签: {tags}"
+    # 3) 缠论中枢 zd/dd 必须落在支撑侧、zg/gg 落在压力侧
+    ch_sup = [v for v, t in t_sup if "chanlun" in t]
+    ch_res = [v for v, t in t_res if "chanlun" in t]
+    assert 4120.0 in ch_sup and 4115.0 in ch_sup, ch_sup
+    assert 4140.02 in ch_res or 4145.0 in ch_res, ch_res
+
+
+def test_tagged_levels_mark_merged_clusters():
+    """缠论位与 SMC 位靠近被合并时，标签取并集（仍能看出两者都给了）。"""
+    from gold_agent.risk.levels import _cluster_tagged
+    # 4140.02(缠论) 与 4141.5(SMC) 相差 1.48 < gap 2.5 -> 合并
+    out = _cluster_tagged([(4140.02, "chanlun"), (4141.5, "smc")], gap=2.5)
+    assert len(out) == 1, out
+    val, tag = out[0]
+    assert "chanlun" in tag and "smc" in tag, tag
+    assert abs(val - 4140.76) < 0.01, val
+
+
+def test_tagged_levels_notes_are_gbk_safe():
+    """来源审计写入 level_notes 时必须 GBK 可编码且不含 '?'。"""
+    from gold_agent.risk.levels import trade_levels
+    cl = {"5m": _CL(center={"zg": 4310.0, "zd": 4280.0,
+                            "gg": 4320.0, "dd": 4270.0})}
+    ev = type("E", (), {"chanlun": cl, "mobius": None})()
+    lv = trade_levels("LONG", 4300.0, {"support_levels": [4290.0]}, ev, atr=10.0)
+    note = [n for n in lv.notes if "结构位来源" in n]
+    assert note, lv.notes
+    note[0].encode("gbk")          # 必须可编码
+    assert "?" not in note[0]
+    assert "缠论中枢" in note[0]
+
+
 def test_config_flags():
     """关键配置必须生效。"""
     # 用户澄清：点位的来源不必是 LLM。LLM 管方向否决，

@@ -20,7 +20,8 @@ import pandas as pd
 import pytest
 
 from gold_agent.common.config import CFG
-from gold_agent.fusion.engine import FusionEngine
+from gold_agent.fusion.engine import FusionEngine, MB_TF_WEIGHTS
+from gold_agent.fusion.gaussian import SourceView, fuse
 from gold_agent.fusion.normalize import SourceNormalizer
 from gold_agent.fusion.weights import SourceIR, WeightTable
 from gold_agent.skills.chanlun_adapter import analyze_tf
@@ -411,6 +412,220 @@ def test_fuse_all_returns_neutral_when_no_verified_source(hist_15m):
     # 被排除的源必须在 per_source 里标注原因（可审计）
     excluded = [s for s in ev.result.per_source if s.get("excluded") == "zero_weight"]
     assert excluded, "零权重源必须被显式标注为 excluded"
+
+
+def test_aggregate_tf_scores_is_coverage_shrunk_mean():
+    """统一聚合口径：覆盖率收缩加权平均（缺周期 -> 向 0 收缩）。
+
+    取代原先两套不一致的公式：
+      chanlun `clip(Σwᵢsᵢ/(wsum/3), ±3)`   —— 代数上 = 3 × 加权平均
+      mobius  `clip(Σwᵢsᵢ,          ±3)`   —— 裸求和，缺周期就静默变小
+    """
+    from gold_agent.fusion.engine import aggregate_tf_scores
+
+    W = {"1h": 1.00, "4h": 0.50, "15m": 0.40, "5m": 0.20, "1m": 0.00}
+    # 1) 全齐 -> 加权平均（除以**声明**权重和 2.1，不是实际到齐的）
+    got = aggregate_tf_scores(W, {"1h": -1.7, "4h": -1.0, "15m": -1.2,
+                                  "5m": -0.6})
+    exp = (1.0 * -1.7 + 0.5 * -1.0 + 0.4 * -1.2 + 0.2 * -0.6) / 2.1
+    assert abs(got - exp) < 1e-12, (got, exp)
+
+    # 2) 缺周期 -> 保守收缩（分子少了，分母不变）
+    only1h = aggregate_tf_scores(W, {"1h": -1.7})
+    assert abs(only1h - (-1.7 / 2.1)) < 1e-12, only1h
+    assert abs(only1h) < abs(got), "缺数据必须收缩，不能放大"
+    # 缺失 ≠ 0 分：显式 None 与"没这个键"等价；但真给 0 分不改变分子
+    assert aggregate_tf_scores(W, {"1h": None}) == aggregate_tf_scores(W, {})
+    # 缺 15m 时，分子少一项 -> 与"15m 给 0 分"不同（0 分是真实观点）
+    a = aggregate_tf_scores(W, {"1h": -1.7, "15m": None})
+    b = aggregate_tf_scores(W, {"1h": -1.7, "15m": 0.0})
+    assert abs(a - b) < 1e-12, "0 分与缺失在分子上都是 0，这里应相同"
+
+    # 3) 零权重周期不参与（1m 权重 0）
+    assert aggregate_tf_scores(W, {"1m": 3.0}) == 0.0
+    # 4) 空输入不炸
+    assert aggregate_tf_scores(W, {}) == 0.0
+    assert aggregate_tf_scores({}, {"1h": 3.0}) == 0.0
+
+
+def test_aggregate_tf_scores_does_not_saturate():
+    """不得像旧口径那样把分数顶死在 ±3（旧实测 53.1% 贴限）。
+
+    旧 mobius 裸求和：min −4.770 / max +4.500，实测 53.1% 触限；
+    新口径是加权平均，|结果| <= max|sᵢ|，因此**永不饱和**。
+    """
+    from gold_agent.fusion.engine import aggregate_tf_scores
+
+    W = {"1h": 1.00, "4h": 0.50, "15m": 0.40, "5m": 0.20, "1m": 0.00}
+    # 全部顶到上限：加权平均仍是 +3（不超），而不是被 clip 成 +3 的 4.5
+    allmax = aggregate_tf_scores(W, {k: 3.0 for k in W if W[k] > 0})
+    assert abs(allmax - 3.0) < 1e-12, allmax
+    # 部分为正部分为负 -> 落在中间，不像裸求和那样轻易越过 ±3
+    mixed = aggregate_tf_scores(W, {"1h": 3.0, "4h": -3.0, "15m": -3.0,
+                                    "5m": -3.0})
+    assert -3.0 <= mixed <= 3.0
+    assert mixed != 3.0 and mixed != -3.0, "不应贴限"
+
+
+def test_mobius_aggregate_no_longer_shrinks_when_tf_missing():
+    """回归：4h 历史上 100% 缺失时，旧裸求和把分数静默压小。
+
+    旧：`Σ wᵢsᵢ` 少了 4h 的 0.5×s₄ₕ -> 分数凭空变小（不是方向变弱，
+        纯粹缺数据）。新口径分母固定为声明权重和 2.1，缺失只让分子
+        少一项，等价于"证据不足 -> 收缩"，且**不重分配**权重。
+    """
+    from gold_agent.fusion.engine import (MB_TF_WEIGHTS,
+                                          aggregate_tf_scores)
+
+    sub = {"1h": -2.0, "15m": -1.0, "5m": -0.5}      # 4h 缺失
+    new = aggregate_tf_scores(MB_TF_WEIGHTS, sub)
+    assert abs(new - (-2.0 - 0.4 - 0.1) / 2.1) < 1e-12, new
+    # 旧口径（裸求和）会给出 -2.5，量纲完全不同
+    old = sum(MB_TF_WEIGHTS[t] * v for t, v in sub.items())
+    assert abs(old - (-2.5)) < 1e-12
+    # 新口径与"分数尺度"一致：结果在 [min(s), max(s)] 之间
+    assert -2.0 <= new <= -0.5, new
+    assert not (-2.0 <= old <= -0.5), "旧口径超出输入尺度 -> 量纲错误"
+
+
+def test_mobius_weight_zero_means_value_change_is_decision_neutral():
+    """安全前提：mobius 权重恒为 0，所以改它的分数不影响融合结果。
+
+    这是**先改 mobius、暂不改 chanlun** 的唯一理由：mobius 未被验证
+    （`data/source_ir.json`：verified=false、tier=rejected），权重 0，
+    它的分数只被记录、不参与加权和。chanlun 权重 4.0 是活源，改它的
+    聚合口径会移动融合分分布与历史阈值标定，必须单独评估。
+    """
+    from gold_agent.fusion.engine import MB_TF_WEIGHTS
+
+    assert MB_TF_WEIGHTS["1m"] == 0.0
+    # 记录在案：mobius 的 IR 未验证 -> 权重必须为 0，直到有真实历史校准
+    import json
+    import pathlib
+    p = pathlib.Path(__file__).resolve().parents[1] / "data" / "source_ir.json"
+    if p.exists():
+        d = json.loads(p.read_text(encoding="utf-8"))
+        m = (d.get("sources") or {}).get("openmobius_smc")
+        if m is not None:
+            assert m.get("verified") is False, (
+                "若 mobius 已被验证并取得非零权重，则本测试的前提失效，"
+                "改变其聚合口径前必须做 A/B 回放")
+
+
+def test_all_weighted_mobius_timeframes_are_supported():
+    """权重表里非零权重的周期，必须都是 Mobius 能抓的周期。
+
+    事故背景：`MB_TF_WEIGHTS` 声明 `4h: 0.50`（占全部权重预算 2.1 的
+    23.8%），但 `graph.py` 的抓取列表是手写的 4 个周期、**漏了 4h**。
+    实测 7716 条 `mobius_score` 日志里 `4h` 键**从未出现**——声明的权重
+    永远拿不到数据，等于把注释里"1h/4h 主导方向"悄悄降级成"1h 主导"。
+
+    现改为从 `MB_TF_WEIGHTS` 派生抓取列表。本测试锁住两层一致性：
+      1. 派生出的周期都在 `SUPPORTED_INTERVALS` 内（否则 API 直接拒）
+      2. 抓取列表恰好等于非零权重集合（新增权重会自动被抓）
+    """
+    from gold_agent.skills.mobius_adapter import MobiusClient
+
+    wanted = tuple(tf for tf, w in MB_TF_WEIGHTS.items() if w > 0)
+    assert wanted, "权重表不得全为 0"
+    # 1) 每个要抓的周期，适配器都必须支持（否则静默 unavailable）
+    unsupported = [tf for tf in wanted if tf not in MobiusClient.SUPPORTED_INTERVALS]
+    assert not unsupported, (
+        f"权重表声明要抓 {unsupported}，但 Mobius 不支持"
+        f"（支持 {MobiusClient.SUPPORTED_INTERVALS}）-> 该权重是死的")
+    # 2) 4h 必须在内（这是本次修的具体缺口）
+    assert "4h" in wanted, "4h 权重非零，必须被抓取"
+    # 3) 1m 权重为 0 -> 不必抓（但抓到也无害，仅浪费配额）
+    assert MB_TF_WEIGHTS["1m"] == 0.0
+    print(f"非零权重周期: {wanted}")
+
+
+def test_mobius_4h_contributes_to_aggregate():
+    """4h 一旦有数据，必须按权重 0.50 真正进入聚合分。
+
+    防止"抓了但没算"——只在抓取侧修、聚合侧不认，等于没修。
+    """
+    from gold_agent.fusion.engine import _mobius_score
+    from gold_agent.skills.mobius_adapter import MobiusResult
+
+    res = MobiusResult(computed_at=0.0, status="ok")
+    res.structures = [{"kind": "BOS", "bias": "bear", "confirmed": True,
+                       "price": 4100.0, "time": "2026-09-28T00:00:00Z"}]
+    sc = _mobius_score(res, 4138.0)
+    # 单条 BOS/bear -> 分量为负（-1.5 × recency 1.0）
+    assert sc < 0, f"bear BOS 应为负分，实际 {sc}"
+    w = MB_TF_WEIGHTS["4h"]
+    assert w == 0.50
+    assert w * sc == 0.50 * sc, "4h 必须按权重 0.50 计入"
+
+
+def test_zero_weight_source_cannot_trigger_disagreement():
+    """零权重源不得触发「源间分歧」（用户反馈的假分歧 bug）。
+
+    实测（logs/decision_*.jsonl 7888 轮）：`openmobius_smc` 权重恒为 0，
+    却在 3235 轮把 `disagreement` 拉成 True；其中 **766 轮（9.7%）没有任何
+    加权源分歧** —— 纯粹由它造成。
+
+    为什么必须修：`disagreement` 会让手数 ×0.5（`risk/gate.py`
+    L103/L109/L219），等于让一个**没有投票权的源实际影响了下单规模**，
+    正是"未验证源不得影响决策"要禁止的事。
+    """
+    tbl = WeightTable(trials=1)
+    tbl.sources["w_src"] = SourceIR("w_src", ir=0.3, nw_t=3.0, n_obs=1000,
+                                    verified=True)
+    tbl.sources["zero_src"] = SourceIR("zero_src", ir=0.0, verified=False)
+    tbl._refresh_ir_max()
+    closes = np.linspace(4000.0, 4010.0, 600)
+
+    srcs = [SourceView("w_src", 1.5, 1.0, weight=tbl.weight("w_src")),
+            SourceView("zero_src", -3.0, 0.5, weight=tbl.weight("zero_src"))]
+    res = fuse(srcs, {}, closes)
+    assert tbl.weight("zero_src") == 0.0
+    assert res.disagreement is False, (
+        "权重为 0 的源不得触发分歧（它没有投票权）")
+    # 但必须仍然被记录在案（可审计），只是标了 excluded
+    names = {p["name"]: p for p in res.per_source}
+    assert names["zero_src"].get("excluded") == "zero_weight"
+    assert names["zero_src"]["w"] == 0.0
+
+    # 真正的加权源分歧仍须触发（不能把功能改死）
+    srcs2 = [SourceView("w_src", 2.9, 1.0, weight=tbl.weight("w_src")),
+             SourceView("w_src2", -2.9, 1.0, weight=tbl.weight("w_src"))]
+    res2 = fuse(srcs2, {}, closes)
+    assert res2.disagreement is True, "加权源真反向必须仍触发分歧"
+
+
+def test_news_score_no_longer_changes_fusion():
+    """news 不得影响融合分（它无实测 IR -> 0 权重）。
+
+    历史实现把 LLM 情绪拼成 ±1.5×impact 传进 `fuse_all(news_score=...)`，
+    但 news 权重恒为 0 -> `gaussian.fuse` 把它排除 -> **对结果零影响**，
+    那次重融合是空操作（实测 news_score 0→+1.5→-1.5 融合分恒为 +1.438195）。
+
+    本测试锁住语义：`news_score` 参数不再改变任何输出，防止有人日后
+    误以为 news 在投票。news 的现有权力在 decision 层（事件闸）
+    与 risk 层（手数降级）。
+    """
+    tbl = WeightTable(trials=1)
+    tbl.sources["w_src"] = SourceIR("w_src", ir=0.3, nw_t=3.0, n_obs=1000,
+                                    verified=True)
+    tbl.sources["news"] = SourceIR("news", ir=0.0, verified=False)
+    tbl._refresh_ir_max()
+    closes = np.linspace(4000.0, 4010.0, 600)
+
+    def _run(news_score):
+        srcs = [SourceView("w_src", 1.5, 1.0, weight=tbl.weight("w_src"))]
+        if news_score != 0.0:
+            srcs.append(SourceView("news", news_score, 0.8,
+                                   weight=tbl.weight("news")))
+        return fuse(srcs, {}, closes)
+
+    base = _run(0.0)
+    for ns in (1.5, -1.5):
+        got = _run(ns)
+        assert got.score == base.score, (
+            f"news_score={ns} 不得改变融合分（news 无投票权）")
+        assert got.effective_weight == base.effective_weight
 
 
 # ══════════════════════════════════════════════════════════════════

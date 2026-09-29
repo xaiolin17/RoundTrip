@@ -19,7 +19,8 @@ from gold_agent.common.config import CFG
 from gold_agent.common.logging_util import (decision_log, log_error, log_info,
                                             log_warn, trade_log)
 from gold_agent.decision.machine import DecisionContext, DecisionEngine, Proposal
-from gold_agent.fusion.engine import FusionEngine, _mobius_score
+from gold_agent.fusion.engine import (MB_TF_WEIGHTS, FusionEngine,
+                                      _mobius_score)
 from gold_agent.fusion.weights import DECISION_SOURCES
 from gold_agent.llm.orchestrator import Orchestrator
 from gold_agent.mt5.client import MT5Client, Mt5Error
@@ -190,13 +191,18 @@ class Graph:
             # t2 analyze (chanlun 本地 + mobius) 并发
             # P1-1：决策周期迁移到 1h 后，方向判据以 1h/4h 为主，
             #       1m 降为执行择时（不参与方向，权重 0）。
+            #
+            # ⚠️ mobius 抓取的周期**从 MB_TF_WEIGHTS 派生**，不再手写字典。
+            #    事故：原先手写 4 个周期，漏了 4h，而 MB_TF_WEIGHTS 里
+            #    `4h: 0.50` 占 23.8% 权重预算 —— 声明了却永远拿不到数据，
+            #    醒来就是把「1h/4h 主导方向」悄悄降级成「1h 主导」。
+            #    派生后权重表与抓取列表不可能再漂移。
+            mob_tfs = tuple(tf for tf, w in MB_TF_WEIGHTS.items() if w > 0)
             cl_tasks = {tf: asyncio.to_thread(analyze_tf, st["bundle"].frames[tf], tf)
                         for tf in ("1m", "5m", "15m", "1h", "4h")}
             mob_tasks = {
-                "1m": asyncio.create_task(self.mobius.get_smc("XAUUSD", "1m", limit=200)),
-                "5m": asyncio.create_task(self.mobius.get_smc("XAUUSD", "5m", limit=200)),
-                "15m": asyncio.create_task(self.mobius.get_smc("XAUUSD", "15m", limit=200)),
-                "1h": asyncio.create_task(self.mobius.get_smc("XAUUSD", "1h", limit=200)),
+                tf: asyncio.create_task(self.mobius.get_smc("XAUUSD", tf, limit=200))
+                for tf in mob_tfs
             }
             news_task = asyncio.create_task(self.news.fetch())
             cl_vals = await asyncio.gather(*cl_tasks.values())
@@ -238,7 +244,18 @@ class Graph:
                                  "audit_mode": r.audit.output_mode,
                                  "failed_gates": r.audit.failed,
                                  "confirmed": len(r.confirmed_signals),
-                                 "observed": len(r.observed_signals)}
+                                 "observed": len(r.observed_signals),
+                                 # ⚠️ 中枢边界必须落盘（原先这里被白名单丢掉）。
+                                 #    用户反馈"单子经常挂在中枢中部"，但实测
+                                 #    全量日志里 zg/zd 命中 0 次 —— 中枢**算了
+                                 #    却没写**，导致事后无法回算是谁的问题。
+                                 #    只写边界值，不写整条中枢列表（控制日志体积）。
+                                 "center": (None if not r.center else {
+                                     "zg": r.center.get("zg"),
+                                     "zd": r.center.get("zd"),
+                                     "gg": r.center.get("gg"),
+                                     "dd": r.center.get("dd"),
+                                     "id": r.center.get("id")})}
                             for tf, r in st["chanlun"].items()},
                 "mobius_score": {tf: (None if r is None else _mobius_score(r, mob_last))
                                  for tf, r in st["mobius"].items()},
@@ -289,17 +306,16 @@ class Graph:
                                                            summary["last_close"])
                 ctx.llm = st["llm"]
                 ctx.llm_available = bool((st["llm"] or {}).get("review"))
-                # LLM 评审结果重新融合（news_score 粗粒度：sentiment→分数）
-                na = (st["llm"] or {}).get("news_assessment") or {}
-                ns = {"bullish": 1.5, "bearish": -1.5, "neutral": 0.0}.get(na.get("sentiment"), 0.0)
-                if ns:
-                    ns *= float(na.get("impact", 0.5))
-                    st["fused"] = self.fusion.fuse_all(st["bundle"].frames, st["chanlun"],
-                                                       st["mobius"], news_score=ns,
-                                                       obs_id=round_id)
-                    ctx.ev = st["fused"]
-                    ev = st["fused"]
-                # LLM 评审结果落日志（skill 合规审计）
+                # ⚠️ 这里**曾经**把 LLM 的新闻情绪当成方向分再融合一次：
+                #     na = ...; ns = {"bullish": 1.5, "bearish": -1.5}.get(...)
+                #     if ns: st["fused"] = fuse_all(..., news_score=ns)
+                # 实测（7874 轮 + 定向实验）这是**纯空操作**：
+                #     news 的 IR 权重 = 0 -> gaussian.fuse 把它标 excluded
+                #     并排除出加权，融合分一字不变。
+                #     实验：news_score 0 → +1.5 → -1.5，融合分恒为 +1.438195。
+                # 代价却是每轮多跑一次完整 fuse_all（含 Kalman/Hurst 重算）。
+                # 现在 news 改走「独立证据」通道（decision 层事件闸 +
+                # risk 层手数降级），不再假装它能影响方向，故删除该重融合。
                 self._log_llm_review(round_id, st["llm"], ctx.llm_available)
 
             # t6 decide
@@ -309,6 +325,17 @@ class Graph:
                                    "reasons": prop.reasons}
             summary["score"] = ev.result.score
             summary["sigma"] = ev.result.sigma
+            # 控制台要打**实测真的会动**的量，而不是恒定的标准差：
+            #   · vol_percentile：波动率滚动分位（959 个取值，sd=0.31）
+            #   · regime        ：Hurst 判定的行情（3 态，按天迁移）
+            #   · disagreement  ：源间方向分歧（会触发手数 ×0.5）
+            #   · per_source    ：逐源分数/权重（"这轮预测有多可信"的真实来源）
+            # ⚠️ effective_weight / n_sources 实测是常数（4.1735 / 恒 3），
+            #    刻意不打 —— 见 runner._format_summary 的说明。
+            summary["vol_percentile"] = ev.result.vol_percentile
+            summary["regime"] = ev.result.regime
+            summary["disagreement"] = ev.result.disagreement
+            summary["per_source"] = ev.result.per_source
             # ⚠️ action 必须**在这里**就设好。
             #    原实现只在 hold / skip_round / safe_hold 三个分支里赋值，
             #    于是 place_grid / open_market / cancel_pending 这些

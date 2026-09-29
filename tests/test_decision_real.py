@@ -42,6 +42,86 @@ def _ctx(score: float, sigma: float = 0.3, holding: list[PositionRow] | None = N
                                           if llm_available is None else llm_available))
 
 
+def _center_ctx(px: float, score: float, zg: float = 4140.0,
+                zd: float = 4120.0, atr: float = 10.0,
+                status: str = "ok") -> DecisionContext:
+    """带 5m 中枢的上下文（用于中枢位置闸测试）。"""
+    ev = FusedEvidence(result=FusionResult(score=score, sigma=0.3,
+                                           regime="trending",
+                                           vol_percentile=0.9))
+
+    class _R:
+        pass
+    r = _R()
+    r.status = status
+    r.center = {"zg": zg, "zd": zd, "gg": zg + 8, "dd": zd - 9,
+                "id": "center:5m:test"}
+    ev.chanlun = {"5m": r}
+    return DecisionContext(ev=ev, positions=PositionsView(positions=[]),
+                           news=NewsView(high_risk_window=False),
+                           llm={"review": {"verdict": "neutral",
+                                           "confidence": 0.2}},
+                           last_close=px, atr=atr, realized_vol=0.008,
+                           round_id=1, llm_available=True)
+
+
+def test_mid_center_blocks_new_position():
+    """中枢中部禁止开仓（用户反馈"经常在中枢中部下单"）。
+
+    实测 123/127 笔真实单子走 `open_market`（entry=市价），全链路不读中枢，
+    配对零假设检验显示择时与"随机时刻入场"无法区分（56.6% vs 57.1%）。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    # 中枢 [4120,4140] 的正中 4130 -> pos=0.50 -> 必须拦
+    p = e.decide(_center_ctx(4130.0, ABOVE))
+    assert p.kind == "hold", f"中枢中部应被拦，实际 {p.kind}"
+    assert any("中枢中部" in r for r in p.reasons), p.reasons
+
+
+def test_center_edges_and_breakouts_are_allowed():
+    """贴边（两端）与突破（已离开中枢）都必须放行 —— 这正是用户要的两种单子。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    for px, label in ((4120.0, "贴下沿 zd"), (4124.0, "近 zd 端"),
+                      (4136.0, "近 zg 端"), (4140.0, "贴上沿 zg"),
+                      (4110.0, "跌破 zd（向下突破）"),
+                      (4150.0, "突破 zg（向上突破）")):
+        p = e.decide(_center_ctx(px, ABOVE))
+        assert p.kind != "hold", f"{label}（{px}）应放行，实际 {p.kind}：{p.reasons}"
+
+
+def test_center_gate_is_conservative_when_data_missing():
+    """拿不到有效中枢时必须放行。
+
+    宁可维持现状，也不因为缺中枢数据把系统变成永不开仓。
+    退化中枢（zg==zd，实测 1m 占 18%）同样视为拿不到。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    # 1) 完全没缠论数据
+    p1 = e.decide(_ctx(score=ABOVE))
+    assert p1.kind != "hold", f"无中枢数据应放行，实际 {p1.kind}"
+    # 2) 退化中枢
+    p2 = e.decide(_center_ctx(4130.0, ABOVE, zg=100.0, zd=100.0))
+    assert p2.kind != "hold", f"退化中枢应放行，实际 {p2.kind}"
+    # 3) 中枢宽度小于 min_width_atr × ATR -> 视为噪音
+    p3 = e.decide(_center_ctx(4130.0, ABOVE, zg=4130.05, zd=4130.0, atr=100.0))
+    assert p3.kind != "hold", f"过窄中枢应放行，实际 {p3.kind}"
+    # 4) status != ok
+    p4 = e.decide(_center_ctx(4130.0, ABOVE, status="unavailable"))
+    assert p4.kind != "hold", f"非 ok 状态应放行，实际 {p4.kind}"
+
+
+def test_center_gate_off_restores_old_behaviour():
+    """闸可关闭（可回滚）：关掉后中部恢复开仓。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    old = CFG.risk.zhongshu_gate
+    try:
+        CFG.risk.zhongshu_gate = False
+        p = e.decide(_center_ctx(4130.0, ABOVE))
+        assert p.kind != "hold", f"闸关闭后中部应放行，实际 {p.kind}"
+    finally:
+        CFG.risk.zhongshu_gate = old
+
+
 def test_flat_hold_low_score():
     e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
     p = e.decide(_ctx(score=BELOW))
@@ -55,6 +135,63 @@ def test_flat_hold_high_sigma():
     p = e.decide(_ctx(score=ABOVE, sigma=1.5))
     assert p.kind == "hold"
     assert any("标准差" in r for r in p.reasons)
+
+
+def test_hold_round_shows_reason_on_console():
+    """观望轮次必须在控制台显示原因。
+
+    ⚠️ 为什么这是必须的：news 事件闸只在 hold 时生效
+    （`新闻事件影响度 … → 等事件过去`）。若观望轮只打 `-> 观望`，
+    用户永远看不出 news 有没有起作用 —— 这正是"news 一次都没出现过"
+    这条反馈的根源之一。
+    """
+    import gold_agent.runner as runner
+
+    out = runner._format_summary(8938, {
+        "score": 1.77, "action": "hold", "regime": "transition",
+        "vol_percentile": 0.956,
+        "proposal": {"kind": "hold", "direction": None,
+                     "reasons": ["新闻事件影响度 0.95 >= 0.7（利空）→ 等事件过去"]}})
+    assert "观望" in out, out
+    assert "新闻事件影响度" in out, f"观望原因未显示: {out!r}"
+    bad = [ch for ch in out if not _gbk_ok(ch)]
+    assert not bad, f"含 GBK 外字符 {bad!r}: {out!r}"
+    # 不得因此引入 '?'
+    assert "?" not in out, out
+
+
+def test_news_event_blocks_new_position():
+    """news「独立证据」通道：重大事件 → 不开新仓。
+
+    用户选定的定位：news 无实测 IR（不得投方向票），但它是有时效性的
+    外部风险信息，应当影响"要不要开"。影响度 >= news_impact_block 时 hold。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    llm = {"review": {"verdict": "neutral", "confidence": 0.2},
+           "news_assessment": {"sentiment": "bearish", "impact": 0.95}}
+    p = e.decide(_ctx(score=ABOVE, llm=llm))
+    assert p.kind == "hold", f"重大事件应拦住开仓，实际 {p.kind}"
+    assert any("新闻事件影响度" in r for r in p.reasons), p.reasons
+    # 理由必须是中文情绪，不得漏出英文枚举
+    assert any("利空" in r for r in p.reasons), p.reasons
+
+
+def test_news_low_impact_does_not_block():
+    """影响度低于阈值时不得拦截（否则等于永久禁开仓）。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    llm = {"review": {"verdict": "neutral", "confidence": 0.2},
+           "news_assessment": {"sentiment": "bearish", "impact": 0.35}}
+    p = e.decide(_ctx(score=ABOVE, llm=llm))
+    assert p.kind != "hold", f"低影响度不应拦截，实际 {p.kind}"
+
+
+def test_news_missing_assessment_is_harmless():
+    """LLM 没返回 news_assessment 时不得崩、也不得拦截。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    p = e.decide(_ctx(score=ABOVE, llm={"review": {"verdict": "neutral",
+                                                  "confidence": 0.2}}))
+    assert p.kind != "hold"
+    assert not any("新闻事件影响度" in r for r in p.reasons)
 
 
 def test_flat_hold_news_high_risk():
@@ -643,3 +780,107 @@ def test_runner_console_format_is_gbk_safe():
         assert not bad, (
             f"_format_summary 产出了 GBK 无法编码的字符 {bad!r} "
             f"-> 会在 GBK 控制台上崩溃: {out!r}")
+
+
+def test_summary_shows_varying_quantities_not_sigma():
+    """用户反馈「标准差就没变动过」-> 摘要改打**真的会动**的量。
+
+    根因（实测 logs/decision_*.jsonl 共 7834 轮）：sigma 只有 3 个取值
+    （0.489×6952 / 0.297×879 / 3.0×2），最近 9 天 512 轮**恒为 0.489**。
+    因为它 = `1/sqrt(Σw)`，而 Σw 只由静态 IR 权重表决定，与行情无关。
+
+    改为实测会动的三个量：波动分位 + 行情 regime + 源间分歧。
+    """
+    import gold_agent.runner as runner
+
+    out = runner._format_summary(8465, {
+        "score": 1.29, "sigma": 0.489, "action": "open_market",
+        "vol_percentile": 0.956, "regime": "trending", "disagreement": True,
+        "proposal": {"kind": "open_market", "direction": "LONG"},
+        "execution": {"ok": True}})
+    assert "标准差" not in out, f"不应再打印恒定的标准差: {out!r}"
+    assert "波动分位=96%" in out, f"缺波动分位: {out!r}"
+    assert "行情=趋势" in out, f"缺行情判定: {out!r}"
+    assert "源间分歧" in out, f"缺源间分歧: {out!r}"
+    assert "trending" not in out, f"行情未中文化: {out!r}"
+
+
+def test_frozen_metrics_are_not_printed():
+    """实测**恒定**的量不得再进摘要（否则重蹈"标准差"的覆辙）。
+
+    · effective_weight：连续 9 天恒为 4.1735（与 sigma 同源于 Σw）
+    · n_sources       ：恒为 3（只有 3 个源有非零 IR 权重）
+    用户原话是「换成会动的量」，打常数就违背了这个要求本身。
+    """
+    import gold_agent.runner as runner
+
+    out = runner._format_summary(1, {
+        "score": 1.25, "sigma": 0.489, "action": "hold",
+        "effective_weight": 4.1735, "n_sources": 3,
+        "vol_percentile": 0.5, "regime": "transition",
+        "proposal": {"kind": "hold", "direction": None}})
+    assert "effective_weight" not in out, out
+    assert "来源数" not in out, f"n_sources 恒为 3，不该打印: {out!r}"
+    assert "4.1735" not in out and "4.17" not in out, out
+
+
+def test_summary_omits_missing_fields_without_question_mark():
+    """缺失的新字段必须**整段省略**，不得填 `?`。
+
+    `?` 在本项目是"没设 action"的事故标记（`-> ?`），
+    测试 `test_*_console_format` 会断言下单轮次不含它。
+    """
+    import gold_agent.runner as runner
+
+    out = runner._format_summary(1, {
+        "score": 1.25, "sigma": 0.49, "action": "open_market",
+        "proposal": {"kind": "open_market", "direction": "LONG"},
+        "execution": {"ok": True}})
+    assert "?" not in out, f"不得出现 '?': {out!r}"
+    assert "波动分位" not in out, "无数据时不应硬凑字段"
+    assert "行情" not in out, "无数据时不应硬凑字段"
+
+
+def test_summary_prints_per_source_scores_and_weights():
+    """用户要求：把**各源分数/权重**打出来（这才是"这轮有多可信"）。
+
+    实测数据（round 8938）：卡尔曼 +1.87 权重 4.0（主导）、
+    缠论 -0.71 权重 0.128、SMC 未参与（IR 权重 0）。
+    必须能一眼看出「谁在主导、谁在反对、谁没参与」。
+    """
+    import gold_agent.runner as runner
+
+    out = runner._format_summary(8938, {
+        "score": 1.77, "action": "hold",
+        "vol_percentile": 0.956, "regime": "transition",
+        "n_sources": 3, "disagreement": True,
+        "per_source": [
+            {"name": "kalman_persist", "score": 1.869, "w": 4.0, "sigma": 1.379},
+            {"name": "chanlun", "score": -0.713, "w": 0.1276, "sigma": 0.5},
+            {"name": "openmobius_smc", "score": -1.49, "w": 0.0,
+             "excluded": "zero_weight"},
+            {"name": "classic_indicators", "score": 0.681, "w": 0.0459,
+             "sigma": 0.6},
+        ]})
+    assert "各源:" in out, f"缺逐源明细: {out!r}"
+    # 源名必须中文（AGENTS.md §二：不得保留英文缩写）
+    assert "卡尔曼趋势" in out and "缠论" in out and "经典指标" in out, out
+    assert "kalman_persist" not in out, f"源名未中文化: {out!r}"
+    # 分数与权重
+    assert "+1.87" in out and "权4.00" in out, f"缺分数/权重: {out!r}"
+    assert "-0.71" in out, f"缺反向源分数: {out!r}"
+    # 0 权重源必须标"未参与"，不能看起来像有意见
+    assert "SMC结构 未参与" in out, f"0 权重源应标未参与: {out!r}"
+
+
+def test_sources_line_is_gbk_safe():
+    """逐源明细含中文且不得引入 GBK 外字符（如 `σ`）。"""
+    import gold_agent.runner as runner
+
+    out = runner._format_summary(1, {
+        "score": 1.0, "action": "hold", "vol_percentile": 0.5,
+        "regime": "trending",
+        "per_source": [{"name": "kalman_persist", "score": 1.0, "w": 4.0,
+                        "sigma": 1.379}]})
+    bad = [ch for ch in out if not _gbk_ok(ch)]
+    assert not bad, f"逐源明细含 GBK 外字符 {bad!r}: {out!r}"

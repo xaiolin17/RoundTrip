@@ -14,7 +14,8 @@ import sys
 
 from gold_agent.common.config import CFG
 from gold_agent.common.logging_util import log_error, log_info, log_warn
-from gold_agent.common.zh import direction_label, kind_label, reason_label
+from gold_agent.common.zh import (direction_label, kind_label, reason_label,
+                                  regime_label, source_label)
 from gold_agent.agent.graph import Graph
 
 
@@ -68,6 +69,57 @@ def _fmt_price(v) -> str:
         return f"{float(v):.3f}"
     except (TypeError, ValueError):
         return str(v)
+
+
+def _pct(v) -> str:
+    """0~1 的分位/占比 → 百分数；None/非数值 → "--"。
+
+    用于替代原来的 `标准差`（见 `_format_summary` 的说明）。
+    """
+    try:
+        return f"{float(v) * 100:.0f}%"
+    except (TypeError, ValueError):
+        return "--"
+
+
+def _sources_line(summary: dict) -> str:
+    """逐源打印**分数 / 权重 / 该源标准差**（用户要求：这轮预测有多可信）。
+
+    为什么需要它：轮次摘要原来只给一个融合分和一个标准差。而那个标准差是
+    `1/sqrt(Σw)`，Σw 只由静态 IR 权重表决定 -> 实测 378 轮恒为 0.49，
+    看不出任何"这轮有多可信"。真正携带可信度信息的是：
+    **几个源在投票、各自权重多少、方向是否一致、各源自身波动多大**。
+
+    `per_source` 来自 `graph` 的 signals 日志，每项含：
+      · `score`  该源当轮归一化分（方向 = 它的符号）
+      · `w`      该源在融合里的实际权重（Σw 的占比决定谁主导）
+      · `sigma`  该源自身标准差（`max(k.sigma*0.8, 0.2)` 等，**真的随数据变**）
+      · `excluded` 非空 = 未验证/0 权重，不参与方向
+    """
+    per = summary.get("per_source") or []
+    if not per:
+        return ""
+    parts = []
+    for s in per:
+        name = source_label(s.get("name"))
+        try:
+            sc = float(s.get("score") or 0.0)
+            w = float(s.get("w") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if s.get("excluded") or w <= 0:
+            # 未验证/被排除的源不参与方向 -> 明确标出来，别让它看起来像"有意见"
+            parts.append(f"{name} 未参与")
+            continue
+        try:
+            sd = float(s.get("sigma"))
+            sd_txt = f" 波动{sd:.2f}"
+        except (TypeError, ValueError):
+            sd_txt = ""
+        parts.append(f"{name} {sc:+.2f}(权{w:.2f}{sd_txt})")
+    if not parts:
+        return ""
+    return "    各源: " + " ".join(parts)
 
 
 def _src_suffix(plan: dict) -> str:
@@ -204,7 +256,6 @@ def _format_summary(n: int, summary: dict) -> str:
     （在 print 行上做源码扫描会漏掉上一行的字面量）。
     """
     score = summary.get("score")
-    sigma = summary.get("sigma")
     if score is None:
         return json.dumps(summary, ensure_ascii=False, default=str)
     prop = summary.get("proposal") or {}
@@ -214,19 +265,58 @@ def _format_summary(n: int, summary: dict) -> str:
     # 下单轮次必须能一眼看出方向（否则控制台只剩一个动作名）
     if direction and action not in ("hold", "skip_round", "safe_hold"):
         act = f"{act} {direction_label(direction)}"
-    line = f"[第{n}轮] 融合分={score:+.2f} 标准差={sigma:.2f} -> {act}"
+    # ⚠️ 原来这里打的是 `标准差={sigma:.2f}`。**实测它是常数**：
+    #    logs/decision_*.jsonl 共 7834 轮，sigma 只有 3 个取值
+    #    （0.489×6952 / 0.297×879 / 3.0×2），最近 9 天 512 轮恒为 0.489。
+    #    因为它 = `1/sqrt(Σw)`，而 Σw 只由**静态 IR 权重表**决定，
+    #    与行情无关。逐轮打印一个常数，只会制造"这是个会动的指标"的错觉。
+    #
+    #    因此改打**实测真的会动**的三个量：
+    #      · 波动分位 vol_percentile：959 个不同取值，sd=0.31 ✅
+    #      · 行情判定 regime       ：3 个状态，按天迁移 ✅
+    #      · 源间分歧 disagreement ：True 415 / False 97 ✅
+    #    实测**不动、故不打印**的量（避免重蹈覆辙）：
+    #      · effective_weight：连续 9 天恒为 4.1735（Σw 同源）
+    #      · n_sources       ：恒为 3（只有 3 个源有非零 IR 权重）
+    #      · 逐源 w          ：卡尔曼 4.0 / 缠论 0.1276 / 经典 0.0459 全固定
+    #        -> 逐源行只打**分数**(每轮都变)+ 权重(标出谁主导)，见 `_sources_line`。
+    #
+    # ⚠️ 缺失字段**整段省略**，不填 `?`：测试 `test_*_console_format`
+    #    断言下单轮次不得出现 `?`（曾因 action 未设而打出 `-> ?`）。
+    head = f"[第{n}轮] 融合分={score:+.2f}"
+    if summary.get("vol_percentile") is not None:
+        head += f" 波动分位={_pct(summary.get('vol_percentile'))}"
+    if summary.get("regime"):
+        head += f" 行情={regime_label(summary.get('regime'))}"
+    if summary.get("disagreement"):
+        head += " 源间分歧"
+    line = f"{head} -> {act}"
+    # ⚠️ 观望轮次**必须带上原因**，否则新加的 news 事件闸会完全不可见：
+    #    实测决策理由首条绝大多数是 `|S_eff| x < 阈值`，而 news 事件闸
+    #    （`新闻事件影响度 … → 等事件过去`）只在 hold 时出现 ——
+    #    不打印理由就永远看不出 news 到底有没有生效（用户正是为此才
+    #    反馈"news 一次都没出现过"）。只取首条，避免控制台刷屏。
+    if action in ("hold", "skip_round", "safe_hold"):
+        why = (prop.get("reasons") or [None])[0]
+        if why:
+            line += f"  （{_zh_reason(str(why))}）"
     risk = summary.get("risk") or {}
     if not risk.get("ok", True):
         line += f"  【被风控拦截】{_zh_reason(risk.get('reason'))}"
-        return line
+        return _with_sources(line, summary)
     # 通过风控（或无需风控）时，把价位明细附在后面
     details = _order_lines(summary)
     ex = summary.get("execution")
     if ex:
         line += "  【执行成功】" if ex.get("ok") else f"  【执行失败】{ex.get('error')}"
-    if details:
-        return line + "\n" + "\n".join(details)
-    return line
+    details_text = ("\n" + "\n".join(details)) if details else ""
+    return _with_sources(line, summary) + details_text
+
+
+def _with_sources(line: str, summary: dict) -> str:
+    """把逐源分数/权重附在轮次行后面（无 per_source 时原样返回）。"""
+    src = _sources_line(summary)
+    return f"{line}\n{src}" if src else line
 
 
 def _safe_print(line: str) -> None:
