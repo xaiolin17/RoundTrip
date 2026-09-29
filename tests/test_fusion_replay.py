@@ -105,35 +105,37 @@ def _mobius_stub(df_15m: pd.DataFrame, last_price: float) -> MobiusResult:
 
 
 def _plumbing_engine() -> FusionEngine:
-    """构造一个带 IR 权重的引擎，用于验证融合链路。
+    """构造一个带**非零权重**的引擎，用于验证融合链路。
 
-    这些 IR 数字与 `research/18 §P0-2` 的基线表一致（kalman 0.28 / chanlun 0.05 /
-    classic 0.03 / openmobius_smc 0.00），并用 `_refresh_ir_max()` 做归一。
-    它们的作用是让 `gaussian.fuse` 有非零权重可加权，从而把
-    「去均值 → IR 加权 → 融合 → 打分」这条**机器**跑通。
+    ⚠️ **这是一份合成夹具，不是校准结果，不得当作任何 IR 依据。**
 
-    生产权重由 `data/source_ir.json` + `weights.BASELINE_IR` 合并得到，
+    它的唯一职责是让每个源都拿到非零权重，从而把
+    「去均值 → 加权 → 融合 → 打分」这条**机器**跑通 ——
+    否则权重全 0 时 `gaussian.fuse` 会把所有源排除，链路根本走不到。
+
+    历史上这里手填过 `research/18 §P0-2` 的基线表
+    （kalman 0.28 / chanlun 0.05 / classic 0.03）+ `_refresh_ir_max()` 归一。
+    该表已删除：其中 kalman 的 0.28 比它自己的出处（`research/11` 的
+    `kalman_trend n=59879 毛 NW-t=+3.31` → IR = 3.31/√59879 = 0.01353）
+    **大 20.7 倍**，且正是这个假数字把排序做成了 kalman > chanlun > classic
+    —— 而 `research/21_source_ir.py` 实测恰好相反。测试夹具里继续手填
+    数字，等于把伪造的先验从源码搬到测试里，故一并去掉。
+
+    现在用**等权先验**（`skill=0` → `lambda=0`），与生产当前状态一致：
+    三个可测源各得 `W_SCALE`，`openmobius_smc` 结构性不可测 → 0。
+    生产权重由 `data/source_ir.json` 经 DL 收缩得到，
     由 `test_production_weight_table_can_trade` 覆盖。
-
-    ⚠️ 注意 kalman 的 IR=0.28 来自 `research/18 §P0-2` 的基线表（其出处是
-    `research/11` 的 kalman_trend 毛 NW-t=+3.31）。`research/23_kalman_tb.py`
-    用 triple_barrier 复核了**线上实现**（filterpy + 固定 R）：毛 NW-t=+1.74，
-    约为文献值的 0.53x；两者方向一致率 89.3%，属同一信号族。
     """
     tbl = WeightTable(trials=6)
-    tbl.sources["kalman_persist"] = SourceIR(
-        "kalman_persist", ir=0.28, nw_t=3.31, n_obs=60000, verified=True,
-        source_script="research/18_COMMERCIAL_PLAN.md §P0-2（基线表）")
-    tbl.sources["chanlun"] = SourceIR(
-        "chanlun", ir=0.05, nw_t=1.1, n_obs=60000, verified=True,
-        source_script="research/18_COMMERCIAL_PLAN.md §P0-2（基线表）")
-    tbl.sources["classic_indicators"] = SourceIR(
-        "classic_indicators", ir=0.03, nw_t=0.8, n_obs=60000, verified=True,
-        source_script="research/18_COMMERCIAL_PLAN.md §P0-2（基线表）")
+    for name in ("kalman_persist", "chanlun", "classic_indicators"):
+        tbl.sources[name] = SourceIR(
+            name, ir=0.0, measurable=True, skill=0.0,
+            basis="equal_prior",
+            source_script="测试夹具（合成，非校准结果）")
     tbl.sources["openmobius_smc"] = SourceIR(
-        "openmobius_smc", ir=0.0, nw_t=0.0, n_obs=0, verified=False,
-        source_script="research/21_source_ir.py")
-    tbl._refresh_ir_max()
+        "openmobius_smc", ir=0.0, measurable=False,
+        source_script="research/21_source_ir.py（离线桩，无历史回放）")
+    tbl._refresh_weights()
     return FusionEngine(weight_table=tbl)
 
 
@@ -193,18 +195,37 @@ def test_fusion_replay_calibration(hist_15m):
 
 
 def test_production_weight_table_can_trade():
-    """生产权重表必须**能开仓** —— 这是硬性验收，不是"诚实状态"记录。
+    """两种权重策略各自的行为都必须明确 —— 这是策略选择的验收。
 
-    ⚠️ 本测试曾经断言相反的事情（"无源通过验证 → 权重全 0 → 不开仓"），
-    并把「不开仓」当作正确行为。**那个结论是错的**，理由：
+    ⚠️ 本测试经过两次修正，记录完整推理：
 
-      1. research/18 §P0-2 **原文就列出了 IR 表**（kalman 0.28 / chanlun 0.05 /
-         classic 0.03 / openmobius_smc 0.00），只有 `openmobius_smc` 是 0。
-         把全部源打成 0 是对该条的过度应用。
-      2. 一个不交易的交易系统是**失败状态**，不是安全状态。
-         实盘证据：`effective_weight=0.0` → `score=0.0` → 永远 hold。
+      · 最初断言的相反命题是"无源通过验证 → 权重全 0 → 不开仓"，
+        并把「不开仓」当成正确行为。
+      · 第一次修正（`baseline_fallback` 时代）：论证 research/18 §P0-2
+        原文就列出了 IR 表，把全部源打成 0 是过度应用；且"一个不交易的
+        交易系统是失败状态"。于是要求 `total > 0`。
+      · **第二次修正（2026-09-29，用户明确要求"让校准结果真能影响权重"）**：
+        上一条的要求本身是有代价的 —— 它把系统**锁死在兜底常数**上，
+        使 `data/source_ir.json` 无论测出什么都无法影响权重（已实测：
+        写入一份"四源全未通过"的校准文件，权重一模一样）。
+        用户选择了如实反映实测证据，接受"当前校准下不开仓"的后果。
+        因此本测试改为**分别验收两种策略**，而不再把"能开仓"当成
+        对生产配置的硬性要求。
 
-    真正要守住的不变量是：**未验证的源（openmobius_smc）拿不到权重**。
+    真正要守住的不变量（与策略无关，收缩模型下依然成立）：
+      **未验证的源（openmobius_smc）拿不到权重。**
+      且系统必须**可交易**（σ ≤ sigma_max）—— 一个不交易的交易系统是失败状态。
+
+    ⚠️ **第三次修正（2026-09-29 晚，用户指出前两次都留下了死代码）**：
+    用户原话「要恢复交易 但是有合理的处理方式吗 不能放一个没有作用的
+    死代码在那吧 我这是商用项目欸」。这个批评是对的，且根因比"选哪个
+    策略"更深：**把统计估计做成了二值开关**。
+      · `baseline_fallback` 下校准文件永不影响权重（文件是装饰性的）；
+      · `authoritative` 下 `BASELINE_IR` 永不被读取（兜底表是死代码），
+        且系统不开仓。
+    两个方案都必然留下一段死代码。故本测试改为验收**收缩模型**：
+    权重永远是 `lambda·实测 + (1−lambda)·等权`，两者都实际参与计算
+    （`lambda` 是权重，不是开关），且 `lambda` 会随数据移动。
     """
     import json
     from pathlib import Path
@@ -213,28 +234,39 @@ def test_production_weight_table_can_trade():
         pytest.skip("尚未运行 research/21_source_ir.py --write")
     data = json.loads(f.read_text(encoding="utf-8"))
 
-    from gold_agent.fusion.weights import DECISION_SOURCES
-    tbl = WeightTable.load()
+    from gold_agent.fusion.weights import DECISION_SOURCES  # noqa: E402
 
-    # (1) 必须能开仓：总权重足够大，使 sigma_S 过 sigma_max 闸门
+    tbl = WeightTable.load(f)
+
+    # ---- (1) 必须可交易：否则"恢复交易"这个目标没有达成 ----
     total = tbl.total_weight(list(DECISION_SOURCES))
     assert total > 0, (
-        "生产权重表全 0 → 融合分恒 0 → 系统永不开仓。"
-        "这是失败状态：research/18 §P0-2 只要求 openmobius_smc 为 0。")
-    sigma_s = 1.0 / (total ** 0.5)
-    assert sigma_s <= CFG.fusion.sigma_max, (
-        f"sigma_S={sigma_s:.3f} > sigma_max={CFG.fusion.sigma_max} → 决策层永远 hold")
+        "权重总和为 0 → 融合分恒为 0 → 系统不会开仓。"
+        "一个不交易的交易系统是失败状态，不是安全状态。")
+    sigma = 1.0 / (total ** 0.5)
+    assert sigma <= CFG.fusion.sigma_max, (
+        f"sigma_S={sigma:.3f} > sigma_max={CFG.fusion.sigma_max} → 决策层永远 hold")
 
-    # (2) 未验证的源必须仍然是 0（这条不能被放松）
-    assert tbl.weight("openmobius_smc") == 0.0, "openmobius_smc 未验证，必须 0 权重"
+    # ---- (2) 收缩端点都必须真实参与（没有死代码）----
+    for name in DECISION_SOURCES:
+        s = tbl.get(name)
+        if not s.measurable:
+            continue
+        assert s.w_prior > 0, f"{name}: 等权先验必须非零（否则是死代码）"
+        expect = tbl.lam * s.w_measured + (1.0 - tbl.lam) * s.w_prior
+        assert s.w_final == pytest.approx(expect), (
+            f"{name}: 最终权重必须等于收缩式 lambda*实测+(1-lambda)*先验")
 
-    # (3) 每个拿到权重的源都必须有 research 出处（不许手填）
+    # ---- (3) 不可测的源必须是 0（硬规则未被放松）----
+    assert tbl.weight("openmobius_smc") == 0.0, (
+        "openmobius_smc 无历史回放（分数来自离线桩）→ 结构性不可测 → 0 权重")
+
+    # ---- (4) 每个拿到权重的可测源都必须有出处 ----
     for name in DECISION_SOURCES:
         if tbl.weight(name) > 0:
             assert tbl.get(name).source_script, f"{name} 有权重但没有出处"
-            assert tbl.get(name).ir > 0, f"{name} 权重>0 但 IR<=0"
 
-    # (4) 毛/净必须分开记录（research/11 的教训）
+    # ---- (5) 毛/净必须分开记录（research/11 的教训）----
     for k, v in data["sources"].items():
         assert "gross_nw_t" in v and "net_nw_t" in v, f"{k} 缺少毛/净分离字段"
         assert v["net_nw_t"] <= v["gross_nw_t"] + 1e-9, f"{k} 净 NW-t 不应高于毛 NW-t"
@@ -572,9 +604,9 @@ def test_zero_weight_source_cannot_trigger_disagreement():
     """
     tbl = WeightTable(trials=1)
     tbl.sources["w_src"] = SourceIR("w_src", ir=0.3, nw_t=3.0, n_obs=1000,
-                                    verified=True)
-    tbl.sources["zero_src"] = SourceIR("zero_src", ir=0.0, verified=False)
-    tbl._refresh_ir_max()
+                                    measurable=True, skill=0.5)
+    tbl.sources["zero_src"] = SourceIR("zero_src", ir=0.0, measurable=False)
+    tbl._refresh_weights()
     closes = np.linspace(4000.0, 4010.0, 600)
 
     srcs = [SourceView("w_src", 1.5, 1.0, weight=tbl.weight("w_src")),
@@ -608,9 +640,9 @@ def test_news_score_no_longer_changes_fusion():
     """
     tbl = WeightTable(trials=1)
     tbl.sources["w_src"] = SourceIR("w_src", ir=0.3, nw_t=3.0, n_obs=1000,
-                                    verified=True)
-    tbl.sources["news"] = SourceIR("news", ir=0.0, verified=False)
-    tbl._refresh_ir_max()
+                                    measurable=True, skill=0.5)
+    tbl.sources["news"] = SourceIR("news", ir=0.0, measurable=False)
+    tbl._refresh_weights()
     closes = np.linspace(4000.0, 4010.0, 600)
 
     def _run(news_score):
@@ -1157,3 +1189,335 @@ def test_oos_open_rate_is_acceptable(monkeypatch):
     finally:
         shutil.rmtree(_iso, ignore_errors=True)
 
+
+# ---------------------------------------------------------------------------
+# 权重校准：DL 收缩（取代旧的 source_ir_policy 二选一开关）
+#
+# 设计依据（research/25 §12）：旧版把**统计估计**做成了二值开关，两个取值
+# 都必然留下一段死代码 ——
+#   · baseline_fallback：校准文件永不影响权重（文件是装饰性的）
+#   · authoritative    ：BASELINE_IR 永不被读取（兜底表是死代码）+ 不开仓
+# 现在权重恒为 `lambda·实测 + (1−lambda)·等权`，两个端点都真实参与计算，
+# 且 `lambda` 由 DerSimonian-Laird 估计量从数据算出、会随数据移动。
+# ---------------------------------------------------------------------------
+def _shrink_table(skills: dict, **extra) -> WeightTable:
+    """构造一份带 `measurable`/`skill` 的校准文件并加载（收缩模型入口）。"""
+    import json
+    import tempfile
+    from pathlib import Path as _P
+
+    rows = {}
+    for n, sk in skills.items():
+        rows[n] = {"ir": 0.01, "nw_t": 0.5, "n_obs": 1000, "measurable": True,
+                   "skill": sk, "tb_n_independent": 300,
+                   "source_script": "cal.py"}
+    payload = {"trials": 6, "sources": rows}
+    payload.update(extra)
+    td = tempfile.mkdtemp()
+    p = _P(td) / "source_ir.json"
+    p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return WeightTable.load(p)
+
+
+def test_shrinkage_reproduces_the_measured_calibration():
+    """当前实测 skill 下必须给出 lambda=0（等权），且**手工可复算**。
+
+    实测（research/21，68871 根 / 用 68000）：
+        skill = t − 方向匹配对照均值 = −0.19 / −0.35 / +0.17
+    三者均值 −0.1233，Q = Σ(skill−mean)² = 0.14187，df = k−1 = 2。
+    Q < df → tau^2 = max(0,(Q−df)/C) = 0 → lambda = 0 → 等权。
+
+    `tau^2 = 0` 的实质含义：观测到的源间差异**不比纯抽样噪声更大**。
+    既然数据分辨不出源的高下，任何按这组数据重排权重的公式都是拟合噪声。
+    """
+    from gold_agent.fusion.weights import W_SCALE
+
+    tbl = _shrink_table({"kalman_persist": -0.19,
+                         "classic_indicators": -0.35,
+                         "chanlun": 0.17})
+    # 手工复算 Q（不依赖实现细节，独立验证）
+    sk = [-0.19, -0.35, 0.17]
+    mean = sum(sk) / len(sk)
+    q_manual = sum((x - mean) ** 2 for x in sk)
+    assert tbl.q_stat == pytest.approx(q_manual, abs=1e-9), (
+        f"Q 必须等于手工复算值 {q_manual:.5f}，实测 {tbl.q_stat:.5f}")
+    assert tbl.q_df == 2
+    assert tbl.q_stat < tbl.q_df, "Q < df 正是 tau^2 = 0 的成因"
+    assert tbl.tau2 == 0.0
+    assert tbl.lam == 0.0, "源间差异不显著于噪声 → lambda=0"
+
+    # lambda=0 → 完全落在等权先验上
+    for n in ("kalman_persist", "classic_indicators", "chanlun"):
+        assert tbl.weight(n) == pytest.approx(W_SCALE), (
+            f"{n}: lambda=0 时应拿等权先验 {W_SCALE}")
+    assert tbl.total_weight(["kalman_persist", "classic_indicators",
+                             "chanlun"]) == pytest.approx(3 * W_SCALE)
+
+
+def test_shrinkage_lambda_moves_when_sources_really_differ():
+    """**可证伪性**：源间差异真的变大时，lambda 必须离开 0 并改变权重。
+
+    这是"没有死代码"的关键证据 —— `lambda` 不是被钉死在 0 的常量。
+    实算（k=3，s²=1，C=k−1=2）：
+        skill = (−s, 0, +s)
+        s=1.00 → Q=2.000, Q−df=0     → tau²=0      → lambda=0
+        s=1.35 → Q=3.645, Q−df=1.645 → tau²=0.8225 → lambda=0.451
+        s=2.00 → Q=8.000, Q−df=6.000 → tau²=3.0000 → lambda=0.750
+    且 skill 高的源必须拿到**更多**权重（实测排序真正接管）。
+    """
+    # s=1.00：恰好压在临界点，仍不显著
+    t0 = _shrink_table({"kalman_persist": -1.0, "classic_indicators": 0.0,
+                        "chanlun": 1.0})
+    assert t0.q_stat == pytest.approx(2.0)
+    assert t0.lam == 0.0, "Q == df 时 tau^2 仍为 0"
+
+    # s=1.35：越过临界点，lambda 必须 > 0
+    t1 = _shrink_table({"kalman_persist": -1.35, "classic_indicators": 0.0,
+                        "chanlun": 1.35})
+    assert t1.q_stat == pytest.approx(3.645)
+    assert t1.tau2 == pytest.approx(0.8225)
+    assert t1.lam == pytest.approx(0.4513, abs=1e-3), (
+        f"lambda 必须离开 0（实算 0.4513），实测 {t1.lam:.4f}")
+    assert t1.weight("chanlun") > t1.weight("kalman_persist"), (
+        "skill 高的源必须拿到更多权重 —— 否则实测排序没有真正接管")
+
+    # s=2.00：更极端的差异 → lambda 更大
+    t2 = _shrink_table({"kalman_persist": -2.0, "classic_indicators": 0.0,
+                        "chanlun": 2.0})
+    assert t2.lam == pytest.approx(0.75)
+    assert t2.lam > t1.lam, "lambda 必须随差异单调增大"
+
+
+def test_shrinkage_endpoints_are_both_live():
+    """两个收缩端点都必须**真实参与**计算（这是"没有死代码"的验收）。
+
+    旧版二选一开关的性质是：任一时刻必有一个分支的输出被整体忽略。
+    收缩模型下 `w = lambda·w_measured + (1−lambda)·w_prior`，
+    两个端点在每个源上都以 lambda 为**权重**（不是开关）参与。
+    """
+    from gold_agent.fusion.weights import W_SCALE
+
+    # 构造一个 lambda 严格位于 (0,1) 的中间态
+    tbl = _shrink_table({"kalman_persist": -2.0, "classic_indicators": 0.0,
+                         "chanlun": 2.0})
+    assert 0.0 < tbl.lam < 1.0, f"需要中间态，实测 lambda={tbl.lam}"
+
+    ch = tbl.get("chanlun")
+    assert ch.w_prior == pytest.approx(W_SCALE)
+    assert ch.w_measured > 0
+    # 中间态下，两个端点都既没有被忽略、也没有单独决定结果
+    assert ch.w_prior != ch.w_final, "等权先验必须实际参与（否则是死代码）"
+    assert ch.w_measured != ch.w_final, "实测排序必须实际参与（否则是死代码）"
+    assert ch.w_final == pytest.approx(tbl.lam * ch.w_measured
+                                       + (1 - tbl.lam) * ch.w_prior)
+
+    # 单调性：lambda 越大，实测排序的影响越大
+    lo = _shrink_table({"kalman_persist": -1.35, "classic_indicators": 0.0,
+                        "chanlun": 1.35})
+    hi = _shrink_table({"kalman_persist": -2.0, "classic_indicators": 0.0,
+                        "chanlun": 2.0})
+    assert hi.lam > lo.lam
+    # 弱源在"更相信实测"的设定下必须被压得更低
+    assert hi.weight("kalman_persist") < lo.weight("kalman_persist")
+
+
+def test_unmeasurable_source_never_gets_weight():
+    """结构性不可测的源（无历史回放）恒为 0 —— 与显著性判定**无关**。
+
+    关键区分：`verified=False` 只说明"这个样本量下测不出显著技能"
+    （三个真实源都是这个状态，但它们是**可测**的）；而
+    `openmobius_smc` 的分数来自离线桩 `_mobius_synthetic_scores`
+    （Mobius API 无历史回放）→ **根本测不了**。把两者混为一谈，
+    就会让权重全 0、系统永不开仓 —— 正是被修掉的缺陷。
+    """
+    import json
+    import tempfile
+    from pathlib import Path as _P
+
+    payload = {"trials": 6, "sources": {
+        # 即使文件声称它 measurable 且 skill 最高，也必须被强制 0
+        "openmobius_smc": {"ir": 0.9, "nw_t": 5.0, "n_obs": 5000,
+                           "measurable": True, "skill": 9.99,
+                           "source_script": "stub.py"},
+        "chanlun": {"ir": 0.01, "nw_t": 0.5, "n_obs": 1000,
+                    "measurable": True, "skill": 0.5,
+                    "source_script": "cal.py"},
+    }}
+    with tempfile.TemporaryDirectory() as td:
+        p = _P(td) / "source_ir.json"
+        p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tbl = WeightTable.load(p)
+        assert tbl.weight("openmobius_smc") == 0.0, (
+            "无历史回放的源必须 0 权重，即使文件里 skill 最高")
+        assert tbl.weight("chanlun") > 0, "可测源不受影响，仍应有权重"
+
+
+def test_missing_file_gives_equal_prior_not_fabricated_ir():
+    """文件缺失 → 等权先验，而不是退回某张手填 IR 表。
+
+    旧版 `BASELINE_IR` 声称 kalman=0.28 出自 research/11，而该文件写的是
+    `kalman_trend n=59879 毛 NW-t=+3.31` → IR = 3.31/√59879 = 0.01353。
+    **0.28 比它自己的出处大 20.7 倍**，且正是这个数字把排序做成了
+    kalman > chanlun > classic（research/21 实测恰好相反）。
+    所以它被删除：没有实测依据时，正确答案是"等权（无信息）"，
+    而不是编造一张带小数点的表。
+    """
+    import tempfile
+    from pathlib import Path as _P
+
+    from gold_agent.fusion.weights import W_SCALE
+
+    with tempfile.TemporaryDirectory() as td:
+        tbl = WeightTable.load(_P(td) / "nope.json")
+        for n in ("kalman_persist", "chanlun", "classic_indicators"):
+            assert tbl.weight(n) == pytest.approx(W_SCALE), (
+                f"{n}: 无校准文件时应拿等权先验")
+            assert tbl.get(n).basis == "equal_prior", (
+                "必须标成 equal_prior，与实测值区分开")
+        assert tbl.weight("openmobius_smc") == 0.0
+        # 关键：不得再有任何手填 IR 冒充实测
+        for s in tbl.sources.values():
+            assert s.ir == 0.0, "无实测依据时不得编造 IR 数字"
+
+    # 文件损坏同样退化为等权，而不是崩溃或全 0
+    with tempfile.TemporaryDirectory() as td:
+        bad = _P(td) / "source_ir.json"
+        bad.write_text("{ not json", encoding="utf-8")
+        t2 = WeightTable.load(bad)
+        assert t2.weight("chanlun") == pytest.approx(W_SCALE)
+
+
+def test_old_format_file_falls_back_to_equal_prior():
+    """旧格式（缺 `measurable`）→ 等权先验，**不得**用 verified 顶替。
+
+    `verified` 是显著性判定；当前三源都因样本量不足而为 false，
+    但它们的分数序列是真实历史数据算出来的、**可测**。
+    旧实现（用 verified 当 measurable）会把"不显著"读成"不可测"
+    → 全部 0 权重 → 系统永不开仓。这正是本次要修掉的缺陷。
+    """
+    import json
+    import tempfile
+    from pathlib import Path as _P
+
+    from gold_agent.fusion.weights import W_SCALE
+
+    payload = {"trials": 6, "sources": {
+        # 旧格式：没有 measurable 字段，且 verified=false（正是真实文件的样子）
+        n: {"ir": 0.0, "nw_t": 0.3, "n_obs": 60000, "verified": False,
+            "tier": "rejected", "source_script": "old.py"}
+        for n in ("kalman_persist", "chanlun", "classic_indicators")}}
+    with tempfile.TemporaryDirectory() as td:
+        p = _P(td) / "source_ir.json"
+        p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tbl = WeightTable.load(p)
+        for n in ("kalman_persist", "chanlun", "classic_indicators"):
+            assert tbl.weight(n) == pytest.approx(W_SCALE), (
+                f"{n}: 旧格式文件不得因 verified=false 被打成 0 权重"
+                f"（那是把「不显著」误读成「不可测」）")
+        assert tbl.weight("openmobius_smc") == 0.0
+
+
+def test_weight_logs_are_gbk_encodable():
+    """权重日志必须能被 GBK 编码（控制台 cp936，否则 print 抛异常）。
+
+    ⚠️ 实测事故：`✓`/`⛔` 等非 GBK 符号曾让进程在**第一次真正开仓那一轮**
+    崩溃 —— 日志看着能跑，一交易就死。故逐条验证可编码。
+    """
+    import tempfile
+    from pathlib import Path as _P
+
+    from gold_agent.fusion import weights as W
+
+    msgs = []
+    o_w, o_i = W.log_warn, W.log_info
+    W.log_warn = lambda m: msgs.append(m)
+    W.log_info = lambda m: msgs.append(m)
+    try:
+        W.WeightTable.load()                       # 旧格式 → warn
+        W.WeightTable.load(_P(tempfile.mkdtemp()) / "nope.json")
+        _shrink_table({"kalman_persist": -0.19, "classic_indicators": -0.35,
+                       "chanlun": 0.17})           # lambda=0 → warn
+        _shrink_table({"kalman_persist": -2.0, "classic_indicators": 0.0,
+                       "chanlun": 2.0})            # lambda>0 → info
+    finally:
+        W.log_warn, W.log_info = o_w, o_i
+
+    assert msgs, "权重状态必须写进日志（不能静默）"
+    for m in msgs:
+        m.encode("gbk")   # 不可编码会抛 UnicodeEncodeError
+
+
+def test_ir_gate_requires_direction_matched_control():
+    """校准判定门必须要求**胜过方向匹配对照**，不能只看 t 值。
+
+    实测缺陷（2026-09-29）：旧门只要求 `非重叠毛 NW-t > 1.5`。但本窗口是
+    趋势市（全空头毛收益 +0.5690 vs 全多头 -0.4644 USD/笔），一个持续偏空
+    的源**不需要任何择时能力**就能拿到正 t。实测：
+      · 纯随机方向有 **14%** 概率通过旧门（t>1.5）；
+      · 把非重叠样本方向随机重排（多空比例不变），对照 t 均值就有 +0.5；
+      · 四个源（含那个"通过"的离线桩）全部落在对照分布内部。
+
+    ⚠️ `verified` 只决定"能不能证明它强"，**不决定权重**（权重走 DL 收缩）。
+    本测试守住"对照必须参与判定"这条不变量。
+    """
+    from pathlib import Path as _P
+
+    src = (_P(__file__).resolve().parents[1] / "research" /
+           "21_source_ir.py").read_text(encoding="utf-8")
+
+    # 对照必须存在且可复现（确定性种子，不用内置 hash()）
+    assert "TB_CTRL_SIMS" in src, "方向匹配对照的模拟次数必须显式定义"
+    assert "_seed = 20260920" in src, (
+        "对照的随机种子必须确定性导出 —— 内置 hash() 会被 PYTHONHASHSEED "
+        "随机化，导致同一份数据每次跑出不同结论")
+
+    # 判定必须引用对照结果
+    assert "ctrl_ok" in src, "判定门必须计算对照是否通过"
+    assert "and ctrl_ok)" in src, "verified 判定必须包含对照条件"
+    assert "t_ind > 2.0 and ctrl_ok" in src, "strong 档也必须过对照"
+
+    # 量纲陷阱：ret 已含源方向，置换必须写成 perm * r_ind
+    assert "perm * r_ind" in src, (
+        "对照必须用 `perm * r_ind`（置换已带方向的收益，多空比例严格不变）")
+    assert "d * r_ind" not in src, (
+        "不得写成 `d * r_ind` —— 那是把收益取反，不是打乱方向，"
+        "多空比例会歪掉，对照就不'匹配'了")
+
+    # 保守置换 p 值（分子加 1，保证 p 不会被伪造成 0）
+    assert "np.sum(np.asarray(ctrl_t) >= t_gross_ind)" in src, (
+        "置换 p 值必须用单侧计数且分子加 1")
+
+    # skill 必须写进校准文件（权重估计量的唯一输入）
+    assert '"skill":' in src, (
+        "必须把 skill（t − 对照均值）写进校准文件，否则权重无从估计")
+    assert '"measurable":' in src, (
+        "必须把 measurable 写进校准文件，否则无法区分"
+        "「不可测」与「不显著」（那正是本次修掉的缺陷）")
+
+
+def test_shrinkage_replaces_the_policy_switch():
+    """旧的 `source_ir_policy` 开关与其兜底表必须已被彻底删除。
+
+    删除的理由不是"换个默认值"，而是它**结构上必然产生死代码**：
+    两个取值里总有一个分支的输出被整体忽略。且 `BASELINE_IR` 本身是伪造的
+    先验（kalman 0.28 vs 出处隐含的 0.01353，差 20.7 倍）。
+    """
+    from pathlib import Path as _P
+
+    from gold_agent.fusion import weights as W
+
+    src = (_P(__file__).resolve().parents[1] / "src" / "gold_agent" /
+           "fusion" / "weights.py").read_text(encoding="utf-8")
+
+    for gone in ("BASELINE_IR", "POLICY_BASELINE", "POLICY_AUTHORITATIVE",
+                 "VALID_POLICIES", "source_ir_policy", "from_baseline"):
+        assert not hasattr(W, gone), f"{gone} 应已删除（它必然产生死代码）"
+        assert gone not in src, f"{gone} 不应再出现在 weights.py 里"
+
+    assert not hasattr(CFG.fusion, "source_ir_policy"), (
+        "config 里的策略开关也应删除")
+
+    # 取而代之的是收缩端点，且确实是"权重"不是"开关"
+    assert hasattr(W, "LAMBDA_CALIBRATED")
+    assert hasattr(W, "NO_HISTORY_SOURCES")
+    assert "openmobius_smc" in W.NO_HISTORY_SOURCES

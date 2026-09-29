@@ -24,7 +24,7 @@ from gold_agent.fusion.bayes import BayesianPool
 from gold_agent.fusion.gaussian import FusionResult, SourceView, fuse
 from gold_agent.fusion.kalman import KalmanTrend
 from gold_agent.fusion.normalize import RollingBaseline, RollingPercentile, SourceNormalizer
-from gold_agent.fusion.weights import WeightTable
+from gold_agent.fusion.weights import LAMBDA_CALIBRATED, WeightTable
 from gold_agent.skills.chanlun_adapter import ChanlunResult
 from gold_agent.skills.mobius_adapter import MobiusResult, _score_fn
 
@@ -267,6 +267,13 @@ class FusedEvidence:
     norm_scores: dict[str, float] = field(default_factory=dict)
     #: 权重表快照（哪些源被排除、为什么）
     weight_table: dict = field(default_factory=dict)
+    #: DL 收缩系数 `lambda`：0 = 源间差异不显著于噪声（等权先验），
+    #: 1 = 完全采用实测排序。风险层据此决定是否按"未校准模式"降仓。
+    weight_lambda: float = 0.0
+    #: 是否处于未校准模式（`lambda < LAMBDA_CALIBRATED`）。
+    #: ⚠️ 这只影响**仓位大小**，绝不影响"开不开仓" —— 把统计功效不足
+    #:    做成开/不开的开关，正是被修掉的缺陷（详见 fusion/weights.py）。
+    uncalibrated: bool = False
     #: 预热状态（未预热的源不给方向）
     warmed: dict[str, bool] = field(default_factory=dict)
 
@@ -522,6 +529,8 @@ class FusionEngine:
         ev.result = result
         ev.weight_table = self.weights.describe(
             [s.name for s in sources])
+        ev.weight_lambda = float(self.weights.lam)
+        ev.uncalibrated = bool(self.weights.lam < LAMBDA_CALIBRATED)
         return ev
 
     # ---------- 波动分位 ----------

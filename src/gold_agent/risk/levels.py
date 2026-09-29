@@ -391,6 +391,11 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     # 最小距离（防贴脸）：用 ATR 定下限
     min_d = (CFG.risk.structure_sl_min_atr * atr) if atr else 0.0
     pad = (CFG.risk.level_pad_atr * atr) if atr else 0.0
+    # ⚠️ 冲突判定阈值原为 6 处硬编码 `0.3`，是实测 180 次
+    # `fusion_vs_levels_conflict` 拒绝里 159 次的**唯一驱动常数**，
+    # 却无法调参（同段的 structure_sl_min_atr / level_pad_atr 早已走配置）。
+    # 收敛到 CFG.risk.conflict_atr_mult，默认 0.3 保持行为不变。
+    conf_d = CFG.risk.conflict_atr_mult * atr if atr else 0.0
 
     if direction == "LONG":
         # 止损：下方最近支撑，再让开 pad
@@ -413,19 +418,20 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         # 收紧到 0.3×ATR（≈4.4 点）：只挡"真贴脸"（1m 内），
         # 不挡"还有空间"的位。
         near_res = _nearest_above(res, entry)
-        if near_res is not None and atr and near_res - entry < 0.3 * atr:
+        if near_res is not None and atr and near_res - entry < conf_d:
             # ⚠️ 纠缠过滤（用户报告"怎么一直在拦截"）：LLM 位也有密集噪音。
-            # 若该压力位下方 0.3×ATR 内就有 LLM 支撑位（支撑/压力交错 =
+            # 若该压力位下方 conf_d 内就有 LLM 支撑位（支撑/压力交错 =
             # 噪音区，实测 5586 轮交错间距仅 0.26 点），位不可信，
             # 跳过冲突判定放行；只有孤立压力位才算"真贴脸"。
-            if _entangled(near_res, sup, 0.3 * atr):
+            if _entangled(near_res, sup, conf_d):
                 out.notes.append(
                     f"压力位 {near_res:.3f} 与支撑纠缠（噪音区），跳过贴脸判定")
             else:
                 out.reason = "fusion_vs_levels_conflict"
                 out.notes.append(
                     f"做多但紧贴压力位 {near_res:.3f}（距入场 {near_res - entry:.3f} "
-                    f"< 0.3×ATR {0.3 * atr:.2f}，LLM位）-> 结构不支持追多")
+                    f"< {CFG.risk.conflict_atr_mult}×ATR {conf_d:.2f}，LLM位）"
+                    f"-> 结构不支持追多")
                 return out
     else:
         lv = _nearest_above(res_all, entry)
@@ -442,17 +448,18 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         # ⚠️ 只对 LLM 给的位判定（原因见做多分支注释；本地 1m SMC 位
         # 是噪音，实测 8/10 拦错）。
         near_sup = _nearest_below(sup, entry)
-        if near_sup is not None and atr and entry - near_sup < 0.3 * atr:
+        if near_sup is not None and atr and entry - near_sup < conf_d:
             # ⚠️ 纠缠过滤（与做多分支同理）：支撑位与压力位交错=噪音区，
             # 跳过贴脸判定放行；只有孤立支撑位才算"真贴脸"。
-            if _entangled(near_sup, res, 0.3 * atr):
+            if _entangled(near_sup, res, conf_d):
                 out.notes.append(
                     f"支撑位 {near_sup:.3f} 与压力纠缠（噪音区），跳过贴脸判定")
             else:
                 out.reason = "fusion_vs_levels_conflict"
                 out.notes.append(
                     f"做空但紧贴支撑位 {near_sup:.3f}（距入场 {entry - near_sup:.3f} "
-                    f"< 0.3×ATR {0.3 * atr:.2f}，LLM位）-> 结构不支持追空")
+                    f"< {CFG.risk.conflict_atr_mult}×ATR {conf_d:.2f}，LLM位）"
+                    f"-> 结构不支持追空")
                 return out
 
     # ---- 先定止损，再据此选"够赔率"的止盈压力位 ----

@@ -73,6 +73,11 @@ COST = 0.520
 #: triple_barrier 的最长持有（1m 根数）。240 = 4 小时，与 1m 短线定位一致。
 TB_HOLD = 240
 
+#: 方向匹配置换对照的模拟次数。用于把「真实择时技能」与「趋势市里的
+#: 方向偏差」分开 —— 后者不需要任何预测能力也能拿到正的 NW-t。
+#: 200 次足以把 p 值分辨到 0.005 粒度（保守置换 p 的下限 = 1/(1+200)）。
+TB_CTRL_SIMS = 200
+
 
 def p(s: str = "") -> None:
     print(s, flush=True)
@@ -322,10 +327,12 @@ def evaluate(name: str, raw: np.ndarray, close: np.ndarray, horizon: int,
     # ---- verified 判定 ----
     # 用**毛**技能（对齐 research/11 的三种对照设计）。
     #
-    # ⚠️ 这里的 IR 是「每观测信息比率」= 毛NW-t/√n，量纲极小（0.001~0.005），
-    #    不能直接当 research/18 §P0-2 里的相对 IR（0.28/0.05/0.03）用。
-    #    所以输出的是 **skill 排序证据**（谁比谁强、是否过对照），
-    #    而绝对 IR 值由 research/18 的基线表给出（weights.BASELINE_IR）。
+    # ⚠️ 这里的 IR 是「每观测信息比率」= 毛NW-t/√n，量纲极小（0.001~0.005）**不是**
+    #    research/18 §P0-2 里的相对 IR（0.28/0.05/0.03）——那张表已删除，
+    #    其中 kalman 的 0.28 比它自己的出处（research/11 的 t=3.31，n=59879
+    #    → IR=0.01353）大 20.7 倍，是伪造的先验。
+    #    权重现在由 weights.py 用 DL 收缩从**本脚本输出的 skill** 直接算出，
+    #    不再需要任何手写基线值。
     strong = bool(np.isfinite(nw_gross) and nw_gross > 2.0 and gross_mean > 0
                   and gross_mean > ctrl_random and gross_mean > ctrl_matched
                   and (not np.isfinite(nw_perm) or nw_gross > nw_perm))
@@ -347,6 +354,11 @@ def evaluate(name: str, raw: np.ndarray, close: np.ndarray, horizon: int,
         "cost_over_gross": (COST / gross_mean) if gross_mean > 0 else None,
         "verified": verified,
         "tier": tier,
+        # 固定视界下的 skill 估计（三重障碍那一支会覆盖成非重叠版）。
+        # 见 triple_barrier 段里 `skill` 的说明。
+        "skill": float(nw_gross - ctrl_matched),
+        # 有真实历史数据可跑 → 可测。与 `verified`（显著性）是两回事。
+        "measurable": bool(len(gross) > 0),
         "source_script": "research/21_source_ir.py",
     }
 
@@ -357,9 +369,19 @@ def main() -> None:
     ap.add_argument("--horizon", type=int, default=60, help="前瞻根数（1m）")
     ap.add_argument("--stride", type=int, default=120, help="chanlun 重算间隔")
     ap.add_argument("--write", action="store_true", help="写入 data/source_ir.json")
+    #: 换一份 1m 数据文件（默认仍是历史基线用的那份）。
+    #: 为什么需要：broker 的 1m 上限是 60000 根，实测窗口会随时间**向前滚动**
+    #: （旧缓存 07-21..09-18，新拉 07-29..09-29）。两次拉取的**重叠区
+    #: 51129 根逐字节一致**，所以可以合并成更长的序列来提高检验功效。
+    #: 不默认换文件：历史结论必须能用原数据复现。
+    ap.add_argument("--data", default="XAUUSDm_1m.parquet",
+                    help="data/cache 下的 1m parquet 文件名")
     args = ap.parse_args()
 
-    d = pd.read_parquet(DATA / "XAUUSDm_1m.parquet")
+    _src = DATA / args.data
+    if not _src.exists():
+        raise SystemExit(f"数据文件不存在: {_src}")
+    d = pd.read_parquet(_src)
     d["time"] = pd.to_datetime(d["time"], utc=True)
     d = d.sort_values("time").reset_index(drop=True).iloc[-args.bars:].reset_index(drop=True)
     close = d["close"].to_numpy(float)
@@ -369,6 +391,7 @@ def main() -> None:
     p("=" * 96)
     p("研究取证 21 · 信号源实测 IR 校准（research/18 P0-2 的数据来源）")
     p("=" * 96)
+    p(f"数据文件: {args.data}")
     p(f"1m {len(d)} 根  {d.time.iloc[0]} .. {d.time.iloc[-1]}  "
       f"区间位移 {close[-1] - close[0]:+.1f} USD  成本={COST}  前瞻={args.horizon} 根")
 
@@ -464,6 +487,42 @@ def main() -> None:
                      if m_ind_n >= 30 else float("nan"))
         overlap = m.sum() / max(m_ind_n, 1)
 
+        # ---- ⚠️ 方向匹配置换对照（判定门的核心）----
+        # 只有 t_ind 会被**方向偏差**污染：本窗口是趋势市（全多头毛收益
+        # -0.46 USD/笔，全空头 +0.57 USD/笔），所以一个持续偏空的源
+        # **不需要任何预测能力**就能拿到正的 t_ind。
+        # 旧判定门只看 `t_ind > 1.5`，等于给趋势市里的偏空源送分。
+        #
+        # 做法：把非重叠样本的**方向在其内部随机重排**（多空比例严格不变、
+        # 收益路径严格不变），得到"同样倾斜、但零择时能力"的基准分布。
+        # 源必须超过这个分布的高分位，才算真的有技能。
+        #
+        # ⚠️ 量纲陷阱（第一版写错过，务必别再踩）：
+        #    `tb.ret` **已经带了源自己的方向**（ret[i] = sgn[i]·u[i]，u 是无
+        #    方向收益）。所以方向的置换必须写成 `perm · ret`（perm 是 sgn 的
+        #    置换），**不能**写成 `d · ret` —— 后者是把收益取反，而不是把
+        #    方向打乱，多空比例会跟着歪掉，对照就不"匹配"了。
+        s_ind = sgn[keep] if m_ind_n else np.zeros(0, dtype=np.int8)
+        ctrl_t: list[float] = []
+        if m_ind_n >= 30:
+            # 种子必须**确定性**地从源名导出：不能用内置 hash()
+            # （PYTHONHASHSEED 随机化会让每次运行结果不同）。
+            _seed = 20260920 + sum((i + 1) * ord(c) for i, c in enumerate(name))
+            _rng = np.random.default_rng(_seed)
+            for _ in range(TB_CTRL_SIMS):
+                perm = _rng.permutation(s_ind).astype(float)
+                ctrl_t.append(newey_west_t(perm * r_ind + COST, lags=30))
+        ctrl_t = [float(x) for x in ctrl_t if np.isfinite(x)]
+        if ctrl_t:
+            ctrl_mean = float(np.mean(ctrl_t))
+            ctrl_sd = float(np.std(ctrl_t, ddof=1)) if len(ctrl_t) > 1 else 0.0
+            # 保守置换 p 值：(1 + #{对照 ≥ 观测}) / (1 + 模拟数)，
+            # 分子加 1 保证 p 不会伪造成 0。
+            p_ctrl = (1.0 + float(np.sum(np.asarray(ctrl_t) >= t_gross_ind))) \
+                / (1.0 + len(ctrl_t))
+        else:
+            ctrl_mean = ctrl_sd = p_ctrl = float("nan")
+
         p(f"{name:<22}{int(m.sum()):>8}{g.mean():>+10.4f}{mu0:>+10.4f}"
           f"{g.mean() - mu0:>+10.4f}{t_gross:>+9.2f}{t_net:>+9.2f}"
           f"{per_trade_ir:>+9.4f}{ann_sr:>+9.2f}")
@@ -481,7 +540,26 @@ def main() -> None:
                         "tb_gross_nw_t_ind": float(t_gross_ind),
                         "tb_net_nw_t_ind": float(t_net_ind),
                         "tb_gross_ind": (float((r_ind + COST).mean())
-                                         if m_ind_n else 0.0)})
+                                         if m_ind_n else 0.0),
+                        # 方向匹配置换对照：控制方向偏差后的真实技能证据
+                        "tb_ctrl_mean": ctrl_mean,
+                        "tb_ctrl_sd": ctrl_sd,
+                        "tb_ctrl_p": p_ctrl,
+                        "tb_ctrl_n": len(ctrl_t),
+                        # ⚠️ `skill` = 观测 t 减去方向匹配对照均值。
+                        #    这才是"超出方向偏差"的真实技能证据，也是
+                        #    weights.py 里 DL 收缩估计量的输入。
+                        #    它**不**单独决定谁拿权重：k 个源的 skill 一起
+                        #    进 DerSimonian-Laird 分解，算出 lambda 后按
+                        #    `lambda·实测 + (1−lambda)·等权` 分配。
+                        #    理由：本窗口 skill 为 −0.19/−0.35/+0.17，
+                        #    Q=0.142 < df=2 → tau^2=0 → 数据分辨不出高下，
+                        #    硬按 skill 排序就是拟合噪声。
+                        "skill": (float(t_gross_ind - ctrl_mean)
+                                  if (np.isfinite(t_gross_ind)
+                                      and np.isfinite(ctrl_mean)) else 0.0),
+                        "tb_long_ratio_ind": (float(np.mean(s_ind > 0))
+                                              if m_ind_n else 0.0)})
     p("")
     p(f"  零基准（全多头，同一价格路径）= {mu0:+.4f} USD/笔")
     p(f"  止损基准 = 1.2 × 1h ATR（中位 {np.nanmedian(atr1h):.2f} USD），"
@@ -513,12 +591,33 @@ def main() -> None:
             # verified 以 **triple_barrier 去重叠后** 的显著性为准。
             # 为什么必须去重叠：信号在相邻 bar 重复 → 重叠样本不独立 →
             # NW-t 被高估（实测 chanlun 456x 重叠时 +3.32 → 去重叠 -0.44）。
+            #
+            # ⚠️ 2026-09-29 加入**方向匹配置换对照**（旧门只看 t_ind，有漏洞）：
+            #    本窗口是趋势市（全空头毛收益 +0.5690 vs 全多头 -0.4644），
+            #    一个持续偏空的源**不需要任何择时能力**就能拿到正的 t_ind。
+            #    实测：把非重叠样本的方向随机重排（多空比例不变、收益路径不变），
+            #    纯置换的 t 均值就有 +0.52、sd 1.0 量级 —— 与三个真实源的观测
+            #    值（+0.31/+0.17/+0.67）同量级，说明旧门测到的多半是方向偏差。
+            #    更直接的反证：**纯随机方向有 14% 的概率通过旧门**（t>1.5）。
+            #    故新增要求：必须显著超过方向匹配对照（置换 p < 0.05）。
             t_ind = tb["tb_gross_nw_t_ind"]
+            p_ctrl_i = tb.get("tb_ctrl_p", float("nan"))
+            ctrl_ok = bool(np.isfinite(p_ctrl_i) and p_ctrl_i < 0.05)
             r["verified"] = bool(np.isfinite(t_ind) and t_ind > 1.5
                                  and tb["tb_n_independent"] >= 30
-                                 and tb["tb_gross_ind"] > 0)   # 必须为正
-            r["tier"] = ("strong" if (np.isfinite(t_ind) and t_ind > 2.0)
+                                 and tb["tb_gross_ind"] > 0   # 必须为正
+                                 and ctrl_ok)                # 必须胜过方向对照
+            r["tier"] = ("strong" if (np.isfinite(t_ind) and t_ind > 2.0 and ctrl_ok)
                          else ("weak" if r["verified"] else "rejected"))
+            # ---- `measurable`：该源**能不能测**，与"显不显著"是两回事 ----
+            # ⚠️ 这里刻意**不**用 `verified`。`verified` 是显著性判定：本窗口
+            #    三源 skill 为 −0.19/−0.35/+0.17，独立样本仅 316~380，
+            #    而 80% 功效需要真实 t ≥ 2.80 —— 测不出显著**不等于**测不了。
+            #    把"不显著"当成"不可测"，就会让权重全 0、系统永不开仓
+            #    （这正是被修掉的缺陷）。`measurable` 只看有没有真实历史
+            #    数据可跑：有 Close 序列能算分数并回测 → 可测。
+            #    openmobius_smc 是离线桩（无历史回放）→ 下面单独强制 False。
+            r["measurable"] = bool(np.isfinite(t_ind) and tb["tb_n_independent"] > 0)
         results.append(r)
         cog = r.get("cost_over_gross")
         cog_s = f"{cog:.1f}x" if cog else "—"
@@ -539,35 +638,90 @@ def main() -> None:
           f"{r['norm_mean']:>+7.3f}  (验收: ∈[−0.3,+0.3])")
 
     p("\n" + "=" * 96)
-    p("C. 结论：哪些源可以拿到非零权重")
+    p("C. 结论：各源拿到多少权重")
     p("=" * 96)
     p("")
-    p("判定规则（**triple_barrier + 非重叠**，这是与实盘收益同分布、且样本独立的度量）：")
+    p("判定规则（**triple_barrier + 非重叠 + 方向匹配对照**）：")
     p("  非重叠毛 NW-t > 1.5 且 非重叠毛均值 > 0 且独立样本 ≥ 30")
+    p("  **且 置换 p < 0.05**（必须胜过「同样多空比例、方向随机重排」的对照）")
+    p("")
+    p("  为什么必须加最后一条：本窗口是趋势市（全多头毛收益 -0.46 USD/笔，")
+    p("  全空头 +0.57 USD/笔），持续偏空的源**不需要任何择时能力**就能")
+    p("  拿到正的 NW-t。实测纯随机方向有 14% 概率通过只看 t>1.5 的旧门。")
+    p("")
+    p("  ⚠️ **但 `verified` 不决定权重，只决定「能不能证明它强」。**")
+    p("     本窗口独立样本仅 316~380，双侧 0.05 下要 80% 功效需要真实")
+    p("     t ≥ 2.80 —— 测不出显著**不等于**没有技能。所以权重由")
+    p("     `weights.py` 的 DerSimonian-Laird 收缩算出：")
+    p("       skill_i = t_i − 方向匹配对照均值_i")
+    p("       tau^2 = max(0, (Q − df)/C),  lambda = tau^2/(tau^2 + 1)")
+    p("       w_i = lambda·(skill_i/skill_max)^2·W_SCALE + (1−lambda)·W_SCALE")
+    p("     lambda = 0 → 源间差异不显著于噪声 → 等权（不拟合噪声）")
+    p("     lambda → 1 → 差异确凿 → 完全采用实测排序")
     p("")
     verified = [r for r in results if r["verified"]]
+    skills = []
     for r in results:
-        mark = "✅ 已验证" if r["verified"] else "❌ 未验证 → 权重 0"
+        mark = "已证实" if r["verified"] else "未证实（不等于没技能）"
         ind = r.get("tb_gross_nw_t_ind", float("nan"))
         ov = r.get("tb_overlap", float("nan"))
         nind = r.get("tb_n_independent", 0)
-        p(f"  {r['name']:<22} {mark}  "
-          f"(非重叠毛NW-t={ind:+.2f}, 独立样本={nind}, 重叠={ov:.0f}x)")
+        cm = r.get("tb_ctrl_mean", float("nan"))
+        cp = r.get("tb_ctrl_p", float("nan"))
+        lr = r.get("tb_long_ratio_ind", float("nan"))
+        sk = r.get("skill", float("nan"))
+        if r["name"] != "openmobius_smc":
+            skills.append(float(sk))
+        p(f"  {r['name']:<22} {mark}")
+        p(f"  {'':<22}   非重叠毛NW-t={ind:+.2f}  独立样本={nind}  重叠={ov:.0f}x")
+        p(f"  {'':<22}   对照(同多空比 {lr:.1%} 随机重排) 均值={cm:+.2f}  "
+          f"置换p={cp:.3f}  {'通过' if (np.isfinite(cp) and cp < 0.05) else '未通过'}")
+        p(f"  {'':<22}   skill = t − 对照均值 = {sk:+.3f}")
+    p("")
+    # 现场复算 lambda，让结论自洽可验证
+    if len(skills) >= 2:
+        k = len(skills)
+        th = float(np.mean(skills))
+        q = float(sum((x - th) ** 2 for x in skills))
+        df = k - 1
+        c = float(k - 1)
+        tau2 = max(0.0, (q - df) / c) if c > 0 else 0.0
+        lam = tau2 / (tau2 + 1.0)
+        p(f"  DL 复算：k={k}  Q={q:.4f}  df={df}  tau^2={tau2:.4f}  lambda={lam:.4f}")
     p("")
     if verified:
-        p(f"  → {len(verified)} 个源拿到非零权重: {[r['name'] for r in verified]}")
+        p(f"  → {len(verified)} 个源已**证实**有效: {[r['name'] for r in verified]}")
+        p("     它们按实测 skill 拿权重（lambda 越接近 1，实测排序影响越大）。")
+        p("     **未证实**的源仍然拿到权重：lambda 由全部可测源共同决定，")
+        p("     未证实只说明样本量不足以证明它强，不构成把它打成 0 的依据。")
     else:
-        p("  ⚠️ **没有任何源通过非重叠检验。**")
-        p("     这意味着在 1m 入场 + 1h ATR 止损的设定下，")
-        p("     本仓库现有信号源没有可证实的预测技能。")
-        p("     此时权重退回 research/18 §P0-2 的基线表（见 weights.BASELINE_IR），")
-        p("     而不是全 0 —— 全 0 会让系统永不开仓，那是失败状态而非安全状态。")
+        p("  ⚠️ **没有任何源通过「非重叠 + 方向匹配对照」检验（即未证实）。**")
+        p("     这不等于「没有技能」：独立样本只有 316~380，")
+        p("     双侧 0.05 下要 80% 功效需要真实 t ≥ 2.80，而实测 t 仅")
+        p("     +0.31/+0.17/+0.67 —— 是**分辨不出来**，不是**测不出东西**。")
+        p("")
+        p("     后续行为（weights.py，**没有开关**，纯估计量）：")
+        p("       · 权重要么来自实测 skill、要么来自等权先验，两者始终按")
+        p("         `lambda` 混合，没有「用哪张表」的二选一。")
+        p("       · 本窗口 skill = −0.19/−0.35/+0.17 → Q≈0.14 < df=2")
+        p("         → tau^2 = 0 → lambda = 0 → **三个可测源等权**。")
+        p("         这是数据给出的答案，不是兜底常数。")
+        p("       · 系统照常开仓（Σw = 12 → σ = 0.289 ≤ sigma_max 0.8），")
+        p("         但风险层按「未校准模式」降仓：低置信度 → 小仓位，")
+        p("         而不是零交易（一个不交易的交易系统不是安全，是失败）。")
+        p("       · openmobius_smc 仍为 0 权重：不是「不显著」，而是")
+        p("         Mobius API **无历史回放**，离线桩的结果无法用于校准。")
     p("")
     p("  ⚠️ 重要：**重叠会把噪声伪装成 alpha。**")
-    p("     chanlun 信号在 15 根 1m 上重复 → 46559 笔「交易」实际只对应")
-    p("     少量独立决策。不校正重叠时毛 NW-t=+3.32（看起来是强 alpha），")
-    p("     校正后跌到 0 附近。research/11 早已提醒「任何毛收益数字都必须")
-    p("     用同一价格路径上的随机方向基准来校准」，重叠校正是同一原则的延伸。")
+    p("     信号在相邻 bar 上重复（如 chanlun 的 15m 结果映射到 15 根 1m）")
+    p("     → 大量「交易」实际只对应少量独立决策。不校正重叠时毛 NW-t")
+    p("     可达 +3 量级（看起来是强 alpha），校正后跌到 0 附近。")
+    p("     research/11 早已提醒「任何毛收益数字都必须用同一价格路径上的")
+    p("     随机方向基准来校准」，重叠校正是同一原则的延伸。")
+    p("")
+    p("  ⚠️ 另一件同样重要的事：**去重叠还不够，必须再控制方向偏差。**")
+    p("     本窗口是趋势市，一个持续偏空的源不需要择时能力就能拿到正 t。")
+    p("     故判定门额外要求「置换 p < 0.05」（见上方逐源输出）。")
 
     p("")
     p(f"试验族规模 N = {TRIALS}（必须显式记录，DSR 需要）")
@@ -580,13 +734,17 @@ def main() -> None:
             "horizon_bars_1m": args.horizon,
             "cost_usd": COST,
             "bars": int(len(d)),
-            "note": ("openmobius_smc 的 IR 由离线桩产出（Mobius API 无历史回放），"
-                     "verified 恒为 false；补齐真实历史校准前其权重必须为 0。"),
+            "note": ("openmobius_smc 无历史回放（Mobius API 不提供），其分数来自"
+                     "离线桩，故 measurable=false → 权重恒为 0。其余源 measurable=true，"
+                     "权重由 weights.py 用 DL 收缩（lambda）在实测 skill 与等权先验"
+                     "之间连续混合，无开关。"),
             "sources": {r["name"]: r for r in results},
         }
-        # openmobius 无历史回放 → 强制 verified=False（不因桩的偶然表现拿到权重）
+        # openmobius 无历史回放 → 强制 verified=False + measurable=False
+        # （不因桩的偶然表现拿到权重；这是"测不了"，不是"不显著"）
         payload["sources"]["openmobius_smc"]["verified"] = False
         payload["sources"]["openmobius_smc"]["tier"] = "rejected"
+        payload["sources"]["openmobius_smc"]["measurable"] = False
         IR_PATH.parent.mkdir(parents=True, exist_ok=True)
         IR_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                            encoding="utf-8")
@@ -596,8 +754,13 @@ def main() -> None:
         p(f"   其中 verified=True 的源: {n_ok} 个"
           f"（openmobius_smc 恒为 false：无历史回放）")
 
-    (RES / "21_source_ir.txt").write_text("\n".join(OUT), encoding="utf-8")
-    print(f"\n[saved] {RES / '21_source_ir.txt'}", flush=True)
+    # ⚠️ 输出文件名带上数据来源：历史上这里固定写 `21_source_ir.txt`，
+    #    换数据重跑就会**静默覆盖**已有取证（本次实测踩到：扩展数据的
+    #    结果把基线那份覆盖了）。基线那份现在叫 `21_source_ir_baseline.txt`。
+    _stem = "21_source_ir" if args.data == "XAUUSDm_1m.parquet" \
+        else "21_source_ir_" + Path(args.data).stem.replace("XAUUSDm_1m_", "")
+    (RES / f"{_stem}.txt").write_text("\n".join(OUT), encoding="utf-8")
+    print(f"\n[saved] {RES / f'{_stem}.txt'}", flush=True)
 
 
 if __name__ == "__main__":

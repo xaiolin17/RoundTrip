@@ -186,6 +186,22 @@ class RiskConfig:
     max_drawdown_deleverage_pct: float = _TOML.get("risk", {}).get("max_drawdown_deleverage_pct", 0.08)
     margin_use_cap: float = _TOML.get("risk", {}).get("margin_use_cap", 0.60)
     news_blackout_min: int = _TOML.get("risk", {}).get("news_blackout_min", 15)
+    #: 新闻高危窗口熔断是否生效。
+    #: ⚠️ 原实现把 `high_risk_window=False` 写死在 gate.py 的调用处，于是
+    #: `CircuitBreakers` 里的 `news_high_risk_window` 分支**从未触发过**，
+    #: 上面的 `news_blackout_min` 也成了无人读取的死配置。注释声称
+    #: 「news 高危由 decision 传入 flags」，但 decision 层只做 hold/降手数，
+    #: 并不回传熔断标志 —— 这条熔断实际是被静默摘掉的。
+    #: 改为可配置，**默认仍为 false**（保持既有行为，不在本次顺手改变风控松紧），
+    #: 但至少可被显式打开、且这个"关着"的事实是可观测的。
+    news_high_risk_window: bool = _TOML.get("risk", {}).get(
+        "news_high_risk_window", False)
+    #: 缠论/结构冲突判定的"贴脸"阈值（ATR 倍数）。
+    #: ⚠️ 原为 levels.py 里 6 处硬编码 `0.3 * atr`，是实测 180 次
+    #: `fusion_vs_levels_conflict` 拒绝里 159 次的**唯一驱动常数**，
+    #: 却无法调参。同等地位的 structure_sl_min_atr / level_pad_atr
+    #: 早已走配置，此处补齐。
+    conflict_atr_mult: float = _TOML.get("risk", {}).get("conflict_atr_mult", 0.3)
     max_holding_h: float = _TOML.get("risk", {}).get("max_holding_h", 48.0)
     # ---- P2-2 方向偏置熔断：近 N 笔同向占比超阈值 → 停机复查 ----
     direction_bias_window: int = _TOML.get("risk", {}).get("direction_bias_window", 100)
@@ -213,6 +229,21 @@ class DecisionConfig:
     reserve_min_profit: float = _TOML.get("decision", {}).get("reserve_min_profit", 5.0)
     reserve_drop_score: float = _TOML.get("decision", {}).get("reserve_drop_score", 0.6)
     loop_interval_s: float = _TOML.get("decision", {}).get("loop_interval_s", 60.0)
+    #: 权重未校准时的**降仓系数**（用户 2026-09-29 选定）。
+    #:
+    #: 背景：`fusion/weights.py` 用 DerSimonian-Laird 收缩分配权重——
+    #: `w = lambda·实测 + (1−lambda)·等权`。本窗口源间差异不显著于抽样
+    #: 噪声（Q≈0.14 < df=2 → tau^2=0 → lambda=0），故三个可测源等权、
+    #: 系统照常开仓。但"分不出源的高下"意味着**置信度低**，
+    #: 正确的表达位置是**仓位**，不是"开/不开"这个二值开关：
+    #: 低置信度 → 小仓位，而不是零交易。
+    #:
+    #: 取 0.5 的理由：与同层的 `disagreement_lot_mult` / `news_impact_lot_mult`
+    #: 同量级（都是"证据不足时减半"）。lambda ≥ LAMBDA_CALIBRATED 后
+    #: 数据已能排序，本系数不再生效（自动恢复全仓）。
+    uncalibrated_lot_mult: float = _TOML.get("decision", {}).get(
+        "uncalibrated_lot_mult", 0.5)
+    #: 校准可选的前置条件（见 fusion/weights.py 的收缩估计量）。
     disagreement_lot_mult: float = _TOML.get("decision", {}).get("disagreement_lot_mult", 0.5)
     # ---- P1-2 波动 regime 闸：只在 σ 位于滚动高分位时开仓 ----
     vol_pct_min: float = _TOML.get("decision", {}).get("vol_pct_min", 0.0)
@@ -254,6 +285,11 @@ class DecisionConfig:
 class Config:
     trade_mode: str = os.getenv("TRADE_MODE", "live")          # live | dry_run
     max_lot: float = float(os.getenv("MAX_LOT", "0.01"))
+    #: 加仓单层手数。原为 gate.py 里 6 处硬编码 0.01（含上限判定），
+    #: 与 `MAX_LOT=0.06` 撞车导致 add_no 的 4/5 层永不可达（153 次空转）。
+    add_layer_lots: float = float(os.getenv("ADD_LAYER_LOTS", "0.01"))
+    #: 交易所最小手数（低于此值无法下单）。用于判定"剩余额度还能不能加"。
+    min_lot: float = float(os.getenv("MIN_LOT", "0.01"))
     project_root: Path = PROJECT_ROOT
     data_dir: Path = PROJECT_ROOT / "data" / "cache"
     log_dir: Path = PROJECT_ROOT / "logs"

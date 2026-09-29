@@ -487,3 +487,85 @@ def test_direction_bias_records_string_and_int():
     b.record_direction(None)      # 未知方向不计入
     assert len(b.recent_directions) == 4
     assert b.recent_directions == [1, 1, -1, -1]
+
+
+def test_news_high_risk_breaker_is_configurable_not_hardcoded():
+    """新闻高危熔断必须可配置 —— 原为 `high_risk_window=False` 写死。
+
+    实测缺陷：`gate.py` 调用 `breakers.check(..., high_risk_window=False)`
+    把参数写死，于是 `CircuitBreakers` 里 `news_high_risk_window` 分支
+    **从未触发过一次**，配套的 `CFG.risk.news_blackout_min` 也成了
+    无人读取的死配置。代码注释声称「news 高危由 decision 传入 flags」，
+    但 decision 层只做 hold/降手数，并不回传任何熔断标志 ——
+    这条熔断实际是被静默摘掉的，且在配置里完全不可见。
+
+    本测试锁住两点：
+      1. 存在一个配置项控制它（不再是写死的字面量）
+      2. 默认值维持 false —— 本次只修"不可观测/不可配置"，
+         **不擅自改变风控松紧**
+    """
+    assert hasattr(CFG.risk, "news_high_risk_window"), (
+        "新闻高危熔断必须由配置控制，不能写死在 gate.py 调用处")
+    assert CFG.risk.news_high_risk_window is False, (
+        "默认必须保持 false（保持既有行为）；要启用请在 config.toml 显式打开")
+
+
+def test_news_high_risk_window_actually_triggers_when_enabled():
+    """打开配置后，该熔断必须真的会拦（证明它不是死代码）。"""
+    b = CircuitBreakers()
+    # 有新闻高危窗口时，check 应返回 news_high_risk_window（而非 None）
+    rej = b.check(10000, 0.0, True)
+    assert rej is not None and "news" in rej, (
+        f"high_risk_window=True 时应触发新闻熔断，实际返回 {rej!r}")
+    # 关闭时不得触发（默认路径）
+    assert b.check(10000, 0.0, False) is None
+
+
+def test_add_layer_room_uses_config_not_hardcoded_lot():
+    """加仓额度必须按「剩余额度」判定，而不是拿硬编码 0.01 去比上限。
+
+    实测缺陷（153 次 `max_lot cap` 全部来自这里）：
+    每层固定 0.01、上限 MAX_LOT=0.06，于是第 6 层起必然
+    `my_lots + 0.01 > 0.06`。实际成功加仓 106 次，add_no 最高只到 3，
+    **声明允许的 4/5 两层永远不可达**；09-29 当天 109 次判定全部失败、
+    0 次成功 —— 加仓路径沦为每轮空转并消耗一次决策。
+
+    修法：`room = max_lot - used`，只有 `room < min_lot` 才是真的加无可加。
+    """
+    assert hasattr(CFG, "add_layer_lots"), "加仓手数须走配置（原为硬编码 0.01）"
+    assert hasattr(CFG, "min_lot"), "须有最小手数配置用于判定剩余额度"
+
+    def allowed(used: float) -> bool:
+        room = CFG.max_lot - used
+        return round(min(CFG.add_layer_lots, room), 2) >= CFG.min_lot
+
+    # 旧规则 `used + 0.01 > max_lot` 会在 used=0.05 时放行、0.06 时拒绝；
+    # 新规则在 still-room 时放行，耗尽时拒绝。
+    assert allowed(0.0), "空仓必须能加第一层"
+    for used in (0.01, 0.02, 0.03, 0.04, 0.05):
+        assert allowed(used), (
+            f"已用 {used} 时仍有余量，必须允许加仓 —— 旧规则在这里把 "
+            f"4/5 层永久锁死")
+    assert not allowed(CFG.max_lot), "额度耗尽必须拒绝"
+
+
+def test_max_adds_ladder_is_reachable_under_max_lot():
+    """声明的 max_adds_per_position 层数必须在 MAX_LOT 下真的走得完。
+
+    旧实现：5 层 × 0.01 = 0.05 < 0.06，看起来够；但因为判定用的是
+    `used + 0.01 > 0.06`（每层都重新比一次硬编码值），实际在第 6 次
+    判定时就撞顶，add_no 从未到达 4/5。这里用纯算术证明新规则可达。
+    """
+    used = 0.0
+    layers = []
+    for i in range(CFG.risk.max_adds_per_position):
+        room = CFG.max_lot - used
+        lots = round(min(CFG.add_layer_lots, room), 2)
+        if lots < CFG.min_lot:
+            break
+        used += lots
+        layers.append(i + 1)
+    assert len(layers) == CFG.risk.max_adds_per_position, (
+        f"在 MAX_LOT={CFG.max_lot} × 每层 {CFG.add_layer_lots} 下只加得动 "
+        f"{len(layers)} 层，但配置声明允许 {CFG.risk.max_adds_per_position} 层")
+

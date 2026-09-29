@@ -114,18 +114,37 @@ class RiskGate:
         r = ev.result
         # ---------- 熔断 ----------
         margin_used = (account.margin / max(account.equity, 1e-9))
+        # --- 新闻高危窗口：原为硬编码 False，等于**永久禁用**这条熔断 ---
+        # 实测：`high_risk_window=False` 写死后，`CircuitBreakers` 里
+        # `news_high_risk_window` 分支从未触发过一次；配套的
+        # `CFG.risk.news_blackout_min` 也成了无人读取的死配置。
+        # 注释说「news 高危由 decision 传入 flags」，但 decision 层只把新闻
+        # 影响度做成 hold/降手数（machine.py），并不回传任何熔断标志 ——
+        # 也就是说这条熔断实际上被静默摘掉了，而不是"由别处接管"。
+        # 现改为按配置驱动，默认仍为 false，保持行为不变，但**可被显式打开**。
         reject = self.breakers.check(account.equity, margin_used,
-                                     high_risk_window=False)  # news 高危由 decision 传入 flags
+                                     high_risk_window=CFG.risk.news_high_risk_window)
         if reject:
             return Approved(ok=False, reason=f"circuit: {reject}")
         # ---------- 分歧加严 ----------
         if r.disagreement:
-            reasons.append("disagreement: lots x0.5")
+            reasons.append(f"disagreement: lots x{CFG.decision.disagreement_lot_mult}")
 
         if prop.kind == "open_market":
             vol_k = volatility_k(realized_vol, None)
             if r.disagreement:
                 vol_k *= CFG.decision.disagreement_lot_mult
+            # ---- 未校准模式：低置信度 → 小仓位 ----
+            # `weights.py` 的 DL 收缩若给出 lambda < LAMBDA_CALIBRATED，
+            # 说明当前样本分辨不出源的高下（等权先验）。这**不是**
+            # 不开仓的理由（把统计功效不足做成开关，正是被修掉的缺陷），
+            # 而是**降仓**的理由：置信度低 → 仓位小。
+            # 该系数随 lambda 自动失效：数据足以排序后不再降仓。
+            if getattr(ev, "uncalibrated", False):
+                vol_k *= CFG.decision.uncalibrated_lot_mult
+                reasons.append(
+                    f"权重未校准（收缩系数 {ev.weight_lambda:.3f}）"
+                    f" -> lots x{CFG.decision.uncalibrated_lot_mult}")
             # ---- news「独立证据」通道：重大事件 → 手数降级 ----
             # news 不影响方向（无实测 IR，不投票），只按 LLM 给出的
             # 事件影响度收缩仓位。影响度更高的档位已在 decision 层直接 hold。
@@ -183,8 +202,23 @@ class RiskGate:
             if adds_count >= CFG.risk.max_adds_per_position:
                 return Approved(ok=False, reason=f"adds capped at {CFG.risk.max_adds_per_position}")
             my_lots = sum(p.volume for p in positions.positions if p.magic == CFG.mt5.magic)
-            if my_lots + 0.01 > CFG.max_lot:
-                return Approved(ok=False, reason=f"max_lot cap: {my_lots:.2f}+0.01 > {CFG.max_lot}")
+            # --- 加仓手数：原为硬编码 0.01，且上限判定也用同一个字面量 ---
+            # 实测问题（153 次 `max_lot cap` 全部来自这里）：
+            # `max_adds_per_position = 5` 声明允许加 5 层，但每层固定 0.01、
+            # 上限 `MAX_LOT = 0.06`，于是第 6 层起必然 `my_lots+0.01 > 0.06`。
+            # 实际成功加仓 106 次，add_no 最高只到 3，**4/5 两层永远不可达**；
+            # 09-29 当天 109 次判定全部失败、0 次成功 —— 加仓路径沦为
+            # 每轮空转并消耗一次决策。
+            # 改为按**剩余额度**推导本次可加手数：只有剩余确实不足
+            # 最小手数时才算"加无可加"（真正的资金上限），而不是固定拿 0.01
+            # 去比。这样 add_no 的 5 层阶梯重新可达。
+            room = CFG.max_lot - my_lots
+            add_lots = round(min(CFG.add_layer_lots, room), 2)
+            if add_lots < CFG.min_lot:
+                return Approved(
+                    ok=False,
+                    reason=f"max_lot cap: 已用 {my_lots:.2f} 上限 {CFG.max_lot} "
+                           f"剩余 {room:.2f} < 最小手数 {CFG.min_lot}")
             # ⚠️ 加仓必须自带 SL/TP。
             # 原实现 plan 里没有 tp/sl，executor 用 `plan.tp or 0.0` →
             # 加仓仓位开出来就是 SL=0 TP=0 的**裸仓**（实测 3 个裸仓全来自加仓）。
@@ -197,13 +231,13 @@ class RiskGate:
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
             plan = {"kind": "add_layer", "direction": prop.direction,
-                    "lots": 0.01, "position_ticket": prop.entry,
+                    "lots": add_lots, "position_ticket": prop.entry,
                     "entry": round(ref, 3),
                     "tp": lv.tp, "sl": lv.sl, "reasons": reasons,
                     "sl_source": lv.sl_source, "tp_source": lv.tp_source,
                     "sl_dist": lv.sl_dist}
             trade_log({"event": "risk_decision", "kind": "add_layer",
-                       "direction": prop.direction, "lots": 0.01,
+                       "direction": prop.direction, "lots": add_lots,
                        "position": position_id, "score": round(r.score, 3),
                        "entry_ref": plan["entry"], "tp": plan["tp"], "sl": plan["sl"],
                        "sl_source": lv.sl_source, "sl_dist": lv.sl_dist,
@@ -245,6 +279,12 @@ class RiskGate:
             vol_k_grid = volatility_k(realized_vol, None)
             if r.disagreement:
                 vol_k_grid *= CFG.decision.disagreement_lot_mult
+            # 未校准模式与 open_market 同口径（见上）：只降仓，不开/关闸。
+            if getattr(ev, "uncalibrated", False):
+                vol_k_grid *= CFG.decision.uncalibrated_lot_mult
+                reasons.append(
+                    f"权重未校准（收缩系数 {ev.weight_lambda:.3f}）"
+                    f" -> lots x{CFG.decision.uncalibrated_lot_mult}")
             base_lots, rej = position_lots(account.equity, atr, point_value_per_lot, 0.5,
                                            vol_k=vol_k_grid, sl_dist=lv.sl_dist or None)
             if rej:
