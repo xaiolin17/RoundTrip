@@ -16,14 +16,22 @@ from gold_agent.fusion.engine import FusedEvidence, FusionResult
 from gold_agent.mt5.client import PositionRow, PositionsView
 from gold_agent.news.collector import NewsView
 from gold_agent.risk.gate import RiskGate
-from gold_agent.risk.grid import GridState
 from gold_agent.risk.position import CircuitBreakers
 
-# 越过开仓阈值的分数。**从 config 派生，不硬编码** ——
-# open_threshold 历史上在 1.2/1.3/1.6 之间变动过（P2-1 参数门会回滚它），
-# 硬编码会让测试随参数回滚而静默失效。
-ABOVE = CFG.decision.open_threshold + 0.4
-BELOW = CFG.decision.open_threshold - 0.4
+# 开/平仓判定用 **z 尺度**（z = S_eff / σ），不是融合分绝对值。
+# ⚠️ 为什么改（2026-09-29 第四次修正，用户指出）：
+#   融合分是**加权平均** S = Σwμ/Σw，故 sd(S) = 1/√Σw = sigma。
+#   旧实现用绝对常数比它（|S| ≥ 1.3），于是同一行代码的含义随权重漂移：
+#     Σw=4.17（旧冻结基线）→ σ=0.4895 → 实为 |z| ≥ 2.66
+#     Σw=12.0（等权收缩）  → σ=0.2887 → 实为 |z| ≥ 4.50
+#   即**权重越大（越有把握）反而越难开仓**，方向正好反了。
+#   用户原话：「本来要改的就是权重影响开仓 但是权重即会增大也会减小才对」。
+#
+# 夹具因此也从 z_min 派生（**不硬编码**）：sigma 固定、分数按 z 反算，
+# 这样 z_min 被参数门回滚时测试自动跟随，不会静默失效。
+_SIGMA = 0.3                                   # 夹具固定标准差
+ABOVE = CFG.decision.z_min * _SIGMA + 0.4      # z 明显越过开仓门
+BELOW = CFG.decision.z_min * _SIGMA - 0.4      # z 明显不足
 
 
 def _ctx(score: float, sigma: float = 0.3, holding: list[PositionRow] | None = None,
@@ -71,7 +79,7 @@ def test_mid_center_blocks_new_position():
     实测 123/127 笔真实单子走 `open_market`（entry=市价），全链路不读中枢，
     配对零假设检验显示择时与"随机时刻入场"无法区分（56.6% vs 57.1%）。
     """
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     # 中枢 [4120,4140] 的正中 4130 -> pos=0.50 -> 必须拦
     p = e.decide(_center_ctx(4130.0, ABOVE))
     assert p.kind == "hold", f"中枢中部应被拦，实际 {p.kind}"
@@ -80,7 +88,7 @@ def test_mid_center_blocks_new_position():
 
 def test_center_edges_and_breakouts_are_allowed():
     """贴边（两端）与突破（已离开中枢）都必须放行 —— 这正是用户要的两种单子。"""
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     for px, label in ((4120.0, "贴下沿 zd"), (4124.0, "近 zd 端"),
                       (4136.0, "近 zg 端"), (4140.0, "贴上沿 zg"),
                       (4110.0, "跌破 zd（向下突破）"),
@@ -95,7 +103,7 @@ def test_center_gate_is_conservative_when_data_missing():
     宁可维持现状，也不因为缺中枢数据把系统变成永不开仓。
     退化中枢（zg==zd，实测 1m 占 18%）同样视为拿不到。
     """
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     # 1) 完全没缠论数据
     p1 = e.decide(_ctx(score=ABOVE))
     assert p1.kind != "hold", f"无中枢数据应放行，实际 {p1.kind}"
@@ -112,7 +120,7 @@ def test_center_gate_is_conservative_when_data_missing():
 
 def test_center_gate_off_restores_old_behaviour():
     """闸可关闭（可回滚）：关掉后中部恢复开仓。"""
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     old = CFG.risk.zhongshu_gate
     try:
         CFG.risk.zhongshu_gate = False
@@ -123,15 +131,65 @@ def test_center_gate_off_restores_old_behaviour():
 
 
 def test_flat_hold_low_score():
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
-    p = e.decide(_ctx(score=BELOW))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    p = e.decide(_ctx(score=BELOW, sigma=_SIGMA))
     assert p.kind == "hold"
-    # 阈值来自 config.toml；断言理由包含当前阈值数字
-    assert any(str(CFG.decision.open_threshold) in r for r in p.reasons)
+    # 理由必须显示**当前生效的 z 阈值**（不是已废弃的绝对阈值）
+    assert any(str(CFG.decision.z_min) in r for r in p.reasons), (
+        f"hold 理由应点名 z 阈值 {CFG.decision.z_min}，实际 {p.reasons}")
+
+
+def test_open_gate_is_z_scaled_so_weight_direction_is_correct():
+    """开仓门必须是 **z 尺度**：权重↑ → σ↓ → 同样信号更容易开仓。
+
+    ⚠️ 本测试锁住的是一个**方向性**错误（2026-09-29 用户指出）：
+    融合分 S 是加权平均，`sd(S) = 1/√Σw = sigma`。
+    旧实现用绝对常数比它，于是：
+
+        Σw=4.17 → σ=0.4895 → |S|≥1.3 实为 |z|≥2.66
+        Σw=12.0 → σ=0.2887 → |S|≥1.3 实为 |z|≥4.50
+
+    即**权重越大（越有把握）越难开仓** —— 反了。用户原话：
+    「本来要改的就是权重影响开仓 但是权重即会增大也会减小才对」。
+
+    本测试用同一个融合分，只改 sigma（=只改权重），断言开仓门随
+    **权重增大而放宽**、随权重减小而收紧 —— 双向、且方向正确。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    fixed_score = CFG.decision.z_min * 0.25      # 一个固定的融合分
+
+    # 权重小 → σ 大 → z 小 → 不开
+    heavy_sigma = 0.5
+    assert abs(fixed_score) / heavy_sigma < CFG.decision.z_min
+    assert e.decide(_ctx(score=fixed_score, sigma=heavy_sigma)).kind == "hold", (
+        "权重小（σ大）时同一个信号不应开仓")
+
+    # 权重大 → σ 小 → z 大 → 开
+    light_sigma = 0.25
+    assert abs(fixed_score) / light_sigma >= CFG.decision.z_min
+    opened = e.decide(_ctx(score=fixed_score, sigma=light_sigma))
+    assert opened.kind in ("open_market", "place_grid"), (
+        f"权重大（σ小）时同一个信号应开仓，实际 {opened.kind} —— "
+        f"说明开仓门仍是绝对的，权重影响被单向反转了")
+
+
+def test_z_score_handles_zero_sigma_without_crashing():
+    """无任何可测源（σ→0）时 z 必须是 0（不开仓），不得崩溃或 inf。
+
+    这是唯一应当空仓的情形：连一个可测源都没有。注意这与
+    "权重小" 不同 —— 后者只应**难**开仓，不应**绝对不能**开仓。
+    """
+    from gold_agent.decision.machine import z_score
+
+    assert z_score(1.5, 0.0) == 0.0
+    assert z_score(1.5, float("nan")) == 0.0
+    assert z_score(1.5, 1e-12) == 0.0
+    # 正常情形返回有限值
+    assert z_score(1.5, 0.5) == 3.0
 
 
 def test_flat_hold_high_sigma():
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     p = e.decide(_ctx(score=ABOVE, sigma=1.5))
     assert p.kind == "hold"
     assert any("标准差" in r for r in p.reasons)
@@ -166,7 +224,7 @@ def test_news_event_blocks_new_position():
     用户选定的定位：news 无实测 IR（不得投方向票），但它是有时效性的
     外部风险信息，应当影响"要不要开"。影响度 >= news_impact_block 时 hold。
     """
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     llm = {"review": {"verdict": "neutral", "confidence": 0.2},
            "news_assessment": {"sentiment": "bearish", "impact": 0.95}}
     p = e.decide(_ctx(score=ABOVE, llm=llm))
@@ -178,7 +236,7 @@ def test_news_event_blocks_new_position():
 
 def test_news_low_impact_does_not_block():
     """影响度低于阈值时不得拦截（否则等于永久禁开仓）。"""
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     llm = {"review": {"verdict": "neutral", "confidence": 0.2},
            "news_assessment": {"sentiment": "bearish", "impact": 0.35}}
     p = e.decide(_ctx(score=ABOVE, llm=llm))
@@ -187,7 +245,7 @@ def test_news_low_impact_does_not_block():
 
 def test_news_missing_assessment_is_harmless():
     """LLM 没返回 news_assessment 时不得崩、也不得拦截。"""
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     p = e.decide(_ctx(score=ABOVE, llm={"review": {"verdict": "neutral",
                                                   "confidence": 0.2}}))
     assert p.kind != "hold"
@@ -195,14 +253,14 @@ def test_news_missing_assessment_is_harmless():
 
 
 def test_flat_hold_news_high_risk():
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     p = e.decide(_ctx(score=ABOVE, high_risk=True))
     assert p.kind == "hold"
     assert any("新闻" in r for r in p.reasons)
 
 
 def test_flat_open_market_aligned_llm():
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     p = e.decide(_ctx(score=ABOVE, llm={"review": {"verdict": "bullish", "confidence": 0.75}}))
     assert p.kind == "open_market"
     assert p.direction == "LONG"
@@ -216,7 +274,7 @@ def test_flat_market_when_not_aligned():
     而 llm_align_conf=0.60），导致 open_market 提案恒为 0。
     现在只要信号够强且 LLM 未明确反对，就走市价。
     """
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     p = e.decide(_ctx(score=-ABOVE, llm={"review": {"verdict": "bullish", "confidence": 0.6}}))
     assert p.kind == "open_market"
     assert p.direction == "SHORT"
@@ -318,7 +376,7 @@ def test_holding_management_not_blocked_by_pending():
     "pending x1 waiting fill" —— **该平的仓一直没平**。
     """
     from gold_agent.mt5.client import OrderRow
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     pos = PositionRow(ticket=333, symbol="XAUUSDm", type="LONG", volume=0.01,
                       price_open=4350, sl=0, tp=0, profit=-2.59, swap=0, time=0,
                       comment="", magic=CFG.mt5.magic)
@@ -350,7 +408,7 @@ def test_pending_cancel_uses_correct_direction():
     这是本测试真正要守住的东西。
     """
     from gold_agent.mt5.client import OrderRow
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
 
     def _mk(direction):
         return OrderRow(ticket=555, symbol="XAUUSDm", type=direction, volume=0.01,
@@ -382,7 +440,7 @@ def test_pending_does_not_block_market_entry():
     现在：强信号 + 有挂单 → 撤掉旧挂单（下一轮市价进），而不是死等。
     """
     from gold_agent.mt5.client import OrderRow
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     pend = OrderRow(ticket=666, symbol="XAUUSDm", type="SHORT", volume=0.01,
                     price_open=4340, sl=0, tp=0, time_setup=0, comment="",
                     magic=CFG.mt5.magic)
@@ -404,7 +462,7 @@ def test_aligned_is_not_required_for_market_entry():
     **open_market 是死代码**（历史提案数 = 0）。
     现在只要信号够强且 LLM 未明确反对即可市价开仓。
     """
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     # 实测最常见的形状：neutral / 0.35
     p = e.decide(_ctx(score=ABOVE,
                       llm={"review": {"verdict": "neutral", "confidence": 0.35}}))
@@ -421,7 +479,7 @@ def test_aligned_is_not_required_for_market_entry():
 
 def test_pending_only_in_mean_revert():
     """用户选定：仅均值回归 regime 挂单，其余市价开仓。"""
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     llm = {"review": {"verdict": "neutral", "confidence": 0.35}}
     p = e.decide(_ctx(score=ABOVE, regime="trending", llm=llm))
     assert p.kind == "open_market", "趋势行情应市价开仓"
@@ -430,7 +488,7 @@ def test_pending_only_in_mean_revert():
 
 
 def test_holding_exit_streak():
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     pos = PositionRow(ticket=111, symbol="XAUUSDm", type="LONG", volume=0.01,
                       price_open=4350, sl=0, tp=0, profit=0, swap=0, time=0,
                       comment="", magic=CFG.mt5.magic)
@@ -443,7 +501,7 @@ def test_holding_exit_streak():
 
 
 def test_holding_llm_adverse_close():
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     pos = PositionRow(ticket=222, symbol="XAUUSDm", type="SHORT", volume=0.01,
                       price_open=4350, sl=0, tp=0, profit=0, swap=0, time=0,
                       comment="", magic=CFG.mt5.magic)
@@ -453,7 +511,7 @@ def test_holding_llm_adverse_close():
 
 
 def test_safe_hold_on_error():
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     # 触发异常：positions 里放非法对象
     p = e.decide(_ctx(score=ABOVE, holding=["bad-object"]))
     assert p.kind == "hold"
@@ -476,7 +534,7 @@ def test_baseline_prevents_structural_long():
     实测融合分均值 +0.52、80.2% 为正（research/16_live_audit.txt）。
     S=+0.52 在旧逻辑下会被当成偏多；减去基线后 S_eff=0 → 应 hold。
     """
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     # 原始 S = 1.0，基线 S0 = 1.0 → S_eff = 0 → hold
     p = e.decide(_ctx(score=1.0, baseline=1.0,
                       llm={"review": {"verdict": "bullish", "confidence": 0.9}}))
@@ -492,7 +550,7 @@ def test_baseline_shifts_direction_decision():
     回滚到 1.6 后 |S_eff| 就不再越线）。这里验证的是**基线校正机制**。
     """
     thr = CFG.decision.open_threshold
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     # 原始 S 看似看多（> 0），基线把它压到 −(thr+0.3) → 翻成看空
     s0 = 2.5
     s = s0 - (thr + 0.3)
@@ -509,7 +567,7 @@ def test_baseline_shifts_direction_decision():
 def test_low_vol_regime_blocks_entry(monkeypatch):
     """P1-2：波动分位低于门槛时不开仓（唯一不依赖方向预测的杠杆）。"""
     monkeypatch.setattr(CFG.decision, "vol_pct_min", 0.5, raising=False)
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     p = e.decide(_ctx(score=ABOVE, vol_pct=0.2,
                       llm={"review": {"verdict": "bullish", "confidence": 0.9}}))
     assert p.kind == "hold"
@@ -518,7 +576,7 @@ def test_low_vol_regime_blocks_entry(monkeypatch):
 
 def test_high_vol_regime_allows_entry(monkeypatch):
     monkeypatch.setattr(CFG.decision, "vol_pct_min", 0.5, raising=False)
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     p = e.decide(_ctx(score=ABOVE, vol_pct=0.9,
                       llm={"review": {"verdict": "bullish", "confidence": 0.9}}))
     assert p.kind == "open_market"
@@ -533,7 +591,7 @@ def test_llm_opposed_blocks_entry():
     research/20：旧版 LLM 未调用时 `aligned=False` → 永远走 place_grid，
     实测 place_grid 30 次 vs open_market 16 次。现在 LLM 有实质否决权。
     """
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     p = e.decide(_ctx(score=ABOVE,
                       llm={"review": {"verdict": "bearish", "confidence": 0.9}}))
     assert p.kind == "hold", "LLM 强烈反对时不得开仓"
@@ -550,7 +608,7 @@ def test_llm_unavailable_no_default_grid(monkeypatch):
     LLM 缺失不会退化成"默认挂单"。
     """
     monkeypatch.setattr(CFG.decision, "allow_grid_without_llm", False, raising=False)
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     p = e.decide(_ctx(score=ABOVE, llm=None, llm_available=False))
     assert p.kind != "place_grid", "LLM 缺失时不应默认挂网格"
     assert p.kind == "open_market", "强信号 + 无 LLM 反对 → 市价开仓"
@@ -562,7 +620,7 @@ def test_llm_neutral_still_allows_entry():
     原断言是 `place_grid`。现在中性 verdict 不再把交易降级成挂单 ——
     实测 verdict 有 335/372 是 neutral，若中性就挂单，等于几乎只挂单。
     """
-    e = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
     p = e.decide(_ctx(score=ABOVE,
                       llm={"review": {"verdict": "neutral", "confidence": 0.3}}))
     assert p.kind == "open_market", "LLM 中性时强信号应市价开仓"
@@ -884,3 +942,51 @@ def test_sources_line_is_gbk_safe():
                         "sigma": 1.379}]})
     bad = [ch for ch in out if not _gbk_ok(ch)]
     assert not bad, f"逐源明细含 GBK 外字符 {bad!r}: {out!r}"
+
+
+def test_lot_degrade_reasons_are_visible_on_console():
+    """**降仓系数必须在控制台可见**（用户要求：不得有不可观测的"死"参数）。
+
+    事故背景：`conflict_lot_mult` / `uncalibrated_lot_mult` /
+    `disagreement_lot_mult` 这几个系数原先只把说明写进 `plan["reasons"]`，
+    而**只有被风控拦截时才打印 reasons** —— 于是下单轮次在控制台上
+    看不出手数为什么被缩小：系数调 0.5 还是 1.0，输出**一模一样**。
+    参数存在、代码读了它，但人无法观测其是否生效 —— 等价于死代码。
+    """
+    import gold_agent.runner as runner
+
+    out = runner._format_summary(10650, {
+        "score": -0.63, "action": "open_market", "last_close": 4180.05,
+        "vol_percentile": 0.31, "regime": "mean_reverting",
+        "proposal": {"kind": "open_market", "direction": "LONG"},
+        "risk": {"ok": True, "plan": {
+            "kind": "open_market", "direction": "LONG", "lots": 0.01,
+            "sl": 4150.0, "tp": 4220.0,
+            "reasons": ["紧贴压力位 4181.000（距 0.950） -> lots x0.5"]}},
+        "execution": {"ok": True, "error": ""}})
+    assert "紧贴压力位" in out, f"降仓说明未出现在控制台: {out!r}"
+    assert "lots x0.5" in out, f"降仓系数未出现在控制台: {out!r}"
+    # 必须在**下单轮次**可见（不是只有被拦截时）
+    assert "【执行成功】" in out, f"这是下单轮次: {out!r}"
+    # 且仍须 GBK 安全
+    bad = [ch for ch in out if not _gbk_ok(ch)]
+    assert not bad, f"降仓说明含 GBK 外字符 {bad!r}: {out!r}"
+
+
+def test_lot_reasons_not_printed_when_absent():
+    """没有降仓说明时不得凭空多打一段方括号（避免噪音）。
+
+    注意 `[第N轮]` 本身就是方括号，所以只断言**手数明细行**上
+    不出现 `lots x` 这类降仓标记。
+    """
+    import gold_agent.runner as runner
+
+    out = runner._format_summary(1, {
+        "score": 1.0, "action": "open_market", "last_close": 4180.0,
+        "proposal": {"kind": "open_market", "direction": "LONG"},
+        "risk": {"ok": True, "plan": {"kind": "open_market", "direction": "LONG",
+                                      "lots": 0.01, "sl": 4150.0, "tp": 4220.0}},
+        "execution": {"ok": True, "error": ""}})
+    detail = out.split("\n")[-1]
+    assert "lots x" not in detail, f"无降仓时不应出现降仓标记: {detail!r}"
+    assert "  [" not in detail, f"无降仓时不应附加方括号段: {detail!r}"

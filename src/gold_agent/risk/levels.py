@@ -64,6 +64,11 @@ class TradeLevels:
     #: 用到的压力/支撑位
     used_sl_level: float | None = None
     used_tp_level: float | None = None
+    #: 「紧贴反向位」标记：非空时表示结构不利，由 gate 决定降仓（不再硬拒）。
+    #: 取值 "resistance"（做多贴压力）| "support"（做空贴支撑）。
+    conflict_side: str = ""
+    conflict_level: float | None = None
+    conflict_dist: float = 0.0
     notes: list[str] = field(default_factory=list)
 
 
@@ -427,12 +432,20 @@ def trade_levels(direction: str, entry: float, review: dict | None,
                 out.notes.append(
                     f"压力位 {near_res:.3f} 与支撑纠缠（噪音区），跳过贴脸判定")
             else:
-                out.reason = "fusion_vs_levels_conflict"
+                # ⚠️ 由**硬拒**改为**标记 + 降仓**（用户选定，见 CFG.risk.conflict_lot_mult）。
+                # 实证：贴脸组与对照组的远期收益无统计差异（全部 |t|<1.96），
+                # 而原实现把 205 个强信号（|z|>=2.66）100% 挡掉 ——
+                # 相当于用一条无证据支持的规则否决了全部高分信号。
+                # 语义上也讲不通：做多时上方压力位**正是止盈目标**，
+                # 只要它在 min_rr 之外就完全不构成冲突（后者在下文照常检查）。
+                # 现在：记为不利因素、降仓，但不阻断交易。
+                out.conflict_side = "resistance"
+                out.conflict_level = near_res
+                out.conflict_dist = near_res - entry
                 out.notes.append(
                     f"做多但紧贴压力位 {near_res:.3f}（距入场 {near_res - entry:.3f} "
                     f"< {CFG.risk.conflict_atr_mult}×ATR {conf_d:.2f}，LLM位）"
-                    f"-> 结构不支持追多")
-                return out
+                    f"-> 结构不利，降仓处理（不再硬拒）")
     else:
         lv = _nearest_above(res_all, entry)
         if lv is not None:
@@ -455,12 +468,14 @@ def trade_levels(direction: str, entry: float, review: dict | None,
                 out.notes.append(
                     f"支撑位 {near_sup:.3f} 与压力纠缠（噪音区），跳过贴脸判定")
             else:
-                out.reason = "fusion_vs_levels_conflict"
+                # 同做多分支：硬拒 -> 标记 + 降仓（用户选定）
+                out.conflict_side = "support"
+                out.conflict_level = near_sup
+                out.conflict_dist = entry - near_sup
                 out.notes.append(
                     f"做空但紧贴支撑位 {near_sup:.3f}（距入场 {entry - near_sup:.3f} "
                     f"< {CFG.risk.conflict_atr_mult}×ATR {conf_d:.2f}，LLM位）"
-                    f"-> 结构不支持追空")
-                return out
+                    f"-> 结构不利，降仓处理（不再硬拒）")
 
     # ---- 先定止损，再据此选"够赔率"的止盈压力位 ----
     if out.sl is None:

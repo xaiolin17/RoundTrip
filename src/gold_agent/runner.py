@@ -155,6 +155,23 @@ def _src_suffix(plan: dict) -> str:
     return "（" + "/".join(uniq) + "）" if uniq else ""
 
 
+def _sizing_suffix(plan: dict) -> str:
+    """把**降仓/加仓**这类"手数为什么是这个值"的说明渲染成一行后缀。
+
+    ⚠️ 为什么必须打：`plan["reasons"]` 里的降仓说明原先只落 JSONL，
+    **控制台看不到** —— 于是 `conflict_lot_mult`（贴脸降仓系数）、
+    `uncalibrated_lot_mult`、`disagreement_lot_mult` 这几个可调参数
+    在实盘里是**不可观测**的：调了 0.5 还是 1.0，控制台的输出一模一样。
+    这正是用户反复强调的"不能放一个没有作用的死代码在那"。
+
+    只挑**影响手数**的关键词，避免把整段 reasons 刷到控制台。
+    """
+    keys = ("紧贴", "未校准", "新闻事件影响度", "disagreement", "源间分歧")
+    hit = [r for r in (plan.get("reasons") or [])
+           if isinstance(r, str) and any(k in r for k in keys)]
+    return ("  [" + "；".join(hit) + "]") if hit else ""
+
+
 def _order_lines(summary: dict) -> list[str]:
     """把本轮**可执行的价位**渲染成缩进的多行文本。
 
@@ -197,7 +214,7 @@ def _order_lines(summary: dict) -> list[str]:
                        f"入场 {_fmt_price(ly.get('level'))}{tag} "
                        f"止损 {_fmt_price(ly.get('sl'))} "
                        f"止盈 {_fmt_price(ly.get('tp'))}"
-                       + _src_suffix(plan))
+                       + _src_suffix(plan) + _sizing_suffix(plan))
             return out
         out.append(f"    挂单层数: {len(layers)}")
         for i, ly in enumerate(layers, 1):
@@ -214,7 +231,7 @@ def _order_lines(summary: dict) -> list[str]:
                    + (f"（参考 {_fmt_price(ref)}）" if ref is not None else "")
                    + f" 止损 {_fmt_price(plan.get('sl'))} "
                      f"止盈 {_fmt_price(plan.get('tp'))}"
-                   + _src_suffix(plan))
+                   + _src_suffix(plan) + _sizing_suffix(plan))
         return out
 
     if kind == "add_layer":
@@ -223,7 +240,7 @@ def _order_lines(summary: dict) -> list[str]:
             out.append(f"    {d} {plan.get('lots')}手 市价加仓"
                        f" 止损 {_fmt_price(plan.get('sl'))} "
                        f"止盈 {_fmt_price(plan.get('tp'))}"
-                       + _src_suffix(plan))
+                       + _src_suffix(plan) + _sizing_suffix(plan))
         else:
             out.append(f"    {d} {plan.get('lots')}手 市价加仓"
                        f"（止损止盈沿用原持仓）")
@@ -231,6 +248,10 @@ def _order_lines(summary: dict) -> list[str]:
 
     if kind == "modify_sltp":
         out.append(f"    {d} 止损移动至 {_fmt_price(plan.get('new_sl'))}")
+        return out
+
+    if kind == "cancel_pending":
+        out.append(f"    撤销挂单 #{plan.get('order_ticket')} {d}")
         return out
 
     return out

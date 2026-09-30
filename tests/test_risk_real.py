@@ -10,7 +10,6 @@ from gold_agent.common.config import CFG
 from gold_agent.fusion.engine import FusionResult
 from gold_agent.mt5.client import AccountInfo
 from gold_agent.risk.gate import Proposal, RiskGate
-from gold_agent.risk.grid import GridState
 from gold_agent.risk.position import (CircuitBreakers, conservative_win_rate,
                                       position_lots, volatility_k, wilson_lower)
 from gold_agent.risk.shrink import reachable_tp, shrink_for_pending, shrink_sl, shrink_tp
@@ -131,14 +130,14 @@ def test_shrink_for_pending_real_df():
 
 
 def test_risk_gate_reject_paths():
-    gate = RiskGate(CircuitBreakers(), GridState())
+    gate = RiskGate(CircuitBreakers())
     ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
     acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
                       margin=0, margin_level=0, leverage=2000, currency="USD")
     # 熔断拒绝
     b = CircuitBreakers()
     b.on_trade_closed(-350, 10000)
-    gate2 = RiskGate(b, GridState())
+    gate2 = RiskGate(b)
     res = gate2.evaluate(Proposal(kind="open_market", direction="LONG"),
                          ev, acc, type("V", (), {"positions": []})(), 1.0, None, 5.0, None)
     assert not res.ok and "circuit" in res.reason
@@ -160,7 +159,7 @@ def test_place_grid_now_emits_single_pending_order():
     实测问题：原实现按 `CFG.risk.grid_layers`（=2）挂多层，是网格行为。
     用户要求只挂预测的那一单；入场价改为回调带（回调到位反弹概率大）。
     """
-    gate = RiskGate(CircuitBreakers(), GridState())
+    gate = RiskGate(CircuitBreakers())
     ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
     acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
                       margin=0, margin_level=0, leverage=2000, currency="USD")
@@ -191,6 +190,63 @@ def test_place_grid_now_emits_single_pending_order():
     assert layers[0]["sl"] and layers[0]["tp"]
 
 
+def test_open_market_reserves_room_for_adds():
+    """首仓必须**为加仓预留额度**，否则加仓阶梯结构上不可达。
+
+    实测：`.env` 写明 `MAX_LOT=0.06 = 首仓 0.01 + 5×0.01`，但首仓手数由
+    `position_lots` 独立算出、原实现不看加仓额度 → 198 笔首仓里 34 笔直接
+    顶到 0.06，剩余额度 0 → 259 次加仓被"总手数上限"拒掉（0 次成功）。
+    本测试：强信号 + 宽止损（本会算出 0.06）时，首仓必须 <= 0.01。
+    """
+    gate = RiskGate(CircuitBreakers())
+    ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
+    acc = AccountInfo(login=1, balance=100000, equity=100000, margin_free=100000,
+                      margin=0, margin_level=0, leverage=2000, currency="USD")
+    empty = type("V", (), {"positions": [], "pending_orders": []})()
+    res = gate.evaluate(Proposal(kind="open_market", direction="LONG", entry=4350.0),
+                        ev, acc, empty, 0.1, None, 5.0, None,
+                        llm_review=_llm_rev([4300.0], [4420.0]))
+    assert res.ok, f"应能开仓: {res.reason}"
+    head = round(CFG.max_lot - CFG.add_layer_lots * CFG.risk.max_adds_per_position, 2)
+    assert res.plan["lots"] <= head + 1e-9, (
+        f"首仓 {res.plan['lots']} 吃掉了加仓额度（应 <= {head:.2f}）——"
+        f"加仓会再次不可达")
+    assert res.plan["lots"] >= CFG.min_lot, "首仓不得低于最小手数"
+
+
+def test_conflict_degrades_lots_instead_of_rejecting():
+    """紧贴反向位：**降仓**而非拒绝（用户选定，见 CFG.risk.conflict_lot_mult）。
+
+    实证 research/26_conflict_gate_test.py：贴脸组远期收益与对照组无统计差异，
+    而原实现把 205 个强信号（|z|>=2.66）100% 挡掉。
+
+    构造：入场 4350，LLM 压力位同时给出**贴脸的 4351** 与**远处的 4420**
+    （贴合实盘 —— LLM 通常给一组位）。贴脸 4351 触发降仓，4420 提供够赔率的
+    目标位，于是"结构不利但赔率够"这个真实场景能走到下单。
+    对照：把贴脸的 4351 换成 4400（同样够赔率、但不贴脸），手数应更大。
+    """
+    gate = RiskGate(CircuitBreakers())
+    ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
+    acc = AccountInfo(login=1, balance=100000, equity=100000, margin_free=100000,
+                      margin=0, margin_level=0, leverage=2000, currency="USD")
+    empty = type("V", (), {"positions": [], "pending_orders": []})()
+    # ATR 12 -> conf_d = 3.6；贴脸位 4351 距入场 1.0 < 3.6
+    near = gate.evaluate(Proposal(kind="open_market", direction="LONG", entry=4350.0),
+                         ev, acc, empty, 0.1, None, 12.0, None,
+                         llm_review=_llm_rev([4300.0], [4351.0, 4420.0]))
+    assert near.ok, f"贴脸不应再硬拒: {near.reason}"
+    assert any("紧贴" in r for r in near.plan["reasons"]), \
+        f"应在 reasons 里看到降仓说明: {near.plan['reasons']}"
+    # 对照：最近压力位 4400，距入场 50 > 3.6 -> 不贴脸
+    far = gate.evaluate(Proposal(kind="open_market", direction="LONG", entry=4350.0),
+                        ev, acc, empty, 0.1, None, 12.0, None,
+                        llm_review=_llm_rev([4300.0], [4400.0, 4420.0]))
+    assert far.ok, f"对照场景应能开仓: {far.reason}"
+    assert not any("紧贴" in r for r in far.plan["reasons"]), "对照不应有降仓说明"
+    assert near.plan["lots"] <= far.plan["lots"], (
+        f"贴脸手数 {near.plan['lots']} 应 <= 无冲突手数 {far.plan['lots']}")
+
+
 def test_max_lot_allows_configured_adds():
     """配置一致性：`max_lot` 必须容得下「基础仓 + max_adds_per_position 次加仓」。
 
@@ -211,7 +267,7 @@ def test_add_layer_passes_risk_gate_with_configured_max_lot():
     注意 `add_layer` 的 `prop.entry` 装的是**持仓 ticket**（不是价格），
     gate 靠它找到持仓、再用 `price_open` 作定价锚点。
     """
-    gate = RiskGate(CircuitBreakers(), GridState())
+    gate = RiskGate(CircuitBreakers())
     ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
     acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
                       margin=0, margin_level=0, leverage=2000, currency="USD")
@@ -237,7 +293,7 @@ def test_add_layer_rejected_without_llm_levels():
     （`ev` 只有 result，没有 chanlun/mobius）→ 无任何点位依据 → 拒绝。
     实测过裸仓事故：加仓开出 SL=0 TP=0 的仓位。
     """
-    gate = RiskGate(CircuitBreakers(), GridState())
+    gate = RiskGate(CircuitBreakers())
     ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
     acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
                       margin=0, margin_level=0, leverage=2000, currency="USD")
@@ -256,7 +312,7 @@ def test_add_layer_allowed_with_local_structure_only():
     这是 `test_add_layer_rejected_without_llm_levels` 的对照面：
     点位来源不必是 LLM，本地缠论中枢/SMC 结构位同样有效。
     """
-    gate = RiskGate(CircuitBreakers(), GridState())
+    gate = RiskGate(CircuitBreakers())
     cl = {"15m": type("C", (), {"center": {"zg": 4400.0, "zd": 4300.0,
                                            "gg": 4420.0, "dd": 4280.0}})()}
     ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3),
@@ -327,7 +383,7 @@ def test_close_position_request_carries_volume():
 
 def test_close_position_plan_includes_lots():
     """风控层必须把持仓手数带进 plan（executor 才有 volume 可用）。"""
-    gate = RiskGate(CircuitBreakers(), GridState())
+    gate = RiskGate(CircuitBreakers())
     res = gate.evaluate(Proposal(kind="close_position", direction="LONG", entry=123456),
                         _ev(), _acc(), _views([_pos(vol=0.02)]), 0.1, None, 12.0, None)
     assert res.ok, res.reason
@@ -347,7 +403,7 @@ def test_modify_sltp_keeps_existing_tp():
                                        position_ticket=123456, sl=4330.0, tp=None))
     assert "tp" not in req2, "原持仓无 TP 时不应传 tp=0.0"
 
-    gate = RiskGate(CircuitBreakers(), GridState())
+    gate = RiskGate(CircuitBreakers())
     res = gate.evaluate(Proposal(kind="modify_sltp", direction="LONG", entry=123456,
                                  tp_struct=4352.0),
                         _ev(), _acc(), _views([_pos(tp=4360.0)]), 0.1, None, 12.0, None)
@@ -360,7 +416,7 @@ def test_add_layer_carries_atr_sl_tp():
     实测 3 个裸仓全部来自加仓（magic 相同，comment='goldagent-add'）。
     现在 SL/TP 来自 LLM 判断的压力位/支撑位。
     """
-    gate = RiskGate(CircuitBreakers(), GridState())
+    gate = RiskGate(CircuitBreakers())
     atr = 12.339
     res = gate.evaluate(Proposal(kind="add_layer", direction="LONG", entry=123456),
                         _ev(), _acc(), _views([_pos(price_open=4350.0)]),
@@ -568,4 +624,79 @@ def test_max_adds_ladder_is_reachable_under_max_lot():
     assert len(layers) == CFG.risk.max_adds_per_position, (
         f"在 MAX_LOT={CFG.max_lot} × 每层 {CFG.add_layer_lots} 下只加得动 "
         f"{len(layers)} 层，但配置声明允许 {CFG.risk.max_adds_per_position} 层")
+
+
+def test_add_ladder_is_unreachable_without_base_reserve():
+    """反证：**不**给首仓预留额度时，加仓阶梯必然不可达。
+
+    这条测试锁住"为什么必须预留"—— 它是 `reserve_lots` 存在的理由。
+    实测：198 笔首仓里 34 笔直接顶到 0.06（消费完额度），
+    于是 259 次加仓被"总手数上限"拒掉、0 次成功。
+    """
+    used = CFG.max_lot          # 首仓吃满总上限（未预留时的真实情形）
+    room = CFG.max_lot - used
+    add_lots = round(min(CFG.add_layer_lots, room), 2)
+    assert add_lots < CFG.min_lot, (
+        "首仓吃满 max_lot 时剩余额度应为 0 —— 加仓必然被拒（这正是缺陷）")
+
+
+def test_prices_are_rounded_to_symbol_digits_on_submit():
+    """提交给 MT5 的价格必须按 symbol digits 规整，否则幂等判定永不收敛。
+
+    ⚠️ 最高严重度缺陷的回归锁（实测同一持仓重复提交 **83 次**、
+    375 拒 / 35 成 = 91.5% 纯浪费）：
+      提交 `sl=4178.211333333333`，MT5 按 digits=3 存回 `4178.211`；
+      下一轮拿 `pos.sl` 与**未规整**的原值比较
+      （LONG: `pos.sl < locked_sl`），3.3e-4 的差让条件**恒为真** ——
+      于是每轮重发同一个值，MT5 恒回 `10025 No changes`。
+
+    修复在**发单边界**统一规整（executor._build_request），
+    使"提交值 == MT5 可能存回的值"，比较才可能收敛。
+    """
+    import gold_agent.mt5.executor as ex
+
+    class _SI:
+        digits = 3
+        filling_mode = 2          # SYMBOL_FILLING_IOC
+        ask = 4180.0
+        bid = 4179.8
+
+    class _C:
+        def symbol_info(self):
+            return _SI()
+
+    e = ex.Executor(_C())
+    for raw in (4178.211333333333, 4176.9549999999, 4180.0005):
+        p = ex.OrderPlan(kind="open_market", direction="LONG", lots=0.01,
+                         tp=raw, sl=raw, entry=raw)
+        e._build_request(p)
+        for f in ("entry", "tp", "sl"):
+            v = getattr(p, f)
+            assert v == round(raw, 3), f"{f} 未按 digits 规整: {v!r}"
+            # 关键性质：规整后的值再规整一次必须**不变**（幂等）
+            assert round(v, 3) == v, f"{f} 规整不幂等: {v!r}"
+
+
+def test_no_wall_clock_in_idempotency_keys():
+    """幂等键**不得含挂钟时间**（否则 `_seen_keys` 查重永不命中 = 幂等机制失效）。
+
+    实测：四个分支原都拼 `int(time.time())`，于是每次调用都产生新键，
+    这个"幂等"机制实际上从未生效 —— 撤单重复提交（38 次执行 / 35 个不同
+    ticket），第二次必被 MT5 回 `10025`，系统无法区分"已撤掉"与"没发出去"。
+    """
+    import inspect
+    import re
+
+    import gold_agent.agent.graph as g
+
+    src = inspect.getsource(g.Graph._execute)
+    # 去掉注释行再查，避免注释里提到 time.time() 造成误判
+    code = "\n".join(ln for ln in src.splitlines()
+                     if not ln.strip().startswith("#"))
+    assert "time.time()" not in code, (
+        "幂等键又用回挂钟时间了 —— _seen_keys 会永远查不中（幂等失效）")
+    keys = re.findall(r'idempotency_key=f"([^"]+)"', code)
+    assert keys, f"未找到幂等键定义: {code!r}"
+    for k in keys:
+        assert "time" not in k, f"幂等键 {k!r} 含时间成分"
 

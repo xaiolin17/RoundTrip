@@ -27,7 +27,6 @@ from gold_agent.mt5.client import MT5Client, Mt5Error
 from gold_agent.mt5.executor import ExecutionResult, Executor, OrderPlan
 from gold_agent.news.collector import Jin10Collector
 from gold_agent.risk.gate import Approved, RiskGate
-from gold_agent.risk.grid import GridState
 from gold_agent.risk.position import CircuitBreakers
 from gold_agent.skills.chanlun_adapter import analyze_tf
 from gold_agent.skills.mobius_adapter import MobiusClient
@@ -64,7 +63,6 @@ class Graph:
     gate: RiskGate
     llm: Orchestrator | None
     breakers: CircuitBreakers
-    grid_state: GridState
     deal_feedback: Any = None
     # {position_id / order_id: 预测符号} 成交→贝叶斯反馈桥接（落盘 pred_orders.json）
     # 键统一用 position_id：平仓 deal 的 order 是新 ticket，与开仓时记的永不相等
@@ -79,7 +77,6 @@ class Graph:
         news = Jin10Collector()
         fusion = FusionEngine()
         breakers = CircuitBreakers.load(CFG.state_path.parent / "breakers.json")
-        grid_state = GridState.load(CFG.state_path.parent / "grid_state.json")
         orchestrator: Orchestrator | None = None
         try:
             from gold_agent.llm.client import RunningHubClient
@@ -88,7 +85,7 @@ class Graph:
             # LLM 缺 key 时禁用（本地降级路径照常决策），首次成功调用前重试初始化
             orchestrator = Orchestrator(None)
             orchestrator._init_error = str(e)
-        gate = RiskGate(breakers, grid_state)
+        gate = RiskGate(breakers)
         engine = DecisionEngine(gate, orchestrator)
         fb = None
         try:
@@ -98,7 +95,7 @@ class Graph:
             log_warn(f"交割单反馈初始化失败：{e}")
         return cls(client=client, executor=executor, mobius=mobius, news=news,
                    fusion=fusion, engine=engine, gate=gate, llm=orchestrator,
-                   breakers=breakers, grid_state=grid_state, deal_feedback=fb)
+                   breakers=breakers, deal_feedback=fb)
 
     async def run_round(self, round_id: int) -> dict:
         """一轮完整决策（docs/00 §3 t0..t9）。返回本轮摘要。"""
@@ -289,8 +286,13 @@ class Graph:
             # → 881 轮只成功 38 次（4.3%），系统绝大多数时候只能挂限价单。
             # 现在：1h 决策周期下每轮都评审（min_interval_min=0），
             # 且只有明显无信号的轮次才跳过以省预算。
-            need_llm = (abs(ev.result.score - ev.result.score_baseline)
-                        >= CFG.decision.open_threshold - 0.6
+            # ⚠️ 门槛用 **z 尺度**（与 decision 层一致）：绝对阈值会让
+            #    "要不要叫 LLM"的频率随权重漂移。留 0.6 的绝对余量
+            #    作为"提前叫"的缓冲，同样换算成 z。
+            _sig_l = float(ev.result.sigma)
+            _z_l = (abs(ev.result.score - ev.result.score_baseline) / _sig_l
+                    if _sig_l > 1e-9 else 0.0)
+            need_llm = (_z_l >= CFG.decision.z_min - 0.6
                         or bool(st["positions"].positions)
                         or bool(st["positions"].pending_orders)
                         or abs(ev.result.score_baseline) > 0.3)
@@ -300,7 +302,9 @@ class Graph:
                                   if st["fused"].indicators else None,
                                   round_id=round_id,
                                   position_adds=self._position_adds,
-                                  point_value_per_lot=self._point_value())
+                                  point_value_per_lot=self._point_value(),
+                                  used_lots=self._used_lots(st["positions"]),
+                                  max_lots_cap=self._max_lots_cap(st["account"]))
             if need_llm and self.llm is not None:
                 st["llm"] = await self.llm.review_and_news(ev, st["news"],
                                                            summary["last_close"])
@@ -391,7 +395,6 @@ class Graph:
                           "summary": {k: summary.get(k) for k in
                                       ("last_close", "proposal", "risk", "execution")}})
             self.breakers.save(CFG.state_path.parent / "breakers.json")
-            self.grid_state.save(CFG.state_path.parent / "grid_state.json")
             self._save_position_adds()
             # P0-1/P1-2/P1-3：滚动统计量跨进程持久（重启不丢预热）
             self.fusion.save_state()
@@ -409,6 +412,15 @@ class Graph:
 
     async def _execute(self, plan: dict, st: GraphState) -> ExecutionResult:
         kind = plan.get("kind")
+        # ⚠️ 幂等键**不能含挂钟时间**（`int(time.time())`）。
+        #    原实现四个分支都拼了时间戳，于是每次调用都产生一个全新键，
+        #    `Executor._seen_keys` 的查重**永不命中** —— 这个"幂等"机制
+        #    实际上从未生效过。实测后果：撤单重复提交（38 次执行 / 35 个不同
+        #    ticket），第二次必被 MT5 回 `10025 No changes`，而系统无法区分
+        #    "已经撤掉了"和"第一次根本没发出去"（这正是风险最高的一类盲区）。
+        #    改为**内容寻址**：同一轮内对同一标的的同一动作 → 同一个键。
+        #    跨轮不重复是**有意**的：加仓/移损本来就需要在新价格上重新提交。
+        _rid = st.get("round_id", 0)
         if kind == "open_market":
             si = self.client.symbol_info()
             if plan["direction"] == "LONG":
@@ -418,7 +430,7 @@ class Graph:
             req = OrderPlan(kind="open_market", direction=plan["direction"],
                             lots=plan["lots"], tp=plan["tp"], sl=plan["sl"],
                             comment="goldagent-open",
-                            idempotency_key=f"open-{int(time.time())}")
+                            idempotency_key=f"open-{_rid}-{plan['direction']}")
             res = await self.executor.execute(req)
             if res.ok:
                 # 记录开仓时的融合分符号，平仓后用于贝叶斯反馈
@@ -430,21 +442,30 @@ class Graph:
                             lots=float(plan["lots"]),
                             position_ticket=int(plan["position_ticket"]),
                             comment="goldagent-close",
-                            idempotency_key=f"close-{plan['position_ticket']}-{int(time.time())}")
+                            idempotency_key=f"close-{plan['position_ticket']}")
             return await self.executor.execute(req)
         if kind == "modify_sltp":
             # 保护性移损：SL 推到锁盈位（tp_struct 携带新 SL）；
             # TP 保持原位（keep_tp 由风控从原持仓带出，None 才不动）
+            # 幂等键带上**目标 SL**：同一个 SL 值在同一轮内不会重复提交。
             req = OrderPlan(kind="modify_sltp", direction=plan.get("direction"),
                             position_ticket=int(plan["position_ticket"]),
                             sl=float(plan["new_sl"]), tp=plan.get("keep_tp"),
                             comment="goldagent-lock",
-                            idempotency_key=f"lock-{plan['position_ticket']}-{int(time.time())}")
+                            idempotency_key=f"lock-{plan['position_ticket']}-{plan['new_sl']}")
             res = await self.executor.execute(req)
             if res.ok:
-                trade_log({"event": "sl_locked", "position": plan["position_ticket"],
-                           "new_sl": plan["new_sl"],
-                           "direction": plan.get("direction")})
+                # 回读对账：broker 实际持有的 SL 才算数（原先只看返回码）
+                want = float(plan["new_sl"])
+                if not await self.executor.verify_sl(int(plan["position_ticket"]), want):
+                    log_warn(f"移损对账失败：持仓 {plan['position_ticket']} "
+                             f"目标 SL {want:.3f} 与 broker 实际值不一致")
+                    trade_log({"event": "sl_verify_failed",
+                               "position": plan["position_ticket"], "want_sl": want})
+                else:
+                    trade_log({"event": "sl_locked", "position": plan["position_ticket"],
+                               "new_sl": plan["new_sl"],
+                               "direction": plan.get("direction")})
             return res
         if kind == "add_layer":
             # 顺势加仓：固定 0.01 手，同向市价；自带 ATR 算出的 SL/TP
@@ -452,7 +473,7 @@ class Graph:
             req = OrderPlan(kind="open_market", direction=plan["direction"],
                             lots=float(plan["lots"]), tp=plan.get("tp"),
                             sl=plan.get("sl"), comment="goldagent-add",
-                            idempotency_key=f"add-{plan['position_ticket']}-{int(time.time())}")
+                            idempotency_key=f"add-{plan['position_ticket']}-{st.get('round_id', 0)}")
             res = await self.executor.execute(req)
             if res.ok:
                 # ⚠️ 事故修复：加仓开的是**新仓位**，原先整个分支都没有记录
@@ -487,11 +508,23 @@ class Graph:
             # 行情反转撤挂单（docs/06 状态机：PENDING_GRID → IDLE）
             req = OrderPlan(kind="cancel_pending", position_ticket=int(plan["order_ticket"]),
                             comment="goldagent-cancel",
-                            idempotency_key=f"cancel-{plan['order_ticket']}-{int(time.time())}")
+                            idempotency_key=f"cancel-{plan['order_ticket']}")
             res = await self.executor.execute(req)
             if res.ok:
-                trade_log({"event": "pending_cancelled", "ticket": plan["order_ticket"],
-                           "direction": plan.get("direction")})
+                # 回读对账：确认挂单**真的不在册**了。
+                # ⚠️ 原实现只在本地记一笔"已撤"就往前走。若撤单其实没生效，
+                # 下一轮 `positions.pending_orders` 里那张单还在 → 决策层再次
+                # 提议撤同一张（实测 38 次撤单执行只对应 35 个不同 ticket，
+                # 3 次是重复撤同一张并拿到 10025）。
+                still = await self.executor.verify_pending(int(plan["order_ticket"]))
+                if still:
+                    log_warn(f"撤单对账失败：挂单 {plan['order_ticket']} 仍在册")
+                    trade_log({"event": "cancel_verify_failed",
+                               "ticket": plan["order_ticket"]})
+                else:
+                    trade_log({"event": "pending_cancelled",
+                               "ticket": plan["order_ticket"],
+                               "direction": plan.get("direction")})
             return res
         if kind == "place_grid":
             # 单张限价挂单（用户要求：取消网格）；挂单成功后记录预测符号，
@@ -503,7 +536,10 @@ class Graph:
                                 tp=layer["tp"], sl=layer["sl"],
                                 expiration_s=layer["expiration_s"],
                                 comment="goldagent-pending",
-                                idempotency_key=f"pending-{layer['level']}-{int(time.time())}")
+                                # `level` 是价格不是身份：同一价位在**后续轮次**
+                                # 重新挂单是合法意图（撤了又挂），所以键要带轮次，
+                                # 只在**同一轮内**防重复提交。
+                                idempotency_key=f"pending-{layer['level']}-{_rid}")
                 last = await self.executor.execute(req)
                 if not last.ok:
                     break
@@ -677,6 +713,24 @@ class Graph:
                     log_warn("跳过融合预热：无行情数据")
         except Exception as e:
             log_warn(f"融合预热失败：{e}")
+
+    def _used_lots(self, positions) -> float:
+        """本 magic 当前**已用**总手数（加仓额度判定用）。"""
+        try:
+            return sum(float(p.volume) for p in positions.positions
+                       if p.magic == CFG.mt5.magic)
+        except Exception:
+            return 0.0
+
+    def _max_lots_cap(self, account) -> float:
+        """**总敞口**上限（加仓额度判定用）。
+
+        ⚠️ 必须与 `RiskGate.add_layer` 里的 `room = CFG.max_lot − my_lots`
+        用**同一个口径**。决策层若按别的口径算（例如按 broker 的单笔上限
+        `volume_max=200`），就会持续提出风控必然拒掉的加仓 ——
+        两处口径不一致正是实测 259 次"总手数上限"拒绝的成因。
+        """
+        return float(CFG.max_lot)
 
     def _point_value(self) -> float:
         si = self.client.symbol_info()

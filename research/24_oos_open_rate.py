@@ -45,7 +45,6 @@ from gold_agent.decision.machine import (DecisionContext, DecisionEngine,
 from gold_agent.mt5.client import PositionsView
 from gold_agent.risk.gate import RiskGate
 from gold_agent.risk.position import CircuitBreakers
-from gold_agent.risk.grid import GridState
 from gold_agent.news.collector import NewsView
 from gold_agent.common.config import CFG
 
@@ -81,7 +80,7 @@ def run_one(d, t0, rounds, verbose=False):
         print(f"  预热: kalman n={eng.normalizer.count('kalman_persist')} "
               f"baseline n={eng.baseline.count()} value={eng.baseline.value:+.4f}")
 
-    de = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+    de = DecisionEngine(RiskGate(CircuitBreakers()))
     kinds, dirs, eff = {}, [], []
     for i in range(t0 + 1, t0 + 1 + rounds):
         if i >= len(d):

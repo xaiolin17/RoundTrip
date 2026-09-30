@@ -115,11 +115,17 @@ class RiskConfig:
     tp_atr_mult: float = _TOML.get("risk", {}).get("tp_atr_mult", 2.0)
     # 止损用哪个周期的 ATR（research/23：1m 短线必须用高级别，否则成本吃掉止损）
     atr_tf: str = _TOML.get("risk", {}).get("atr_tf", "1h")
-    grid_layers: int = _TOML.get("risk", {}).get("grid_layers", 3)
-    grid_layer_decay: float = _TOML.get("risk", {}).get("grid_layer_decay", 0.7)
-    grid_atr_mult: float = _TOML.get("risk", {}).get("grid_atr_mult", 0.8)
-    martin_atr_mult: float = _TOML.get("risk", {}).get("martin_atr_mult", 1.5)
-    max_group_lots_mult: float = _TOML.get("risk", {}).get("max_group_lots_mult", 3.0)
+    # ---- 已删除的死配置（2026-09-30，用户要求「不能放没有作用的死代码」）----
+    # `grid_layers` / `grid_layer_decay` / `grid_atr_mult` / `martin_atr_mult` /
+    # `max_group_lots_mult`：网格已按用户要求取消（只挂预测的那一张限价单），
+    # 这 5 个键全项目**零真实引用**（网格状态机 risk/grid.py 已整体删除）。
+    # `structure_enabled` / `structure_sl_max_atr` / `structure_frac_lo` /
+    # `structure_frac_hi`：同样是零引用；且经实测（position_lots 反推）
+    # 止损宽度本身已被风险预算自然约束 —— sl_dist 从 5 放大到 300 点时，
+    # 实际风险恒在名义预算内（最大 0.500%），再宽则直接 `risk_budget_below_min_lot`
+    # 拒单。所以"止损上限"这个安全阀是冗余的，删掉不降低任何保护。
+    # `decision.reserve_drop_score`：已被 z 尺度的 `reserve_drop_z` 取代
+    # （0.6 绝对分 ÷ 旧 σ 0.4895 ≈ 1.23 z，两者等价）。
     # 用户规则：每仓固定 0.01 手，同向最多加仓次数
     max_adds_per_position: int = _TOML.get("risk", {}).get("max_adds_per_position", 5)
     # 用户指定：市价单 TP 缩 40%、SL 缩 （与挂单一致）
@@ -129,14 +135,9 @@ class RiskConfig:
     # 用哪个周期的结构定 SL/TP。用户选定 15m（实测分型两倍≈33.8，
     # 1h 是 73.8、4h 是 149.0，差 4.4 倍）。
     structure_tf: str = _TOML.get("risk", {}).get("structure_tf", "15m")
-    # 是否启用结构定价（关掉则退回纯 ATR，行为与旧版一致）
-    structure_enabled: bool = _TOML.get("risk", {}).get("structure_enabled", True)
-    # 结构止损的宽度上下限（×ATR）：防贴脸止损与过宽止损
+    # 结构止损的**下限**宽度（×ATR）：防贴脸止损（实测 15m 笔只给 0.243）。
+    # 在 levels.py:397 真实生效。上限/占比区间已删除，理由见上。
     structure_sl_min_atr: float = _TOML.get("risk", {}).get("structure_sl_min_atr", 0.5)
-    structure_sl_max_atr: float = _TOML.get("risk", {}).get("structure_sl_max_atr", 2.5)
-    # 分型区间两倍的占比上下限：结构止损须落在 [0.2, 1.0]×分型两倍内
-    structure_frac_lo: float = _TOML.get("risk", {}).get("structure_frac_lo", 0.2)
-    structure_frac_hi: float = _TOML.get("risk", {}).get("structure_frac_hi", 1.0)
     # ---- 压力位/支撑位定价（用户要求：止损止盈看压力位，由 LLM 判断）----
     # 止损放在支撑/压力位之外时额外让开的距离（×ATR），防贴边被扫
     level_pad_atr: float = _TOML.get("risk", {}).get("level_pad_atr", 0.25)
@@ -202,6 +203,16 @@ class RiskConfig:
     #: 却无法调参。同等地位的 structure_sl_min_atr / level_pad_atr
     #: 早已走配置，此处补齐。
     conflict_atr_mult: float = _TOML.get("risk", {}).get("conflict_atr_mult", 0.3)
+    #: 「紧贴反向位」不再是**硬拒**，而是降仓（用户选定：证据不支持硬拦）。
+    #: 实证（research/26_conflict_gate_test.py，13879 样本 / 61 天 / 5 个前瞻窗口）：
+    #: 贴脸组的远期收益与对照组**统计上无差异**（全部 |t| < 1.96，
+    #: 日块自助 20/20 格不显著，k=10 一致），点估计还有 6/10 格**反向**。
+    #: 即"贴脸就被压回"这一机制没有得到数据支持。
+    #: 但该研究对 h=60 的检出力只到约 2~3 点，**不足以证明安全**，
+    #: 所以也不删掉这条风控 —— 改为按此系数降仓：
+    #: 保留"结构不利就少下注"的审慎，同时不再把 205 次强信号（|z|>=2.66）
+    #: 全部挡在门外。设为 0.0 即等价于原硬拒行为。
+    conflict_lot_mult: float = _TOML.get("risk", {}).get("conflict_lot_mult", 0.5)
     max_holding_h: float = _TOML.get("risk", {}).get("max_holding_h", 48.0)
     # ---- P2-2 方向偏置熔断：近 N 笔同向占比超阈值 → 停机复查 ----
     direction_bias_window: int = _TOML.get("risk", {}).get("direction_bias_window", 100)
@@ -212,11 +223,44 @@ class RiskConfig:
     # ---- P2-3 交割单样本量门槛 ----
     #: 胜率参与 Kelly 计算所需的最少交割单样本
     min_deals_for_kelly: int = _TOML.get("risk", {}).get("min_deals_for_kelly", 10)
+    #: Kelly 冷启动胜率（交割单样本不足时用）。原为 gate.py 两处硬编码 `0.5`。
+    #: 它直接进 half_kelly -> 手数上限，是**真实影响仓位**的参数，
+    #: 却无法调整（不同品种/策略的先验胜率并不都是 0.5）。补齐为真配置。
+    cold_start_win_rate: float = _TOML.get("risk", {}).get("cold_start_win_rate", 0.5)
+    #: 限价挂单有效期（小时）。原为 gate.py 硬编码 `4 * 3600` 秒。
+    #: MT5 挂单到期即自动撤销，该值决定"挂单能等多久行情"。
+    pending_expiry_h: float = _TOML.get("risk", {}).get("pending_expiry_h", 4.0)
 
 
 @dataclass
 class DecisionConfig:
-    open_threshold: float = _TOML.get("decision", {}).get("open_threshold", 1.6)
+    # ---- 开/平仓阈值：**z 尺度**（尺度无关），不是融合分的绝对值 ----
+    #
+    # ⚠️ 2026-09-29 第四次修正（用户指出的隐蔽耦合）：
+    #   融合分 S 是**加权平均** S = Σwμ/Σw，故其尺度恰好是
+    #       sd(S) = 1/√Σw = `FusionResult.sigma`
+    #   而旧实现用**绝对常数**去比它：`abs(S) >= open_threshold`。
+    #   于是同一行代码的含义随权重漂移：
+    #       Σw = 4.17（旧冻结基线）→ σ=0.4895 → |S|≥1.3 实为 |z|≥2.66
+    #       Σw = 12.0（等权收缩）  → σ=0.2887 → |S|≥1.3 实为 |z|≥4.50
+    #   即**权重越大（越有把握）→ 越难开仓**，方向正好反了。
+    #   用户原话：「本来要改的就是权重影响开仓 但是权重即会增大也会减小才对」。
+    #
+    #   改成 z 尺度后，权重对开仓的影响变成**双向且方向正确**：
+    #       源越多/越确定 → Σw 大 → σ 小 → 同样强度的信号 z 更大 → 更容易开；
+    #       源被剔除/不确定 → Σw 小 → σ 大 → 更难开。
+    #   这正是"权重影响开仓"应有之义，且 `z_min` 从此与权重解耦，
+    #   不会再被下一次权重改动静默改掉入场松紧。
+    #
+    #   标定：取当前**实际生效**的 z（1.3/0.4895 = 2.66）为默认值，
+    #   故本次改动不改变当前入场松紧，只把耦合去掉。
+    #   6.5 年回放：z_min=2.66 → 开仓率 14.0%/17.0%（旧绝对阈值下为 12.3%/21.3%）。
+    z_min: float = _TOML.get("decision", {}).get("z_min", 2.66)
+    #: 兼容字段：**仅供日志/参数门显示**的等效绝对阈值，不参与判定。
+    #: 真实判定一律走 `z_min`（`machine.py`）。
+    open_threshold: float = _TOML.get("decision", {}).get("open_threshold", 1.3)
+    #: 平仓的 z 门槛。原 `exit_threshold` 的等效 z ≈ 1.2/0.4895 = 2.45。
+    z_exit: float = _TOML.get("decision", {}).get("z_exit", 2.45)
     exit_threshold: float = _TOML.get("decision", {}).get("exit_threshold", 1.2)
     exit_persist_rounds: int = _TOML.get("decision", {}).get("exit_persist_rounds", 3)
     # 利润回吐检测（用户选定：改用移动止损锁盈，不再砍掉浮盈）
@@ -227,7 +271,10 @@ class DecisionConfig:
     lock_profit_min_usd: float = _TOML.get("decision", {}).get("lock_profit_min_usd", 8.0)
     lock_profit_gap_usd: float = _TOML.get("decision", {}).get("lock_profit_gap_usd", 2.0)
     reserve_min_profit: float = _TOML.get("decision", {}).get("reserve_min_profit", 5.0)
-    reserve_drop_score: float = _TOML.get("decision", {}).get("reserve_drop_score", 0.6)
+    #: 信号回吐平仓的**z 落差**（峰值 z − 当前 z）。
+    #: 原 `reserve_drop_score=0.6` 是绝对分落差；在旧尺度（σ=0.4895）上
+    #: 等效 z 落差 0.6/0.4895 ≈ 1.23，故取 1.23 保持当前行为不变。
+    reserve_drop_z: float = _TOML.get("decision", {}).get("reserve_drop_z", 1.23)
     loop_interval_s: float = _TOML.get("decision", {}).get("loop_interval_s", 60.0)
     #: 权重未校准时的**降仓系数**（用户 2026-09-29 选定）。
     #:
@@ -276,6 +323,12 @@ class DecisionConfig:
     news_impact_block: float = _TOML.get("decision", {}).get("news_impact_block", 0.70)
     #: LLM 新闻影响度 >= 此值 → 新仓手数 × news_impact_lot_mult
     news_impact_reduce: float = _TOML.get("decision", {}).get("news_impact_reduce", 0.40)
+    #: LLM 新闻影响度 >= 此值 **且与持仓反向** → 立即平仓评估（docs/06 §3.2 / docs/07）。
+    #: ⚠️ 原为 `machine.py` 里的硬编码 `0.8`，是三个新闻档位（0.40 降仓 /
+    #: 0.70 不开新仓 / 0.8 反向平仓）中**唯一不可调**的一个 ——
+    #: 调 `news_impact_block` 对已持仓的反向平仓**毫无影响**，属于
+    #: "看起来能调、实际调不动"的假参数。现补齐为真配置，默认 0.8 保持不变。
+    news_impact_close: float = _TOML.get("decision", {}).get("news_impact_close", 0.80)
     #: 事件降级时的手数系数
     news_impact_lot_mult: float = _TOML.get("decision", {}).get(
         "news_impact_lot_mult", 0.5)

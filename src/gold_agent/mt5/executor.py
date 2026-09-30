@@ -44,9 +44,17 @@ class ExecutionResult:
 
 
 _RETRYABLE = set()
+#: `10025 TRADE_RETCODE_NO_CHANGES` —— 请求的目标状态**已经就是当前状态**。
+#: 这不是失败，而是**幂等成功**：MT5 明确告诉我们"无需改动"。
+#: 原实现把它和其他错误一起丢进 `order_rejected` 并返回 `ok=False`，
+#: 于是：① 移损被记为失败（实测 375 次）；② 决策层下一轮看到目标 SL
+#: 仍未生效，就再提一次，形成无限重试；③ 真正的失败（Invalid stops）
+#: 被淹没在 375 条噪音里。归入成功是唯一语义正确的处理。
+_IDEMPOTENT_OK = set()
 if mt5 is not None:
     _RETRYABLE = {mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_PRICE_CHANGED,
                   mt5.TRADE_RETCODE_PRICE_OFF}
+    _IDEMPOTENT_OK = {mt5.TRADE_RETCODE_NO_CHANGES}
 
 
 class Executor:
@@ -71,6 +79,15 @@ class Executor:
                     return ExecutionResult(ok=True, retcode=result["retcode"],
                                            deal=result["deal"], order=result["order"],
                                            price=result["price"], volume=result["volume"])
+                if result["retcode"] in _IDEMPOTENT_OK:
+                    # 目标状态已是当前状态 —— 记成功，但用独立事件名，
+                    # 以便在日志里把"真的改了"与"本来就对"区分开。
+                    if plan.idempotency_key:
+                        self._seen_keys.add(plan.idempotency_key)
+                    trade_log({"event": "order_unchanged", "plan": plan.__dict__,
+                               "result": result})
+                    return ExecutionResult(ok=True, retcode=result["retcode"],
+                                           price=result["price"])
                 if result["retcode"] in _RETRYABLE and attempt < 2:
                     await self.client.get_ohlcv(bars_per_tf=2)  # 触发一次报价刷新
                     continue
@@ -86,6 +103,21 @@ class Executor:
         si = self.client.symbol_info()
         if si is None:
             raise Mt5Error("symbol_info None during order build")
+        # ⚠️ 所有价格必须**按 symbol 的 digits 规整**后才发出去。
+        # 事故（2026-09-30 实测）：`modify_sltp` 提交 `sl=4178.211333333333`，
+        # MT5 存回的是 `4178.211`（digits=3）。决策层下一轮拿 `pos.sl`
+        # 与**未规整的**原值比较（LONG: `pos.sl < locked_sl`），
+        # `4178.211 < 4178.211333` 恒为真 → 每轮重发同一个值，
+        # MT5 每次都回 `10025 No changes`。
+        # 实测：同一持仓最高重复提交 **83 次**，375 拒 / 35 成（91.5% 纯浪费）。
+        # 在**发单边界**统一规整，使「提交值 == MT5 可能存回的值」，
+        # 幂等判定才能收敛（只在 executor 一层做，避免各处漏改）。
+        digits = int(getattr(si, "digits", 3) or 3)
+        px = lambda v: (round(float(v), digits) if v else v)  # noqa: E731
+        for _k in ("entry", "tp", "sl"):
+            _v = getattr(plan, _k, None)
+            if _v:
+                setattr(plan, _k, px(_v))
         # filling mode 协商（docs/01 §4）：按 symbol_info.filling_mode 位掩码选择
         # 1=FOK, 2=IOC, 3=RETURN（MT5: SYMBOL_FILLING_FOK=1, SYMBOL_FILLING_IOC=2）
         fm = si.filling_mode
@@ -161,3 +193,26 @@ class Executor:
         """成交对账：position_get 确认存在。"""
         view = await self.client.get_positions()
         return any(p.ticket == ticket for p in view.positions)
+
+    async def verify_pending(self, ticket: int) -> bool:
+        """挂单对账：order 仍**在册**返回 True（未被撤、未成交、未过期）。"""
+        view = await self.client.get_positions()
+        return any(o.ticket == ticket for o in view.pending_orders)
+
+    async def verify_sl(self, ticket: int, want_sl: float,
+                        digits: int = 3) -> bool:
+        """移损对账：读回持仓，确认 broker **实际**持有的 SL 等于目标值。
+
+        ⚠️ 这是原先完全缺失的一环：`modify_sltp` 只看返回码，从不回读。
+        实测事故：同一持仓对同一个 SL 值重复提交 83 次，因为系统无法知道
+        "我提交的值"与"MT5 存下的值"是否一致（digits=3 四舍五入造成的
+        3.3e-4 差异让比较永远为真）。回读比对是唯一能收敛的判据。
+        """
+        view = await self.client.get_positions()
+        for p in view.positions:
+            if p.ticket == ticket:
+                if p.sl is None:
+                    return False
+                return abs(round(float(p.sl), digits) - round(float(want_sl), digits)) < 1e-9
+        # 持仓已不在（已平仓）—— 视为"无需再改"，返回 True 以免无限重试
+        return True

@@ -517,8 +517,12 @@ class FusionEngine:
 
         # ---- 动量-结构矛盾闸（复盘：结构多+动量空的入场全是亏损）----
         # 在**归一化后**的分数上判定，且仅当 kalman 源有权重时生效
-        # （权重 0 = 未验证，不应以它的方向否决其他源）。
-        if abs(result.score) >= CFG.decision.open_threshold and sources:
+        # （权重 0 = 未测量，不应以它的方向否决其他源）。
+        # ⚠️ 门槛用 **z 尺度**（S/σ），与 decision 层一致：绝对阈值会让
+        #    本闸的触发频率随权重漂移，且方向是反的（权重↑→σ↓→更难触发）。
+        _sig = float(result.sigma)
+        _z = (abs(result.score) / _sig) if _sig > 1e-9 else 0.0
+        if _z >= CFG.decision.z_min and sources:
             kal = sources[0]
             kal_w = kal.weight if kal.weight is not None else 0.0
             if kal_w > 0 and kal.score * result.score < 0 and abs(kal.score) >= 2.0:

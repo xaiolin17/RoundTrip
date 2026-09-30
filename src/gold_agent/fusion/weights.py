@@ -210,7 +210,15 @@ class WeightTable:
     tau2: float = 0.0
 
     def get(self, name: str) -> SourceIR:
-        return self.sources.get(name) or SourceIR(name=name, measurable=False)
+        """取源的记录。**表里没有的源**返回可测性未知的空记录（0 权重）。
+
+        `basis="absent"` 而不是 `"measured"`：一个从未出现在校准文件里的源
+        （如 `news`）没有任何实测证据，把它标成 "measured" 会让审计日志
+        谎称它有出处。这正是本项目反复出问题的模式（日志显示 provenance，
+        但 provenance 是编的），故显式区分。
+        """
+        return self.sources.get(name) or SourceIR(name=name, measurable=False,
+                                                  basis="absent")
 
     def _refresh_weights(self) -> None:
         """用 DL 收缩把 `w_final` 写到每个源上（唯一的权重计算入口）。

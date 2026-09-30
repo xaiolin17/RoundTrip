@@ -24,6 +24,7 @@ LLM 在主路径上（research/20 的修正）
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -37,6 +38,13 @@ from gold_agent.mt5.client import PositionsView
 from gold_agent.news.collector import NewsView
 from gold_agent.risk.gate import Proposal, RiskGate
 from gold_agent.risk.zhongshu import center_of, edge_side
+
+#: 报价小数位（XAUUSDm digits=3）。所有**提交给 MT5 的价格**都必须先按它规整，
+#: 否则"我提交的值"与"MT5 存回的值"永不相等，幂等判定会退化成死循环。
+#: 实测事故见 `_decide_holding` 的移动止损分支（同一持仓重复提交 83 次）。
+_PX_DIGITS = 3
+#: XAUUSDm point（1 point = 0.001 价格单位）。
+_POINT = 0.001
 
 
 class State(str, Enum):
@@ -63,6 +71,10 @@ class DecisionContext:
     round_id: int = 0
     position_adds: dict | None = None      # {position_ticket_str: 已加仓次数}（Graph 持久）
     point_value_per_lot: float = 1.0       # 每手每点美元值（移损计算用）
+    #: 当前**已用**总手数（本 magic 全部持仓之和）与 broker 允许的总上限。
+    #: 决策层据此判断"还有没有加仓额度"，避免提出必然被风控拒掉的加仓。
+    used_lots: float = 0.0
+    max_lots_cap: float = 0.0
     #: LLM 是否真的被调用并返回了 review（用于区分"LLM 说中性"与"LLM 没参与"）
     llm_available: bool = False
 
@@ -70,6 +82,32 @@ class DecisionContext:
 def effective_score(s: float, baseline: float) -> float:
     """P1-3：融合分零点校正。S_eff = S − S0。"""
     return float(s) - float(baseline)
+
+
+def z_score(s_eff: float, sigma: float) -> float:
+    """把有效融合分换成**尺度无关**的 z 值：`z = S_eff / σ`。
+
+    ⚠️ 为什么必须有这一层（2026-09-29 第四次修正，用户指出）：
+    融合分是**加权平均** `S = Σwμ/Σw`，故 `sd(S) = 1/√Σw = sigma`。
+    旧实现用绝对常数比它（`abs(S) >= 1.3`），于是同一行代码的含义
+    随权重漂移：
+
+        Σw=4.17（旧冻结基线）→ σ=0.4895 → |S|≥1.3 实为 |z|≥2.66
+        Σw=12.0（等权收缩）  → σ=0.2887 → |S|≥1.3 实为 |z|≥4.50
+
+    结果**权重越大（越有把握）越难开仓**，方向正好反了。用户原话：
+    「本来要改的就是权重影响开仓 但是权重即会增大也会减小才对」。
+
+    换成 z 尺度后权重的影响变成双向且方向正确：源越多/越确定 → Σw 大
+    → σ 小 → 同样强度的信号 z 更大 → 更容易开，反之更难开。
+
+    `sigma <= 0`（无任何可测源）时返回 0.0，即"不开仓"——
+    这是唯一应当空仓的情况；"权重小"只应体现为难开，不应变成绝对不能开。
+    """
+    sig = float(sigma)
+    if not math.isfinite(sig) or sig <= 1e-9:
+        return 0.0
+    return float(s_eff) / sig
 
 
 def news_impact(ctx: "DecisionContext") -> tuple[float, str]:
@@ -105,12 +143,32 @@ class DecisionEngine:
         self._profit_peak: dict[str, float] = {}  # ticket -> 持仓期间浮盈峰值（回吐检测）
         self._score_peak: dict[str, float] = {}   # ticket -> 持仓期间顺向信号峰值
 
+    def _prune_closed(self, holding: list) -> None:
+        """清掉已平持仓的峰值状态。
+
+        ⚠️ 这三个字典原先**只增不减**：`_profit_peak` / `_score_peak` 按
+        `position_ticket` 累积，`_exit_streak` 按方向累积。仓位平掉后条目仍在，
+        进程长期运行（本项目是 7×24 常驻）会一直涨，且更隐蔽的危害是
+        **ticket 复用**：MT5 的 ticket 在长时间尺度上会回收，旧峰值会让
+        新仓位一开出来就"已经达到过锁盈门槛"，直接触发错误的保本离场。
+        实测：日志里已累积 188 个 ticket 且无一被清理。
+        """
+        live = {str(p.ticket) for p in holding}
+        for d in (self._profit_peak, self._score_peak):
+            for k in [k for k in d if k not in live]:
+                del d[k]
+        # `_exit_streak` 以方向为键、只保留"当前持仓方向"，避免换向后残留计数
+        live_dirs = {p.type for p in holding}
+        for k in [k for k in self._exit_streak if k not in live_dirs]:
+            del self._exit_streak[k]
+
     def decide(self, ctx: DecisionContext) -> Proposal:
         """纯函数式判定一轮行为；执行与对账在 runner。"""
         r = ctx.ev.result
         try:
             holding = [p for p in ctx.positions.positions if p.magic == CFG.mt5.magic]
             pending = [o for o in ctx.positions.pending_orders if o.magic == CFG.mt5.magic]
+            self._prune_closed(holding)
             # P1-3：所有阈值判定都用校正后的分数
             s_eff = effective_score(r.score, r.score_baseline)
             # ⚠️ **持仓管理优先于挂单**。
@@ -180,10 +238,11 @@ class DecisionEngine:
         if pdir not in ("LONG", "SHORT"):
             # 方向未知（CLOSE_BY 等）→ 保守起见不撤，交给上层
             return None
-        adverse = (pdir == "LONG" and s <= -CFG.decision.exit_threshold) or \
-                  (pdir == "SHORT" and s >= CFG.decision.exit_threshold)
+        z_p = z_score(s, sigma)
+        adverse = (pdir == "LONG" and z_p <= -CFG.decision.z_exit) or \
+                  (pdir == "SHORT" and z_p >= CFG.decision.z_exit)
         if adverse or sigma > CFG.fusion.sigma_max:
-            why = (f"S_eff={s:+.2f} 标准差={sigma:.2f}"
+            why = (f"z={z_p:+.2f} 标准差={sigma:.2f}"
                    if adverse else f"标准差={sigma:.2f}>{CFG.fusion.sigma_max}")
             return Proposal(kind="cancel_pending", direction=pdir,
                             entry=pending[0].ticket,
@@ -195,8 +254,11 @@ class DecisionEngine:
         """空仓开仓门。
 
         s 是**已做零点校正**的有效融合分（P1-3）。
+        判定用 z = s/σ（尺度无关），故权重变化会**双向**影响开仓
+        （权重↑→σ↓→z↑→更易开），而不是旧的单向收紧。见 `z_score`。
         """
-        thr = CFG.decision.open_threshold
+        z = z_score(s, sigma)
+        z_min = CFG.decision.z_min
         if sigma > CFG.fusion.sigma_max:
             return Proposal(kind="hold",
                             reasons=[f"标准差 {sigma:.2f} > 上限 {CFG.fusion.sigma_max}"])
@@ -218,9 +280,11 @@ class DecisionEngine:
             return Proposal(kind="hold",
                             reasons=[f"低波动区间 {vol_pct:.2f} < {CFG.decision.vol_pct_min}"])
 
-        if abs(s) < thr:
-            return Proposal(kind="hold", reasons=[f"|S_eff| {abs(s):.2f} < 阈值 {thr}"])
-        direction = "LONG" if s > 0 else "SHORT"
+        if abs(z) < z_min:
+            return Proposal(kind="hold", reasons=[
+                f"|z| {abs(z):.2f} < 阈值 {z_min} "
+                f"(S_eff={s:+.3f} 标准差={sigma:.3f})"])
+        direction = "LONG" if z > 0 else "SHORT"
 
         # ---- LLM 一致性（主路径确认环节）----
         review = (ctx.llm or {}).get("review") or {}
@@ -290,11 +354,12 @@ class DecisionEngine:
     def _decide_holding(self, ctx: DecisionContext, holding, s: float, sigma: float) -> Proposal:
         pos = holding[0]
         direction = pos.type
+        z = z_score(s, sigma)
         review = (ctx.llm or {}).get("review") or {}
         verdict = review.get("verdict")
         conf = float(review.get("confidence") or 0)
-        adverse = (direction == "LONG" and s <= -CFG.decision.exit_threshold) or \
-                  (direction == "SHORT" and s >= CFG.decision.exit_threshold)
+        adverse = (direction == "LONG" and z <= -CFG.decision.z_exit) or \
+                  (direction == "SHORT" and z >= CFG.decision.z_exit)
         adverse_llm = (direction == "LONG" and verdict == "bearish" or
                        direction == "SHORT" and verdict == "bullish") and conf >= CFG.decision.llm_adverse_conf
         key = direction
@@ -321,7 +386,9 @@ class DecisionEngine:
         else:                                   # 兼容旧格式 {ticket: n}
             adds_count, last_score, last_conf = int(rec or 0), None, None
         conf_cur = float(review.get("confidence") or 0)
-        cur = abs(s)
+        # 加仓阶梯也在 **z 尺度**上比较（与开仓门同一尺度）。
+        # 若混用绝对分与 z，阶梯的"比上次更高"会被权重漂移污染。
+        cur = abs(z)
         if last_score is None:
             score_ok = True                     # 首次加仓：只需过开仓阈值
             required = cur
@@ -337,13 +404,24 @@ class DecisionEngine:
                 required = last + base_gap * (2 ** (adds_count - 1))
                 score_ok = cur >= required
         conf_ok = last_conf is None or conf_cur > float(last_conf)
-        if (same_side and abs(s) >= CFG.decision.open_threshold
+        # ⚠️ 额度闸：`add_layer` 是**总手数上限**下唯一会失败的方向。
+        # 实测：首仓常已用满 `max_lot`（198 单里 24 单直接 0.06），
+        # 此时 `room = max_lot − used = 0`，风控必拒。
+        # 原实现没有这道闸，于是每轮都提出一个**注定被拒**的加仓：
+        # 实测 316 次 add_layer 拒绝中 **259 次**是"总手数上限"，
+        # 且失败不写 `position_adds`（只在成功时写）→ 下一轮重新提，
+        # 形成"提—拒—再提"的死循环，白耗一轮决策和一次落盘。
+        # 这里先算清剩余额度：连最小手数都放不下就直接不提。
+        room = (float(getattr(ctx, "max_lots_cap", 0.0) or 0.0)
+                - float(getattr(ctx, "used_lots", 0.0) or 0.0))
+        room_ok = room >= CFG.min_lot if getattr(ctx, "max_lots_cap", 0.0) else True
+        if (same_side and abs(z) >= CFG.decision.z_min
                 and sigma <= CFG.fusion.sigma_max
                 and adds_count < CFG.risk.max_adds_per_position
-                and score_ok and conf_ok):
+                and room_ok and score_ok and conf_ok):
             return Proposal(kind="add_layer", direction=direction, entry=pos.ticket,
                             reasons=[f"加仓 第{adds_count + 1}/{CFG.risk.max_adds_per_position}次 "
-                                     f"S_eff={s:+.2f} (需>={required:.2f} 上次={last_score}) "
+                                     f"z={z:+.2f} (需>={required:.2f} 上次={last_score}) "
                                      f"置信={conf_cur:.2f} (上次={last_conf})"])
         # ---- 超短期利润回吐检测（用户选定：改用移动止损锁盈，不再砍掉浮盈）----
         # ⚠️ 事故复盘：原实现是「浮盈从峰值回吐 50% 就**主动平仓**」，
@@ -358,7 +436,6 @@ class DecisionEngine:
         peak = self._profit_peak.get(key_pos, 0.0)
         cur_profit = pos.profit
         self._profit_peak[key_pos] = max(peak, cur_profit)
-        _POINT = 0.001                      # XAUUSDm point
         usd_per_price_unit = (getattr(ctx, "point_value_per_lot", 1.0)
                               / _POINT * pos.volume)
         lock_gap = CFG.decision.lock_profit_gap_usd / max(usd_per_price_unit, 1e-9)
@@ -367,9 +444,15 @@ class DecisionEngine:
                      else pos.price_open - lock_gap)
         # 浮盈已达门槛 -> 推 SL 到保本上方（锁盈）
         if cur_profit >= CFG.decision.lock_profit_min_usd and pos.profit > 0:
-            sl_is_old = (pos.sl is None or
-                         (direction == "LONG" and pos.sl < locked_sl) or
-                         (direction == "SHORT" and pos.sl > locked_sl))
+            # ⚠️ 必须先规整到 symbol digits（XAUUSDm=3），否则幂等判定永不收敛。
+            # 事故（2026-09-30）：`locked_sl=4178.211333333333` 提交后 MT5 存回
+            # `4178.211`，下一轮 `pos.sl < locked_sl`（3.3e-4 的差）恒为真
+            # → 每轮重发同一个值，MT5 恒回 `10025 No changes`。
+            # 实测同一持仓重复 **83 次**，375 拒 / 35 成（91.5% 纯浪费）。
+            locked_sl = round(locked_sl, _PX_DIGITS)
+            sl_is_old = (pos.sl is None
+                         or (direction == "LONG" and pos.sl < locked_sl)
+                         or (direction == "SHORT" and pos.sl > locked_sl))
             if sl_is_old:
                 return Proposal(kind="modify_sltp", direction=direction, entry=pos.ticket,
                                 tp_struct=locked_sl, reasons=[
@@ -382,19 +465,22 @@ class DecisionEngine:
                             reasons=[f"锁盈回吐：峰值 ${self._profit_peak[key_pos]:.2f} "
                                      f"-> 现 ${cur_profit:.2f}，保本离场"])
         # 信号回吐检测保留（信号本身转弱时平仓，与移动止损互补）
+        # ⚠️ 同样用 z 尺度：峰值与当前值必须同尺度比较，否则权重变化会让
+        #    "回吐"判定随 Σw 漂移（旧版混用绝对分，与开仓门不一致）。
         score_peak = self._score_peak.get(key_pos, 0.0)
-        same_dir_score = s if direction == "LONG" else -s     # 顺持仓方向的信号分
-        self._score_peak[key_pos] = max(score_peak, same_dir_score)
-        reserve_drop = CFG.decision.reserve_drop_score
-        signal_giveback = (self._score_peak[key_pos] >= CFG.decision.open_threshold
-                           and same_dir_score <= self._score_peak[key_pos] - reserve_drop)
+        same_dir_z = z if direction == "LONG" else -z          # 顺持仓方向的信号 z
+        self._score_peak[key_pos] = max(score_peak, same_dir_z)
+        reserve_drop = CFG.decision.reserve_drop_z
+        signal_giveback = (self._score_peak[key_pos] >= CFG.decision.z_min
+                           and same_dir_z <= self._score_peak[key_pos] - reserve_drop)
         if signal_giveback:
-            why = (f"信号回吐：峰值 S={self._score_peak[key_pos]:+.2f} -> {same_dir_score:+.2f}")
+            why = (f"信号回吐：峰值 z={self._score_peak[key_pos]:+.2f} "
+                   f"-> {same_dir_z:+.2f}")
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
                             reasons=[why])
-        # 新闻反向减仓
+        # 新闻反向减仓（阈值走配置：原为硬编码 0.8，见 CFG.decision.news_impact_close）
         na = (ctx.llm or {}).get("news_assessment") or {}
-        if na.get("impact", 0) >= 0.8:
+        if na.get("impact", 0) >= CFG.decision.news_impact_close:
             na_dir = {"bullish": "LONG", "bearish": "SHORT", "neutral": None}.get(na.get("sentiment"))
             if na_dir and na_dir != direction:
                 return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
@@ -412,20 +498,17 @@ class DecisionEngine:
         # ⚠️ 原实现写 `2.0 / (point_value_per_lot * volume)`，漏了 /point，
         #    算出 SL = 开仓价 + 2000（远超现价）→ MT5 报 'Invalid stops'，
         #    移损从未成功过一次。
-        _POINT = 0.001                      # XAUUSDm point
-        usd_per_price_unit = (getattr(ctx, "point_value_per_lot", 1.0)
-                              / _POINT * pos.volume)
-        profit_locked_sl = (pos.price_open + 2.0 / max(usd_per_price_unit, 1e-9)
-                            if direction == "LONG"
-                            else pos.price_open - 2.0 / max(usd_per_price_unit, 1e-9))
-        sl_still_open = (pos.sl is not None and pos.sl > 0 and
-                         ((direction == "LONG" and pos.sl < pos.price_open) or
-                          (direction == "SHORT" and pos.sl > pos.price_open)))
-        if pos.profit > 10.0 and sl_still_open:
-            return Proposal(kind="modify_sltp", direction=direction, entry=pos.ticket,
-                            tp_struct=profit_locked_sl, reasons=[
-                                f"保本锁盈：利润 ${pos.profit:.2f} > $10，"
-                                f"止损上移至 {profit_locked_sl:.3f}（锁定 $2）"])
+        # ⚠️ 已删除「保本锁盈」分支（利润 > $10 -> 止损推到开仓价上方 $2），
+        #    连同它专用的 `profit_locked_sl` / `sl_still_open` /
+        #    第二份 `usd_per_price_unit` 一起删除。
+        #    它是**不可达死代码**，证明如下：
+        #      · 走到这里要求 SL 仍在**亏损侧**（LONG: sl < price_open）。
+        #      · 而上方「移动止损锁盈」分支的条件正是
+        #        `profit >= lock_profit_min_usd(8)` 且 SL 仍在亏损侧，命中即 return。
+        #      · 于是能到达本行的浮盈必然 < 8 美元，`profit > 10.0` **恒为假**。
+        #    实测印证：该分支最后一次触发 09-22 20:23（共 8 次），此后被
+        #    「移动止损锁盈」完全取代（411 次），13 天零触发。
+        #    用户明确要求"不能放一个没有作用的死代码在那"，故删除。
         return Proposal(kind="hold",
                         reasons=[f"持仓 {direction_label(direction)} {age_h:.1f} 小时 "
                                  f"S_eff={s:+.2f}"])

@@ -12,7 +12,6 @@ from gold_agent.common.logging_util import decision_log, trade_log
 from gold_agent.common.zh import sentiment_label
 from gold_agent.fusion.engine import FusedEvidence
 from gold_agent.mt5.client import AccountInfo, PositionsView
-from gold_agent.risk.grid import GridGroup, GridLayer, GridState
 from gold_agent.risk.levels import trade_levels
 from gold_agent.risk.position import CircuitBreakers, position_lots, volatility_k
 from gold_agent.risk.structure import pullback_entry
@@ -54,9 +53,8 @@ def _news_impact(llm_review: dict | None) -> tuple[float, str]:
 
 
 class RiskGate:
-    def __init__(self, breakers: CircuitBreakers, grid_state: GridState) -> None:
+    def __init__(self, breakers: CircuitBreakers) -> None:
         self.breakers = breakers
-        self.grid_state = grid_state
 
     def _levels(self, direction: str, entry: float, ev, atr: float | None,
                 llm_review: dict | None = None):
@@ -154,7 +152,8 @@ class RiskGate:
                 reasons.append(
                     f"新闻事件影响度 {na_imp:.2f}（{sentiment_label(na_senti)}）"
                     f" -> lots x{CFG.decision.news_impact_lot_mult}")
-            win_rate = win_rate if win_rate is not None else 0.5   # 交割单胜率（样本≥10）；否则冷启动 0.5
+            win_rate = (win_rate if win_rate is not None
+                        else CFG.risk.cold_start_win_rate)   # 冷启动先验胜率（可配）
             entry = prop.entry   # 市价由 executor 取当前 bid/ask
             # ---- 止损止盈看压力位/支撑位（LLM 判断 + 本地配套计算）----
             lv = self._levels(prop.direction, entry, ev, atr, llm_review)
@@ -165,9 +164,28 @@ class RiskGate:
                     decision_log({"event": "risk_reject", "kind": prop.kind,
                                   "reason": lv.reason, "levels_notes": lv.notes})
                     return Approved(ok=False, reason=f"levels: {lv.reason}")
-            # 仓位按**实际**止损距离反推，锁死单笔 risk_pct 风险
+            # ---- 紧贴反向位：**降仓**而非硬拒（用户选定）----
+            # 实证不支持硬拦（research/26_conflict_gate_test.py）：
+            # 贴脸组与对照组远期收益无统计差异；而原实现把 205 个强信号
+            # （|z|>=2.66）100% 挡掉。改为按 conflict_lot_mult 降仓。
+            # `CFG.risk.conflict_lot_mult = 0.0` 即恢复原硬拒行为。
+            if lv.conflict_side:
+                if CFG.risk.conflict_lot_mult <= 0:
+                    decision_log({"event": "risk_reject", "kind": prop.kind,
+                                  "reason": "fusion_vs_levels_conflict",
+                                  "levels_notes": lv.notes})
+                    return Approved(ok=False, reason="levels: fusion_vs_levels_conflict")
+                vol_k *= CFG.risk.conflict_lot_mult
+                reasons.append(
+                    f"紧贴{('压力' if lv.conflict_side == 'resistance' else '支撑')}位"
+                    f" {lv.conflict_level:.3f}（距 {lv.conflict_dist:.3f}）"
+                    f" -> lots x{CFG.risk.conflict_lot_mult}")
+            # 仓位按**实际**止损距离反推，锁死单笔 risk_pct 风险；
+            # 同时为后续加仓预留额度（否则首仓吃满总上限 → 加仓永久不可达）
+            reserve = CFG.add_layer_lots * CFG.risk.max_adds_per_position
             lots, rej = position_lots(account.equity, atr, point_value_per_lot,
-                                      win_rate, vol_k=vol_k, sl_dist=lv.sl_dist or None)
+                                      win_rate, vol_k=vol_k, sl_dist=lv.sl_dist or None,
+                                      reserve_lots=reserve)
             if rej:
                 decision_log({"event": "risk_reject", "kind": prop.kind,
                               "reason": rej, "win_rate": round(win_rate, 3)})
@@ -285,13 +303,20 @@ class RiskGate:
                 reasons.append(
                     f"权重未校准（收缩系数 {ev.weight_lambda:.3f}）"
                     f" -> lots x{CFG.decision.uncalibrated_lot_mult}")
-            base_lots, rej = position_lots(account.equity, atr, point_value_per_lot, 0.5,
+            # ⚠️ 这里原为硬编码 `0.5`，**与 open_market 分支的口径不一致**：
+            #    open_market 用真实交割单胜率（样本≥min_deals_for_kelly），
+            #    挂单却恒用 0.5 —— 同一套 Kelly 仓位公式，两个入口给不同答案。
+            #    现统一走 cold_start_win_rate（默认 0.5，行为不变，但可调）。
+            win_rate_grid = (win_rate if win_rate is not None
+                             else CFG.risk.cold_start_win_rate)
+            base_lots, rej = position_lots(account.equity, atr, point_value_per_lot,
+                                           win_rate_grid,
                                            vol_k=vol_k_grid, sl_dist=lv.sl_dist or None)
             if rej:
                 return Approved(ok=False, reason=f"grid base: {rej}")
             order = {"level": pe.entry, "lots": base_lots,
                      "tp": lv.tp, "sl": lv.sl,
-                     "expiration_s": 4 * 3600}
+                     "expiration_s": int(CFG.risk.pending_expiry_h * 3600)}
             plan = {"kind": "place_grid", "direction": prop.direction,
                     "grid_plan": [order], "reasons": reasons,
                     "entry_source": pe.source or "pullback",

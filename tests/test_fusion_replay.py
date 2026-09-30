@@ -405,28 +405,66 @@ def test_source_normalizer_idempotent_per_obs():
     assert nz._buf["x"] == before, "同一 obs_id 不得重复入缓冲"
 
 
-def test_unverified_source_gets_zero_weight():
-    """P0-2 硬规则：未验证的源权重为 0（不得参与方向决策）。"""
+def test_unmeasurable_source_gets_zero_weight():
+    """硬规则：**结构性不可测**的源权重为 0（不得参与方向决策）。
+
+    ⚠️ 语义已收窄（2026-09-29）：旧版这里是"未验证 → 0"，把
+    **统计显著性**当成了准入条件。但 `verified=False` 只说明"这个样本量下
+    测不出显著技能"（三个真实源都是，且独立样本仅 316~380，80% 功效需
+    t ≥ 2.80 而实测只有 +0.31/+0.17/+0.67）—— 是分辨不出来，不是测不了。
+    用它当准入条件会让权重全 0、系统永不开仓。
+
+    现在 0 权重的唯一依据是 **`measurable=False`**：
+    数据源本身没有历史数据可校准（`openmobius_smc` 的离线桩，
+    Mobius API 无历史回放）。这是事实判断，与显著性无关。
+    """
     tbl = WeightTable(trials=1)
-    tbl.sources["verified_src"] = SourceIR("verified_src", ir=0.3, nw_t=3.0,
-                                           n_obs=1000, verified=True)
-    tbl.sources["unverified_src"] = SourceIR("unverified_src", ir=0.9, nw_t=9.9,
-                                             n_obs=1000, verified=False)
-    assert tbl.weight("verified_src") > 0
-    assert tbl.weight("unverified_src") == 0.0, "未验证源即使 IR 很高也必须 0 权重"
+    tbl.sources["measurable_src"] = SourceIR("measurable_src", ir=0.3, nw_t=3.0,
+                                             n_obs=1000, measurable=True,
+                                             skill=0.4)
+    tbl.sources["stub_src"] = SourceIR("stub_src", ir=0.9, nw_t=9.9,
+                                       n_obs=1000, measurable=False)
+    tbl._refresh_weights()
+    assert tbl.weight("measurable_src") > 0
+    assert tbl.weight("stub_src") == 0.0, "不可测源即使实测数字很高也必须 0 权重"
     # 缺失源同样为 0
     assert tbl.weight("never_heard_of_it") == 0.0
 
 
-def test_negative_ir_gets_zero_weight():
-    """负 IR 不做反向交易（research/18 §4 已证伪反买）。"""
+def test_negative_skill_is_never_reversed():
+    """负技能不做反向交易（research/18 §4 已证伪反买）。
+
+    收缩模型下负 skill 的处理是：`w_measured = max(0, skill/skill_max)² × W_SCALE = 0`
+    —— 即"不因为测出负技能就反着做"，而不是把它打成 0 权重。
+
+    ⚠️ 与旧版的区别：旧规则是"负 IR → 0 权重"（用显著性当准入）。
+    现在负 skill 的源仍然拿**等权先验** —— 这正是用户选定的"等权"：
+    本窗口实测 kalman −0.19 / classic −0.35 也是负的，它们与 chanlun +0.17
+    的差异（Q≈0.14 < df=2）**不显著于抽样噪声**，故数据不支持把谁踢出去。
+    真正要守住的不变量是：**绝不出现负权重**（那会变成反向交易）。
+    """
     tbl = WeightTable()
-    tbl.sources["neg"] = SourceIR("neg", ir=-0.4, nw_t=-3.0, n_obs=1000, verified=True)
-    assert tbl.weight("neg") == 0.0
+    tbl.sources["neg"] = SourceIR("neg", ir=-0.4, nw_t=-3.0, n_obs=1000,
+                                  measurable=True, skill=-0.4)
+    tbl.sources["pos"] = SourceIR("pos", ir=0.4, nw_t=3.0, n_obs=1000,
+                                  measurable=True, skill=0.4)
+    tbl._refresh_weights()
+    for n in ("neg", "pos"):
+        assert tbl.weight(n) >= 0.0, f"{n}: 权重不得为负（否则变成反向交易）"
+        assert tbl.get(n).w_measured >= 0.0, f"{n}: 实测端点不得为负"
+    # 负 skill 的实测端点为 0（不复用它的反向信号）
+    assert tbl.get("neg").w_measured == 0.0, "负技能不得产生正权重"
+    assert tbl.get("pos").w_measured > 0.0
 
 
-def test_fuse_all_returns_neutral_when_no_verified_source(hist_15m):
-    """没有任何已验证源时，融合分必须中性（S=0）—— 宁可空仓。"""
+def test_fuse_all_returns_neutral_when_no_measurable_source(hist_15m):
+    """没有任何可测源时，融合分必须中性（S=0）—— 这是正确的空仓条件。
+
+    ⚠️ 注意与"不显著"的区别：`WeightTable(trials=1)` 是**空表**（连可测源
+    都没有登记），此时确实无从加权 → 中性。而真实校准下三个源都是
+    `measurable=True`，即使它们全部 `verified=False` 也照常加权、
+    照常开仓（见 `test_production_weight_table_can_trade`）。
+    """
     engine = FusionEngine(weight_table=WeightTable(trials=1))   # 空权重表
     df = hist_15m
     if len(df) < 500:
@@ -439,7 +477,7 @@ def test_fuse_all_returns_neutral_when_no_verified_source(hist_15m):
     cl = {tf: analyze_tf(frames[tf], tf) for tf in ("5m", "15m", "1h")}
     mob = {"15m": _mobius_stub(window, float(window["close"].iloc[-1]))}
     ev = engine.fuse_all(frames, cl, mob, obs_id=999999)
-    assert ev.result.score == 0.0, "无已验证源时必须返回中性分"
+    assert ev.result.score == 0.0, "无任何可测源时必须返回中性分"
     assert ev.result.effective_weight == 0.0
     # 被排除的源必须在 per_source 里标注原因（可审计）
     excluded = [s for s in ev.result.per_source if s.get("excluded") == "zero_weight"]
@@ -1135,7 +1173,6 @@ def test_oos_open_rate_is_acceptable(monkeypatch):
         from gold_agent.mt5.client import PositionsView
         from gold_agent.risk.gate import RiskGate
         from gold_agent.risk.position import CircuitBreakers
-        from gold_agent.risk.grid import GridState
         from gold_agent.news.collector import NewsView
 
         PAYLOAD, ROUNDS = 600, 300
@@ -1155,7 +1192,7 @@ def test_oos_open_rate_is_acceptable(monkeypatch):
             engine.prime_history(_payload(t0), n_steps=300, step_bars=1)
             assert engine.normalizer.warm("kalman_persist"), "预热必须生效"
 
-            de = DecisionEngine(RiskGate(CircuitBreakers(), GridState()))
+            de = DecisionEngine(RiskGate(CircuitBreakers()))
             opens = 0
             for i in range(t0 + 1, t0 + 1 + ROUNDS):
                 fr = _payload(i)
@@ -1302,14 +1339,18 @@ def test_shrinkage_endpoints_are_both_live():
                          "chanlun": 2.0})
     assert 0.0 < tbl.lam < 1.0, f"需要中间态，实测 lambda={tbl.lam}"
 
-    ch = tbl.get("chanlun")
+    ch = tbl.get("kalman_persist")   # 弱源：两个端点必然都不等于结果
     assert ch.w_prior == pytest.approx(W_SCALE)
-    assert ch.w_measured > 0
+    assert ch.w_measured == 0.0, "skill=-2.0（最弱）→ 实测端点为 0"
     # 中间态下，两个端点都既没有被忽略、也没有单独决定结果
-    assert ch.w_prior != ch.w_final, "等权先验必须实际参与（否则是死代码）"
-    assert ch.w_measured != ch.w_final, "实测排序必须实际参与（否则是死代码）"
+    assert ch.w_final != ch.w_prior, "等权先验必须实际参与（否则是死代码）"
+    assert ch.w_final != ch.w_measured, "实测排序必须实际参与（否则是死代码）"
     assert ch.w_final == pytest.approx(tbl.lam * ch.w_measured
                                        + (1 - tbl.lam) * ch.w_prior)
+    # 最强源在中间态下仍拿满 W_SCALE（实测端点 = 先验端点，二者重合）
+    top = tbl.get("chanlun")
+    assert top.w_measured == pytest.approx(W_SCALE)
+    assert top.w_prior == pytest.approx(W_SCALE)
 
     # 单调性：lambda 越大，实测排序的影响越大
     lo = _shrink_table({"kalman_persist": -1.35, "classic_indicators": 0.0,
@@ -1508,11 +1549,24 @@ def test_shrinkage_replaces_the_policy_switch():
 
     src = (_P(__file__).resolve().parents[1] / "src" / "gold_agent" /
            "fusion" / "weights.py").read_text(encoding="utf-8")
+    # 只在**可执行代码**里查找残留：文档字符串会（且应当）提到这些名字
+    # 来解释它们为什么被删，那不是死代码。
+    import ast as _ast
+    tree = _ast.parse(src)
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.Module, _ast.ClassDef, _ast.FunctionDef,
+                             _ast.AsyncFunctionDef)):
+            body = node.body
+            if (body and isinstance(body[0], _ast.Expr)
+                    and isinstance(body[0].value, _ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                body.pop(0)          # 去掉文档字符串
+    code = _ast.unparse(tree)
 
     for gone in ("BASELINE_IR", "POLICY_BASELINE", "POLICY_AUTHORITATIVE",
                  "VALID_POLICIES", "source_ir_policy", "from_baseline"):
         assert not hasattr(W, gone), f"{gone} 应已删除（它必然产生死代码）"
-        assert gone not in src, f"{gone} 不应再出现在 weights.py 里"
+        assert gone not in code, f"{gone} 不应再作为代码出现在 weights.py 里"
 
     assert not hasattr(CFG.fusion, "source_ir_policy"), (
         "config 里的策略开关也应删除")

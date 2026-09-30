@@ -215,7 +215,8 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
                   win_rate: float, vol_k: float = 1.0,
                   volume_min: float = 0.01, volume_step: float = 0.01,
                   volume_max: float = 10.0,
-                  sl_dist: float | None = None) -> tuple[float, str | None]:
+                  sl_dist: float | None = None,
+                  reserve_lots: float = 0.0) -> tuple[float, str | None]:
     """风险预算 + Half-Kelly 上限 + 波动率目标系数。
 
     返回 (lots, reject_reason)。
@@ -270,6 +271,19 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
             return round(volume_min, 2), None
         return 0.0, "risk_budget_below_min_lot"
     lots = min(lots, volume_max, CFG.max_lot if CFG.trade_mode == "live" else volume_max)
+    # 为**后续加仓**预留额度（用户选定：首仓封顶，保证 5 层加仓可达）。
+    # `.env` 写明 `MAX_LOT=0.06 = 基础仓 0.01 + 5×0.01 加仓`，但首仓手数由本函数
+    # 独立算出、原实现**不看加仓额度** —— 实测 198 笔首仓里 34 笔直接顶到 0.06，
+    # 剩余额度归零，于是 259 次加仓被"总手数上限"拒掉（0 次成功）。
+    # 这里把首仓压到"总上限 − 计划加仓额度"，使加仓阶梯真正可达。
+    if reserve_lots > 0:
+        # ⚠️ 必须先四舍五入再比较：`0.06 − 5×0.01` 在浮点下是
+        # 0.009999999999999995，直接跟 0.01 比会判成"放不下"而**跳过预留**
+        # （实测：加了预留逻辑但首仓仍是 0.06）。
+        head = round(CFG.max_lot - reserve_lots, 2)
+        if head >= volume_min:
+            lots = min(lots, round(math.floor(round(head / volume_step, 6)) * volume_step, 2))
+            lots = round(lots, 2)
     return lots, None
 
 

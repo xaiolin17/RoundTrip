@@ -65,7 +65,13 @@ def test_long_conflict_when_resistance_too_close():
     """
     rev = {"support_levels": [4324.0], "resistance_levels": [4338.5]}
     lv = trade_levels("LONG", 4338.0, rev, None, atr=12.0)
-    assert not lv.ok and lv.reason == "fusion_vs_levels_conflict"
+    # ⚠️ 2026-09-30 语义变更（用户选定）：贴脸反向位由**硬拒**改为
+    # **标记 + 降仓**（CFG.risk.conflict_lot_mult）。实证见
+    # research/26_conflict_gate_test.py：贴脸组远期收益与对照组无统计差异，
+    # 而原实现把 205 个强信号 100% 挡掉。
+    # 冲突**仍被识别**（conflict_side 非空），但不再阻断开仓。
+    assert lv.conflict_side == "resistance"
+    assert lv.conflict_level == 4338.5
 
 
 def test_long_allowed_when_resistance_far():
@@ -76,10 +82,11 @@ def test_long_allowed_when_resistance_far():
 
 
 def test_short_conflict_when_support_too_close():
-    """做空但紧贴**LLM 支撑位**（< 0.3×ATR）-> 结构不支持追空 -> 拒。"""
+    """做空但紧贴**LLM 支撑位**（< 0.3×ATR）-> 标记为结构不利 -> 降仓（不再硬拒）。"""
     rev = {"support_levels": [4330.5], "resistance_levels": [4348.0]}
     lv = trade_levels("SHORT", 4332.0, rev, None, atr=12.0)
-    assert not lv.ok and lv.reason == "fusion_vs_levels_conflict"
+    assert lv.conflict_side == "support"
+    assert lv.conflict_level == 4330.5
 
 
 def test_entangled_resistance_skips_conflict():
@@ -101,10 +108,16 @@ def test_entangled_resistance_skips_conflict():
 
 
 def test_isolated_resistance_still_blocks():
-    """孤立压力位（下方无支撑纠缠）且贴脸 < 0.3×ATR -> 仍拦截。"""
+    """孤立压力位（下方无支撑纠缠）且贴脸 < 0.3×ATR -> 仍**标记**为冲突。
+
+    注意（2026-09-30 变更）：标记后由 gate 按 conflict_lot_mult 降仓，
+    不再直接拒绝开仓。本测试只验证"孤立真贴脸**仍被识别**"，
+    降仓效果在 test_risk_real.py 里验证。
+    """
     rev = {"support_levels": [4282.87], "resistance_levels": [4287.87]}
     lv = trade_levels("LONG", 4286.141, rev, None, atr=14.8)
-    assert not lv.ok and lv.reason == "fusion_vs_levels_conflict", "孤立真贴脸应拦"
+    assert lv.conflict_side == "resistance", "孤立真贴脸仍应被识别"
+    assert any("降仓" in n for n in lv.notes), "notes 应说明改为降仓处理"
 
 
 def test_entangled_support_skips_conflict_short():
@@ -120,6 +133,7 @@ def test_short_allowed_when_support_far():
     rev = {"support_levels": [4300.0], "resistance_levels": [4350.0]}
     lv = trade_levels("SHORT", 4330.0, rev, None, atr=12.0)
     assert lv.ok
+    assert not lv.conflict_side, "远处的支撑位不应标记冲突"
 
 
 def test_conflict_ignores_local_structure_noise():
