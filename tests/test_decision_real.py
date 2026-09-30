@@ -309,6 +309,41 @@ def test_order_direction_mapping_is_exhaustive():
         "整数码 2 (BUY_LIMIT) 用字符串猜方向的旧逻辑是错的，不要改回")
 
 
+def test_position_adds_pruned_to_live_positions():
+    """回归：`position_adds.json` 只保留在场持仓，已平仓条目必须清掉。
+
+    ⚠️ 这是**真实缺陷**，不是洁癖。实测该文件累积 85 条而真实在场仅 1~2 条。
+    危害在 MT5 **ticket 会回收**：新仓位若继承旧条目的 `count`（例如 3），
+      · `adds_count < max_adds_per_position` 一开始就被吃掉几次；
+      · 第 3 次起门槛按 `base_gap × 2^(count−1)` **指数**抬升，
+        新仓会被要求畸高的分数才能加仓 → 静默禁用加仓。
+    与 `machine._prune_closed`（清浮盈/信号峰值）同根因，此处补持久化层。
+    """
+    from gold_agent.agent.graph import Graph
+
+    class _P:
+        def __init__(self, t):
+            self.ticket = t
+
+    class _Ps:
+        def __init__(self, ts):
+            self.positions = [_P(t) for t in ts]
+
+    g = Graph.__new__(Graph)          # 不跑 __post_init__（避免连 MT5）
+    g._position_adds = {"111": {"count": 3}, "222": {"count": 1},
+                        "333": {"count": 2}}
+    g._prune_position_adds(_Ps([111]))
+    assert set(g._position_adds) == {"111"}, g._position_adds
+
+    # 全平 -> 全清
+    g._prune_position_adds(_Ps([]))
+    assert g._position_adds == {}, g._position_adds
+
+    # 空/None 不得抛异常（首轮或 MT5 返回空时会发生）
+    g._prune_position_adds(_Ps([]))
+    g._prune_position_adds(None)
+
+
 def test_single_instance_lock_blocks_second_runner(tmp_path, monkeypatch):
     """回归：同一账号**不得**同时跑两个 main.py。
 

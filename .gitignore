@@ -32,6 +32,9 @@ env/
 # ---- 测试 / 类型检查 / 覆盖率缓存 ----
 .pytest_cache/
 .pytest_tmp/
+# pytest 在默认临时根不可用时，会改在**仓库根目录**建 `pytest-cache-files-*`。
+# 实测一次环境异常（WinError 5）就留下 18 个空目录，且不会被上面两条覆盖。
+pytest-cache-files-*
 .mypy_cache/
 .ruff_cache/
 .tox/

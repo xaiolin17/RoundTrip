@@ -395,6 +395,7 @@ class Graph:
                           "summary": {k: summary.get(k) for k in
                                       ("last_close", "proposal", "risk", "execution")}})
             self.breakers.save(CFG.state_path.parent / "breakers.json")
+            self._prune_position_adds(st.get("positions"))
             self._save_position_adds()
             # P0-1/P1-2/P1-3：滚动统计量跨进程持久（重启不丢预热）
             self.fusion.save_state()
@@ -547,6 +548,27 @@ class Graph:
                     self._record_pred(last, st)
             return last
         return ExecutionResult(ok=True, error=f"noop kind {kind}")
+
+    def _prune_position_adds(self, positions) -> None:
+        """删掉已平仓的加仓计数，只保留当前在场持仓的条目。
+
+        ⚠️ **这是真实缺陷，不是洁癖**：`position_adds.json` 原先只增不减，
+        实测已累积 85 个 ticket 而真实在场只有 1~2 个。
+        危害在 **MT5 ticket 会回收**：若某个新仓位拿到一个旧 ticket，
+        它会直接继承旧条目的 `count`（例如 3），于是
+          · `adds_count < CFG.risk.max_adds_per_position` 一开始就被吃掉几次；
+          · 第 3 次起门槛按 `base_gap × 2^(count−1)` 指数抬升，
+            新仓会被要求一个**畸高的分数**才能加仓 —— 等于静默禁用了加仓。
+        与 `machine._prune_closed`（清理浮盈/信号峰值）是同一个根因，
+        这里补上持久化层面的对应处理。
+        """
+        live = {str(p.ticket) for p in (positions.positions if positions else [])}
+        stale = [k for k in self._position_adds if k not in live]
+        for k in stale:
+            del self._position_adds[k]
+        if stale:
+            log_info(f"加仓计数清理：删除 {len(stale)} 个已平仓条目，"
+                     f"保留 {len(self._position_adds)} 个在场持仓")
 
     def _save_position_adds(self) -> None:
         path = CFG.state_path.parent / "position_adds.json"

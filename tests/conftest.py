@@ -5,11 +5,32 @@
 """
 from __future__ import annotations
 
+import shutil
 import tempfile
 import time
 from pathlib import Path
 
 import pytest
+
+#: 历史会话保留个数。`.pytest_tmp` 曾**只增不减**：每跑一次 pytest 就多一个
+#: `run-*` 目录（实测累积 105 个 / 9.6 MB），而里面只是被隔离的测试日志，
+#: 没有任何保留价值。保留最近几次便于排查失败用例，更早的自动清掉。
+_KEEP_RUNS = 3
+
+
+def _prune_old_runs(local: Path) -> None:
+    """清掉 `.pytest_tmp` 里过期的会话目录，只留最近 `_KEEP_RUNS` 个。
+
+    ⚠️ 为什么放在建新目录**之前**：这样即使本次会话随后崩溃，
+    目录数也有上界（最多 `_KEEP_RUNS + 1`），不会无限增长。
+    """
+    try:
+        runs = sorted((p for p in local.glob("run-*") if p.is_dir()),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in runs[_KEEP_RUNS:]:
+            shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        pass          # 清理失败绝不能影响测试本身
 
 
 def _session_dir() -> Path:
@@ -17,6 +38,7 @@ def _session_dir() -> Path:
     local = Path(__file__).resolve().parents[1] / ".pytest_tmp"
     try:
         local.mkdir(parents=True, exist_ok=True)
+        _prune_old_runs(local)
         d = local / f"run-{int(time.time())}-{id(object()) % 100000}"
         d.mkdir(parents=True, exist_ok=True)
         return d
