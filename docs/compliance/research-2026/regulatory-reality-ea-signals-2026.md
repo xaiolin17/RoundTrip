@@ -1,0 +1,64 @@
+# Regulatory Reality: Selling MT5 EAs & Trading Signals — 2026
+
+Research date 2026-09-20. Primary sources only. ⚠️ marks UNVERIFIED or a correction to a common (wrong) premise.
+
+## 1. United States
+
+**Does selling an EA trigger CTA registration?** Sometimes. CEA §1a(12)(B)(iv) publisher exclusion covers "the publisher or producer of any print or electronic data of general and regular dissemination," and under (C) applies "only if the furnishing of such services … is **solely incidental**." ⚠️ The "newspaper, news column, newsletter … specific investment situation of each client" wording often quoted is **Advisers Act §202(a)(11)(D), not the CEA**. CFTC Rule 4.14(a)(9) needs (i) no directing client accounts and (ii) no advice "based on, or tailored to, the commodity interest or cash market positions or other circumstances or characteristics of particular clients." Rule 4.14(a)(10) needs ≤15 persons/12 months **and** no general holding out to the public — a retail vendor fails prong two. NFA Interpretive Notice 9055 + CFTC Staff Letter 03-26: bundling a system with account opening or a "letter of direction" to follow signals creates an "**informal arrangement**" defeating 4.14(a)(9) → registration required. **CFTC Staff Letter 26-25 (17 Sep 2026)** grants broad "passive software" IB no-action but expressly excludes platforms that "generate express 'buy' or 'sell' signals" — an EA/signals vendor cannot rely on it (and it covers IB, not CTA).
+
+**Mandatory disclaimer — CFTC Rule 4.41(b)(1)(i), verbatim:** *"These results are based on simulated or hypothetical performance results that have certain inherent limitations. Unlike the results shown in an actual performance record, these results do not represent actual trading. Also, because these trades have not actually been executed, these results may have under-or over-compensated for the impact, if any, of certain market factors, such as lack of liquidity. Simulated or hypothetical trading programs in general are also subject to the fact that they are designed with the benefit of hindsight. No representation is being made that any account will or is likely to achieve profits or losses similar to these being shown."* Non-oral: "**prominently disclosed and in immediate proximity**" (4.41(b)(2)). **4.41(c)(2): applies "regardless of whether the [CTA] is exempt from registration."** 4.41(b)(1)(ii) lets NFA members substitute the NFA statement — a non-member must use the CFTC text verbatim.
+
+**NFA Rule 2-29** (amended eff. **21 July 2025**): (b)(3) profit mention needs an equally prominent risk-of-loss discussion; (b)(4) past profits need "not necessarily indicative of future results"; (c)(1) mandatory hypothetical disclaimer; (c)(3) 5-year **actual** customer performance; **(c)(4) hypotheticals barred once the system has 3 months of actual results**; (h) audio/video ads making a specific trading recommendation or profit reference need NFA pre-approval ≥10 days. (i)(2) expressly captures "the sale, through publications or otherwise, of **non-personalized trading advice**." ⚠️ "Guaranteed/insured/safe/risk-free" are **not** enumerated in the rule — reached via 2-29(b)(1)–(3), Rule 2-4, and the Promo Guide.
+
+⚠️ **Brief corrections:** no NFA "hypothetical performance record," no monthly hypothetical log, no 5-year hypothetical look-back exists — Rule 2-36(d) is "Doing Business with Non-Members." The 29 Aug 2019 document is NFA's CEA §17(j) submission letter, not a joint interpretive notice.
+
+**Enforcement:** *CFTC v. Fintech Investment Group/Compcoin*, No. 6:20-cv-00652 (M.D. Fla., consent order 7 Mar 2022) — **$1.2M restitution + $600K CMP** for marketing an automated forex algorithm with simulated results without the 4.41(b) disclaimer.
+
+## 2. EU
+
+**Authorisation trigger.** MiFID II Annex I §A: (4) portfolio management, (5) investment advice. Art 4(1)(4): advice = "**personal recommendations** to a client … in respect of one or more transactions." Art 9 of Del. Reg. 2017/565 ends: "**A recommendation shall not be considered a personal recommendation if it is issued exclusively to the public.**" So **generic public signals sit outside advice**; personalised ones do not. ESMA35-36-794 Q3, Answer 3(1)(d) lists as unacceptable and requiring authorisation: "Third party introducing brokers also engaging in automated trading arrangements whereby the third party both introduces clients … and **acts as a signal provider** to those clients."
+
+**ESMA74-1505669079-10311, Supervisory Briefing on Algorithmic Trading in the EU (26 Feb 2026)** — the most important current document. ¶9: algorithms that "**only serve to inform a trader** of a particular investment opportunity" are not algorithmic trading "provided that the execution is not algorithmic." ¶11 lists "**Signal-based trading**, quantitative models, or machine learning-driven strategies" as algorithmic trading where they influence order parameters. ¶36–37: "**regulatory accountability cannot be transferred**"; a third-country vendor does not relieve the EU firm. **RTS 6 has never been amended** (only consolidated version 02017R0589-20170331); the MiFIR review (Reg. 2024/791) did not touch Art 17.
+
+**RTS 6 (Del. Reg. 2017/589) key articles:** Art 5 general methodology, and **Art 5(6) — paragraphs 2–5 apply only to "trading algorithms leading to order execution."** Art 6 conformance testing. Art 7(3): firm "**retains full responsibility**" even using a vendor's test environment. Art 9 annual self-assessment + validation report. Art 12 kill functionality (cancel any/all unexecuted orders immediately). Art 15 pre-trade controls — 15(1)(a) price collars, (b) max order values, (c) max order volumes, **(d) maximum messages limits**; **15(3) repeated automated execution throttles** that auto-disable until re-enabled by a designated person. Art 16(5): real-time alerts "**within five seconds**." Art 17 post-trade controls. **Art 17 MiFID II applies regardless of firm size**; Art 1(5) extends Art 17(1)–(6) to non-authorised market members.
+
+**DORA** (Reg. 2022/2554) applies from **17 January 2025**; Art 16 gives small non-interconnected investment firms a simplified ICT framework. Dutch AFM (1 Apr 2026) stated RTS 6 Arts 14 and 18 need not be in the annual self-assessment as they now fall under DORA.
+
+**CFD measures — current 2026 status.** ESMA's temporary decisions **lapsed 31 July 2019**; ESMA's own Feb 2026 statement confirms "all NCAs adopted **permanent national** product intervention measures mostly mirroring the … ESMA decision." Content: leverage **30:1** major FX; **20:1** non-major FX, gold, major indices; **10:1** other commodities, non-major indices; **5:1** shares/other; **2:1** crypto. ⚠️ Close-out is **per ACCOUNT** at 50% of total initial margin (not per position). Negative balance protection per account; incentives ban; standardised risk warning with a **firm-specific** "% of retail investor accounts lose money," recalculated every 3 months over 12 months. **Binary options** prohibition likewise persists via national measures; ESMA35-243228190-8148 (3 Jul 2026) confirms in-scope event contracts are caught.
+
+## 3. UK
+
+⚠️ **The brief's COBS numbering is wrong.** COBS 4.5 is "Communicating with retail clients," not past performance. **Past performance = COBS 4.6.2R**, warning at **4.6.2R(4)** ("figures refer to the past and that past performance is not a reliable indicator of future results"). **Simulated past performance = COBS 4.6.6R**; **future performance = COBS 4.6.7R** — which requires it "**is not based on and does not refer to simulated past performance**" and needs negative *and* positive scenarios. MiFID-side equivalents: **COBS 4.5A.10UK / 4.5A.12UK / 4.5A.14UK**; **4.5A.16UK** bars implying FCA endorsement. No rule bans "guaranteed" — that is guidance at **COBS 4.2.5G**. Gross-performance figures require disclosure of commissions/fees (4.6.2R(6), 4.6.7R(1)(c)).
+
+**Perimeter.** **PERG 8.30.5G** is decisive: software generating "**specific buy, sell or hold signals** relating to particular investments" is "liable, as a general rule, to be advice for the purposes of article 53(1) (as well as financial promotions)" — saved only where the user has "enough control over the setting of parameters." **PERG 8.4.24G**: trading tools are "in many cases … too remote … to be inducements" **but** if sold as "almost certain to produce profits" the promotion becomes an inducement. FCA copy-trading page (updated 27/07/2026): copy trading is "portfolio or investment management where no manual input is clear from the account holder," and setting trading parameters "**will not affect the characterisation**." ⚠️ The journalistic exclusion is **RAO art. 54** (not art. 53(2)/(3), which covers P2P lending); promotion-side is **FPO 2005 art. 20** (FPO 2001 revoked 2005).
+
+**Promotions.** FSMA s.21(1) — unauthorised communication is a **criminal offence** (up to 2 years). The s.21 approval gateway (FSMA ss.55NA/55NB, **SI 2023/1411** + **SI 2023/966**) took effect **7 February 2024**; approvers need FCA permission and must obtain **quarterly written attestations** (COBS 4.10.2R(1B)). **FG24/1 ¶2.8**: Discord/Telegram signal groups are financial promotions. **Consumer Duty** PRIN 2A — where the sole Principle 12 activity is promoting, PRIN 2A.5 (consumer understanding) does the work (2A.1.15AG); PRIN 2A.4.8R(3) captures recurring subscription fees.
+
+**CFDs (COBS 22.5):** leverage **30/20/10/5** — ⚠️ **no 2:1 crypto tier** (cryptoasset derivatives prohibited, COBS 22.6) and UK gilts are 30:1 vs ESMA's 5:1. ⚠️ **No fixed 70% figure** — COBS 22.5.6R(1A) uses a firm-specific percentage recalculated quarterly. Close-out 22.5.13R; NBP 22.5.17R; incentives ban 22.5.20R. ⚠️ **No FCA prop-firm statement exists.**
+
+## 4. Bottom line — without a licence
+
+| Action | US | EU | UK |
+|---|---|---|---|
+| Sell EA the client configures/runs | Yes | Yes | Yes |
+| Publish generic public signals | Yes (4.14(a)(9)/(10) if no tailoring, no holding out) | Yes (Art 9, 2017/565) | **No** — PERG 8.30.5G treats specific signals as advice |
+| Personalised "this trade suits you" signals | **No** — CTA registration | **No** — Annex I A(5) | **No** — RAO art. 53 |
+| Auto-execute on client's account | **No** | **No** — A(4) | **No** — portfolio management |
+| Show backtests without disclaimer | **No** — 4.41(b) | National CFD rules | **No** — COBS 4.6.6R |
+| Show backtests once 3 months live results exist | **No** — NFA 2-29(c)(4) | Permitted w/ warning | Permitted w/ warning |
+| Say "guaranteed"/"risk-free"/"safe" | **No** — 2-29(b)(1)–(3), Rule 2-4 | **No** | **No** — COBS 4.2.1R/4.2.5G |
+| Claim "FCA/ESMA approved" | — | **No** | **No** — COBS 4.5A.16UK |
+| Promote via Discord/Telegram | Covered by 2-29 | Covered | **Criminal offence** if unapproved |
+
+**Mandatory warnings:** US — CFTC 4.41(b) verbatim, prominent + immediate proximity. EU — CFD risk warning with firm-specific loss % (provider obligation, not the vendor's). UK — COBS 4.6.2R(4) past-performance warning; 4.6.6R(4) simulated warning; 4.6.7R(1)(d) forecast warning.
+
+## 5. Verdict for a 1–3 person team
+
+Adoptable: sell the EA as a **tool the client configures and runs**; keep signals **generic and public**; publish the CFTC 4.41(b) disclaimer verbatim on every backtest; never claim guaranteed/safe/risk-free; disclose fees against gross figures; run marketing through an authorised approver in the UK. Four things break the model: **(a)** NFA 2-29(c)(4) makes backtest marketing unlawful in the US once the EA has 3 months of live results — this is the sharpest, soonest risk; **(b)** UK PERG 8.30.5G means the signals business, not the software business, is the authorisation trigger; **(c)** any auto-execution without manual input is portfolio management in both EU and UK; **(d)** EU/UK promotion of CFDs is criminal/unauthorised without approval, and Discord/Telegram counts. Realistic posture: sell software, publish generic research, never auto-execute, never personalise — and treat the US and UK signals businesses as requiring a licensed partner rather than as a compliance-cost problem.
+
+## UNVERIFIED
+- No CFTC/NFA action naming an **MT5 EA vendor** specifically (Fintech/ART, Tradewale, SimTradePro are nearest analogues).
+- No ESMA Q&A expressly addressing **copy-trading platforms or EA vendors** as such; MFSA copy-trading briefing (Apr 2023) returned 403.
+- **ESMA70-156-4575** does not exist; real refs are ESMA70-156-2368 (CP) and ESMA70-156-4572 (Final Report, 28 Sep 2021), which recommended **no** Level 1/2 changes.
+- UK: no case law on whether software vendors "arrange"/"advise"; no FCA prop-firm statement; newest genuine Handbook captures are Dec 2023 (COBS 4), Oct 2024 (COBS 22), Feb 2024 (PRIN 2A) — rule numbers stable, wording not verified unamended through Sept 2026.
+- RTS 6 amendment status inferred from EUR-Lex consolidated-versions navigation (AUTO endpoint 404).

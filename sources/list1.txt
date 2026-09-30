@@ -1,0 +1,17 @@
+pra_cobs4_current.html | https://www.prarulebook.co.uk/pra-rules/cobs-conduct-of-business-sourcebook-1/01-01-2026
+pra_cobs4_2026b.html | https://www.prarulebook.co.uk/pra-rules/cobs-conduct-of-business-sourcebook-1/20-09-2026
+wb_cobs22_2026.pdf | https://web.archive.org/web/2026id_/https://www.handbook.fca.org.uk/handbook/COBS/22.pdf
+wb_prin2a.pdf | https://web.archive.org/web/2025id_/https://www.handbook.fca.org.uk/handbook/PRIN/2A.pdf
+wb_prin2a_2026.pdf | https://web.archive.org/web/2026id_/https://www.handbook.fca.org.uk/handbook/PRIN/2A.pdf
+leg_rao_contents.html | https://www.legislation.gov.uk/uksi/2001/544/contents
+leg_rao_art3.html | https://www.legislation.gov.uk/uksi/2001/544/article/3
+leg_rao_art14.html | https://www.legislation.gov.uk/uksi/2001/544/article/14
+leg_rao_art21.html | https://www.legislation.gov.uk/uksi/2001/544/article/21
+leg_rao_art25.html | https://www.legislation.gov.uk/uksi/2001/544/article/25
+leg_rao_art37.html | https://www.legislation.gov.uk/uksi/2001/544/article/37
+leg_rao_art40.html | https://www.legislation.gov.uk/uksi/2001/544/article/40
+leg_rao_art53.html | https://www.legislation.gov.uk/uksi/2001/544/article/53
+leg_fsma_s21.html | https://www.legislation.gov.uk/ukpga/2000/8/section/21
+leg_fsma_s19.html | https://www.legislation.gov.uk/ukpga/2000/8/section/19
+leg_fsma_s138d.html | https://www.legislation.gov.uk/ukpga/2000/8/section/138D
+leg_fpo2023.html | https://www.legislation.gov.uk/uksi/2023/1217/contents
