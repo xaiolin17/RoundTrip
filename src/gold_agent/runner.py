@@ -247,7 +247,10 @@ def _order_lines(summary: dict) -> list[str]:
         return out
 
     if kind == "modify_sltp":
-        out.append(f"    {d} 止损移动至 {_fmt_price(plan.get('new_sl'))}")
+        # 收窄时 TP 也会变（new_tp），有则一并显示，便于事后核对收窄是否生效
+        _tp = plan.get("keep_tp")
+        out.append(f"    {d} 止损移动至 {_fmt_price(plan.get('new_sl'))}"
+                   + (f" 止盈调整至 {_fmt_price(_tp)}" if _tp else ""))
         return out
 
     if kind == "cancel_pending":
@@ -427,6 +430,12 @@ def _acquire_single_instance_lock(dry: bool):
 
 async def main_async(dry: bool, rounds: int | None) -> None:
     CFG.ensure_dirs()
+    # 声明本进程为实盘进程 —— 只有这里会调 `set_live()`。
+    # 研究/回放脚本默认**不允许**写生产 logs/（见 logging_util 的 `_live` 说明：
+    # 一次忘调 set_silent 的回放就往生产日志灌了 19824 条伪造轮次）。
+    from gold_agent.common.logging_util import set_live, set_source
+    set_live(True)
+    set_source("dry" if dry else "live")
     if dry:
         CFG.trade_mode = "dry_run"
     lock_path = _acquire_single_instance_lock(dry)

@@ -23,6 +23,11 @@ class Proposal:
     direction: str | None = None
     entry: float | None = None     # 市价 None；挂单给定
     tp_struct: float | None = None # 结构位 TP（可空）
+    #: `modify_sltp` 专用的**新止盈**。
+    #: ⚠️ 命名说明：`tp_struct` 在 `modify_sltp` 语境下承载的是**新止损**
+    #: （历史原因，见 gate 的 modify 分支）。两者必须分开，否则"同时收窄
+    #: 止损与止盈"无处表达。为 None 表示**保持原止盈不动**。
+    new_tp: float | None = None
     reasons: list[str] | None = None
     evidence_ids: list[str] | None = None
 
@@ -79,6 +84,12 @@ class RiskGate:
             # 锁盈移损：把新 SL 放进 plan（executor 消费 new_sl）
             # ⚠️ 必须带上原持仓的 TP：TRADE_ACTION_SLTP 是**整体覆盖**，
             # tp 传 0.0 等于把止盈删掉（且 MT5 会因此报 Invalid stops）。
+            #
+            # ⚠️ 改单**永不受 `min_rr` 约束**（用户 2026-09-30 明确要求：
+            #    「新止损止盈缩小时不受 1.2 倍的比例影响」）。
+            #    收窄 SL/TP 是**降低**风险敞口，用开仓的赔率门去卡它在语义上
+            #    就是错的；且本分支在 evaluate 里**早返回**，本来也到不了
+            #    levels 的赔率校验。`new_tp` 为 None 时沿用原止盈。
             pos = next((p for p in positions.positions
                         if getattr(p, "ticket", None) == int(prop.entry)), None)
             if pos is None:
@@ -87,7 +98,9 @@ class RiskGate:
                                            "direction": prop.direction,
                                            "position_ticket": prop.entry,
                                            "new_sl": prop.tp_struct,
-                                           "keep_tp": pos.tp})
+                                           "keep_tp": (prop.new_tp
+                                                       if prop.new_tp is not None
+                                                       else pos.tp)})
         if prop.kind == "hold":
             return Approved(ok=True, plan={"kind": "hold"})
         if prop.kind == "cancel_pending":

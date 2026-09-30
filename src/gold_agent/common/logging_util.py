@@ -23,6 +23,47 @@ _silent: bool = os.environ.get("GOLD_AGENT_NO_FILE_LOG", "") not in ("", "0", "f
 #: 记录来源，便于事后区分实盘 / 研究 / 测试产生的日志
 _source: str = os.environ.get("GOLD_AGENT_LOG_SOURCE", "live")
 
+#: 本进程是否为**实盘 runner**。只有 `runner.main()` 会置 True。
+#:
+#: ⚠️ 为什么需要这个开关（2026-09-30 二次事故）：
+#: `set_silent` 是**自愿**调用的，一旦有人忘了调，研究/回放脚本就会直接
+#: 写进生产 `logs/`。实测我自己写的一次性回放脚本忘了调，直接调用
+#: `DecisionEngine.decide()`（内部会 `decision_log`），往 09-30 的
+#: 生产日志里灌了 **19824 条 `round=1` 的伪造轮次**，覆盖 09-18/09-21/
+#: 09-22/09-29/09-30 五天。这些假行和真实轮次交错，让"实盘到底跑了什么"
+#: 无法分辨，且会污染一切基于日志的回测与统计。
+#:
+#: 所以改成**默认拒绝**：只有显式声明自己是实盘进程，才允许写生产 `logs/`。
+#: 测试不受影响（`conftest` 会把 `CFG.log_dir` 指向临时目录）。
+_live: bool = False
+
+#: 被拒绝的写入次数（便于自检；不写盘，避免"用日志记录日志失败"）
+_blocked_writes: int = 0
+
+
+def set_live(on: bool = True) -> None:
+    """声明本进程是实盘 runner，允许写生产日志目录。"""
+    global _live
+    _live = bool(on)
+
+
+def _prod_log_dir() -> Path:
+    """仓库根下的生产日志目录（`src/gold_agent/common/logging_util.py` -> 上溯 3 层）。"""
+    return Path(__file__).resolve().parents[3] / "logs"
+
+
+def _is_prod_log(path: Path) -> bool:
+    try:
+        path.resolve().relative_to(_prod_log_dir().resolve())
+        return True
+    except Exception:
+        return False
+
+
+def blocked_writes() -> int:
+    """返回被拒绝的写入次数（供自检/测试断言）。"""
+    return _blocked_writes
+
 
 def set_silent(on: bool = True) -> None:
     """开启后 `jlog` 不再写文件（用于研究回放与测试）。"""
@@ -42,7 +83,16 @@ def set_source(src: str) -> None:
 
 def jlog(path: Path, record: dict) -> None:
     """追加一条 JSONL 记录；连续相同 payload 自动去重（休市/数据停更时不灌日志）。"""
+    global _blocked_writes
     if _silent:
+        return
+    # 非实盘进程禁止写生产日志目录 —— 见 `_live` 的说明。
+    # 研究脚本要留档请自己指定输出路径（或用 set_silent 明确静默）。
+    if not _live and _is_prod_log(path):
+        _blocked_writes += 1
+        if _blocked_writes == 1:
+            print(f"[WARN] 非实盘进程试图写生产日志 {path}，已拒绝"
+                  f"（如需实盘写入请调用 logging_util.set_live()）", file=sys.stderr)
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     record.setdefault("ts", time.time())

@@ -10,7 +10,10 @@ research/18_COMMERCIAL_PLAN.md 的三项修正落在本模块：
   预测的杠杆（`12_levers.py` C1：毛边际 +171%，净 NW-t 改善 7 倍）。
 - **P1-3 阈值零点校正**：融合分的零点不在 0（实测均值 +0.52）。阈值判断前先减去
   滚动基线 S0，否则 S=+0.52 的"中性"会被当成"偏多"。
-- **P1-1 决策周期**：`exit_persist_rounds` 在 1h 周期下 = 2（一轮 = 3 小时）。
+- **P1-1 决策周期**：主循环 1m（`loop_interval_s=60`）。
+  平仓判据为「尾部 `exit_adverse_window` 轮不一致率」（2026-09-30 起，
+  取代原「连续 `exit_persist_rounds` 轮」—— 后者在 46% 基础逆向率下
+  纯属噪声触发，实测 129 次 vs 新规则 7 次）。
 
 LLM 在主路径上（research/20 的修正）
 -----------------------------------
@@ -24,6 +27,7 @@ LLM 在主路径上（research/20 的修正）
 """
 from __future__ import annotations
 
+import collections
 import math
 import time
 from dataclasses import dataclass, field
@@ -139,28 +143,35 @@ class DecisionEngine:
         self.gate = risk_gate
         self.llm = llm
         self.state = State.IDLE
-        self._exit_streak: dict[str, int] = {}   # direction -> 连续反向轮数
         self._profit_peak: dict[str, float] = {}  # ticket -> 持仓期间浮盈峰值（回吐检测）
         self._score_peak: dict[str, float] = {}   # ticket -> 持仓期间顺向信号峰值
+        #: ticket -> 最近 N 轮「行情与持仓方向不一致」的 0/1 滑窗。
+        #: 用**比例**而非连续计数：实测 09-23 起 2283 个持仓轮里 46% 逆向，
+        #: "连续 3 轮"在随机游走下极易满足（实测触发 129 次），是噪声不是风控。
+        self._adverse_hist: dict[str, collections.deque] = {}
+        #: 已收窄过止损止盈的 ticket（**一次性**，防棘轮）。
+        #: ⚠️ 为什么必须去重：收窄是"按现价再收一档"。若每轮都收，20 → 10 → 5
+        #:    → 2.5 → … 会几何式收敛到点差以内，等于**用几十轮慢刀把仓位磨死**，
+        #:    比原来的直接平仓更糟。实测未去重时 9 轮就把止损压到 0.25（点差）。
+        self._tightened: set[str] = set()
 
     def _prune_closed(self, holding: list) -> None:
         """清掉已平持仓的峰值状态。
 
-        ⚠️ 这三个字典原先**只增不减**：`_profit_peak` / `_score_peak` 按
-        `position_ticket` 累积，`_exit_streak` 按方向累积。仓位平掉后条目仍在，
-        进程长期运行（本项目是 7×24 常驻）会一直涨，且更隐蔽的危害是
-        **ticket 复用**：MT5 的 ticket 在长时间尺度上会回收，旧峰值会让
-        新仓位一开出来就"已经达到过锁盈门槛"，直接触发错误的保本离场。
+        ⚠️ 这些字典原先**只增不减**：`_profit_peak` / `_score_peak` 按
+        `position_ticket` 累积。仓位平掉后条目仍在，进程长期运行
+        （本项目是 7×24 常驻）会一直涨，且更隐蔽的危害是 **ticket 复用**：
+        MT5 的 ticket 在长时间尺度上会回收，旧峰值会让新仓位一开出来就
+        "已经达到过锁盈门槛"，直接触发错误的保本离场。
         实测：日志里已累积 188 个 ticket 且无一被清理。
         """
         live = {str(p.ticket) for p in holding}
-        for d in (self._profit_peak, self._score_peak):
+        for d in (self._profit_peak, self._score_peak, self._adverse_hist):
             for k in [k for k in d if k not in live]:
                 del d[k]
-        # `_exit_streak` 以方向为键、只保留"当前持仓方向"，避免换向后残留计数
-        live_dirs = {p.type for p in holding}
-        for k in [k for k in self._exit_streak if k not in live_dirs]:
-            del self._exit_streak[k]
+        # 收窄标记也按 ticket 清理（同样存在 MT5 ticket 复用问题）
+        for k in [k for k in self._tightened if k not in live]:
+            self._tightened.discard(k)
 
     def decide(self, ctx: DecisionContext) -> Proposal:
         """纯函数式判定一轮行为；执行与对账在 runner。"""
@@ -351,6 +362,70 @@ class DecisionEngine:
                         reasons=reasons + ["LLM 未确认 -> 先挂限价单"])
 
     # ---------- 持仓 ----------
+    # ---------- 信号转弱 -> 收窄止损止盈（而非平仓）----------
+    def _tighten_levels(self, ctx: DecisionContext, pos, direction: str,
+                        s: float, sigma: float
+                        ) -> tuple[float, float] | None:
+        """把 SL/TP 同时向现价收近一档；无法安全收窄时返回 None。
+
+        用户 2026-09-30：「只修改止损和止盈位置（新止损止盈缩小时不受
+        1.2 倍的比例影响）」。
+
+        为什么"收窄"是正确的中性动作：信号转弱时，继续按原 SL 距离持有
+        等于**用旧信息承担风险**。把 SL 收近 = 降低单笔风险敞口；
+        把 TP 同步收近 = 让目标在当前动能下更可能达成。
+        两者都让仓位更快、更便宜地出清，而不是被信号噪声直接砍掉。
+
+        返回 `(new_sl, new_tp)`；**已按 symbol digits 规整**（否则幂等判定
+        会因浮点尾数永不收敛 —— 见 `_decide_holding` 移动止损分支的事故）。
+        """
+        atr = getattr(ctx, "atr", None) or 0.0
+        if atr <= 0:
+            return None
+        # 一次性：同一持仓只收窄一次（否则每轮 ×0.7 会棘轮到点差以内）
+        if str(getattr(pos, "ticket", "")) in self._tightened:
+            return None
+        px = float(getattr(pos, "price_open", 0.0) or 0.0)
+        cur = float(getattr(ctx, "last_close", 0.0) or 0.0)
+        sl_old = float(getattr(pos, "sl", 0.0) or 0.0)
+        if px <= 0 or cur <= 0:
+            return None
+        # 现价与持仓方向的关系：只在**顺向**（浮盈侧）才收窄，
+        # 否则"收窄"会把止损推到现价错误的一侧（MT5 直接 Invalid stops）。
+        long_side = direction == "LONG"
+        # 目标止损距离：取「原止损距离 × 0.7」与「0.6×ATR」中较小者。
+        # ⚠️ 下限是**绝对**值而非比例：实测 XAUUSDm 点差 0.240，
+        #    止损必须显著宽于点差，否则会被点差随机打掉（那不是风控是送钱）。
+        spread_pad = max(0.25, atr * 0.05)
+        old_dist = abs(cur - sl_old) if sl_old else abs(cur - px)
+        if old_dist <= 0:
+            old_dist = 0.6 * atr
+        new_dist = max(min(old_dist * 0.7, 0.6 * atr), spread_pad)
+        # 只有真的更"紧"才值得改单；否则返回 None 让上层走原逻辑
+        if sl_old and new_dist >= old_dist - 1e-9:
+            return None
+        new_sl = cur - new_dist if long_side else cur + new_dist
+        # TP 同步收近到「新止损距离 × min_rr」——这里**只用它定目标位**，
+        # 不做"是否够赔率"的放行判定（收窄动作本身豁免 min_rr，见 gate）。
+        tp_old = float(getattr(pos, "tp", 0.0) or 0.0)
+        rr = max(float(CFG.decision.signal_exit_tp_rr), 0.0)
+        tp_dist = new_dist * rr
+        new_tp = cur + tp_dist if long_side else cur - tp_dist
+        # 若原 TP 比新目标更近，保留原 TP（不要为了"统一"把目标推远）
+        if tp_old and ((long_side and tp_old < new_tp) or
+                       (not long_side and tp_old > new_tp)):
+            new_tp = tp_old
+        # 收窄后 SL 必须仍在**亏损侧**、TP 仍在**盈利侧**，否则 MT5 报
+        # 'Invalid stops'。用开仓价而非现价做最终对齐基准。
+        if long_side:
+            if new_sl >= cur or new_tp <= cur:
+                return None
+        else:
+            if new_sl <= cur or new_tp >= cur:
+                return None
+        self._tightened.add(str(getattr(pos, "ticket", "")))
+        return round(new_sl, _PX_DIGITS), round(new_tp, _PX_DIGITS)
+
     def _decide_holding(self, ctx: DecisionContext, holding, s: float, sigma: float) -> Proposal:
         pos = holding[0]
         direction = pos.type
@@ -360,17 +435,29 @@ class DecisionEngine:
         conf = float(review.get("confidence") or 0)
         adverse = (direction == "LONG" and z <= -CFG.decision.z_exit) or \
                   (direction == "SHORT" and z >= CFG.decision.z_exit)
+        # 逆向轮（z 与持仓方向符号相反）——用于**窗口不一致率**。
+        # 与 `adverse`（越过 z_exit 的强逆向）区分：后者是"信号明确反对"，
+        # 前者只是"方向对不上"，两者都要，但用途不同。
+        ekey = str(pos.ticket)
+        hist = self._adverse_hist.setdefault(ekey, collections.deque(
+            maxlen=CFG.decision.exit_adverse_window))
+        hist.append(1 if ((direction == "LONG" and z < 0)
+                          or (direction == "SHORT" and z > 0)) else 0)
         adverse_llm = (direction == "LONG" and verdict == "bearish" or
                        direction == "SHORT" and verdict == "bullish") and conf >= CFG.decision.llm_adverse_conf
-        key = direction
-        if adverse:
-            self._exit_streak[key] = self._exit_streak.get(key, 0) + 1
-        else:
-            self._exit_streak[key] = 0
-        if self._exit_streak.get(key, 0) >= CFG.decision.exit_persist_rounds:
+        # ---- 主动平仓闸（用户 2026-09-30）----
+        # 只有"窗口内逆向**比例**非常高"才主动平仓，否则一律只改止损止盈。
+        # 见 `CFG.decision.exit_adverse_window/rate` 的窗口标定说明。
+        n_hist = len(hist)
+        rate = (sum(hist) / n_hist) if n_hist else 0.0
+        # 样本不足窗口时**不判**（宁可不动，也不在半截数据上下结论）
+        full = n_hist >= CFG.decision.exit_adverse_window
+        rate_high = full and rate >= CFG.decision.exit_adverse_rate - 1e-9
+        if rate_high:
             return Proposal(kind="close_position", direction=direction,
                             entry=pos.ticket,
-                            reasons=[f"连续 {self._exit_streak[key]} 轮信号不利"])
+                            reasons=[f"近 {n_hist} 轮方向不一致率 {rate:.0%} "
+                                     f">= {CFG.decision.exit_adverse_rate:.0%}"])
         if adverse_llm:
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
                             reasons=[f"LLM 反向 {verdict_label(verdict)}/{conf:.2f}"])
@@ -476,6 +563,25 @@ class DecisionEngine:
         if signal_giveback:
             why = (f"信号回吐：峰值 z={self._score_peak[key_pos]:+.2f} "
                    f"-> {same_dir_z:+.2f}")
+            # 用户 2026-09-30：「只修改止损和止盈位置」。
+            # 信号转弱时**不再主动平仓**，改为把 SL 收到更紧处、TP 同步收近，
+            # 让仓位在下一次真实反向波动中自然离场，而不是由信号噪声砍掉。
+            tight = self._tighten_levels(ctx, pos, direction, s, sigma)
+            if tight is not None:
+                return Proposal(kind="modify_sltp", direction=direction,
+                                entry=pos.ticket, tp_struct=tight[0],
+                                new_tp=tight[1],
+                                reasons=[f"{why} -> 收窄止损止盈"
+                                         f"（止损 {tight[0]:.3f} 止盈 {tight[1]:.3f}）"])
+            if key_pos in self._tightened:
+                # 已按本条信号收窄过（一次性，防棘轮）。
+                # ⚠️ 此处**必须 hold 而非平仓**：否则"收窄"只是把平仓推迟一轮，
+                #    用户要的"只修改止损止盈位置"就没落到实处。
+                #    收窄后的止损是**真实存在的离场机制** —— 交给它执行。
+                return Proposal(kind="hold",
+                                reasons=[f"{why}，已收窄止损止盈，交由止损止盈离场"])
+            # 收窄不可行（缺 ATR / 价位异常 / 会越过现价）才退回平仓：
+            # 有信号转弱却既不收窄也不离场，是把风险敞口无条件留在场上。
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
                             reasons=[why])
         # 新闻反向减仓（阈值走配置：原为硬编码 0.8，见 CFG.decision.news_impact_close）

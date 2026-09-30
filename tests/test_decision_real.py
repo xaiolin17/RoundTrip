@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from gold_agent.common.config import CFG
@@ -409,6 +411,10 @@ def test_holding_management_not_blocked_by_pending():
     实盘证据：持仓 LONG 浮亏 −2.59，S_eff=−1.50 已越过
     exit_threshold=1.2 连续 **12 轮**，日志却一直是
     "pending x1 waiting fill" —— **该平的仓一直没平**。
+
+    ⚠️ 平仓条件已于 2026-09-30 变更（用户要求"不轻易主动平仓"）：
+    由「连续 N 轮逆向」改为「窗口不一致率 >= 阈值」。本测试要守住的
+    仍是**挂单不得掩盖持仓管理**这一条，故改为填满窗口后断言。
     """
     from gold_agent.mt5.client import OrderRow
     e = DecisionEngine(RiskGate(CircuitBreakers()))
@@ -425,8 +431,8 @@ def test_holding_management_not_blocked_by_pending():
         c.positions.pending_orders = [pend]
         return c
 
-    # 连续反向达到 exit_persist_rounds → 必须平仓，不能被挂单挡住
-    for _ in range(CFG.decision.exit_persist_rounds - 1):
+    # 填满不一致率窗口（全程逆向）→ 必须平仓，且不能被挂单挡住
+    for _ in range(CFG.decision.exit_adverse_window - 1):
         p = e.decide(_ctx_with_pending(score=-ABOVE))
     p = e.decide(_ctx_with_pending(score=-ABOVE))
     assert p.kind == "close_position", (
@@ -523,16 +529,95 @@ def test_pending_only_in_mean_revert():
 
 
 def test_holding_exit_streak():
+    """窗口不一致率填满后 → 平仓。
+
+    ⚠️ 2026-09-30 变更（用户："除非方向不一致率非常高，否则不轻易主动平仓"）：
+    原为「连续 exit_persist_rounds(3) 轮逆向即平仓」，实测 09-23 起 2283 个
+    持仓轮里 42% 逆向 → 该规则触发 139 次，是噪声驱动。现改为尾部
+    `exit_adverse_window` 轮的**比例** >= `exit_adverse_rate` 才平仓。
+    """
     e = DecisionEngine(RiskGate(CircuitBreakers()))
     pos = PositionRow(ticket=111, symbol="XAUUSDm", type="LONG", volume=0.01,
                       price_open=4350, sl=0, tp=0, profit=0, swap=0, time=0,
                       comment="", magic=CFG.mt5.magic)
-    # 需要连续 exit_persist_rounds 轮反向（P1-1 已从 3 改为 2）
-    for _ in range(CFG.decision.exit_persist_rounds - 1):
+    # 窗口未填满前**不得**平仓（半截数据不下结论）
+    for _ in range(CFG.decision.exit_adverse_window - 1):
         p = e.decide(_ctx(score=-ABOVE, holding=[pos]))
-        assert p.kind == "hold"
+        assert p.kind == "hold", f"窗口未满就平仓（{p.kind}）"
     p = e.decide(_ctx(score=-ABOVE, holding=[pos]))
     assert p.kind == "close_position"
+
+
+def test_signal_giveback_tightens_instead_of_closing():
+    """用户 2026-09-30：「只修改止损和止盈位置」——信号回吐不得直接平仓。
+
+    构造：信号峰值冲高后回落越过 reserve_drop_z，但方向仍顺持仓
+    （未触发平仓闸）。此时应收窄 SL/TP，而不是 close_position。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    pos = PositionRow(ticket=777, symbol="XAUUSDm", type="LONG", volume=0.01,
+                      price_open=4300.0, sl=4280.0, tp=4360.0, profit=1.0,
+                      swap=0, time=time.time(), comment="", magic=CFG.mt5.magic)
+    # 加仓额度用尽 —— 否则第一轮会被 `add_layer` 提前返回，
+    # 走不到 score_peak 的更新（那是本测试要建立的前提）。
+    exhausted = {"777": {"count": CFG.risk.max_adds_per_position}}
+
+    def _c(score):
+        c = _ctx(score=score, holding=[pos])
+        c.position_adds = exhausted
+        return c
+
+    # 先在强顺向信号上建立很高的 score_peak
+    e.decide(_c(3.0))
+    # 再让信号回落到顺向但明显走弱（z 仍为正 -> 不触发窗口平仓闸）
+    p = e.decide(_c(0.6))
+    assert p.kind == "modify_sltp", (
+        f"信号回吐应改为收窄止损止盈，得到 {p.kind}")
+    assert p.tp_struct is not None, "必须给出新止损"
+    assert p.new_tp is not None, "必须给出新止盈"
+
+    class _P:
+        positions = [pos]
+        pending_orders = []
+    ap = e.gate.evaluate(p, _c(0.6).ev,
+                         type("A", (), {"equity": 1e5, "margin": 0.0})(),
+                         _P(), 0.1, None, 5.0, 0.008)
+    assert ap.ok, f"改单必须放行（收窄不受 min_rr 限制），得到 {ap.reason}"
+    assert ap.plan["kind"] == "modify_sltp"
+    assert ap.plan["new_sl"] == p.tp_struct
+    assert ap.plan["keep_tp"] == p.new_tp
+
+    # ⚠️ 防棘轮：收窄是**一次性**的，且之后必须 hold 而非平仓。
+    # 否则 ①每轮 ×0.7 会几何收敛到点差以内（慢刀磨死仓位）；
+    #      ②"收窄后下一轮就平仓"等于只把平仓推迟一轮，违背用户要求。
+    sl = p.tp_struct
+    for _ in range(5):
+        nxt = e.decide(_c(0.6))
+        assert nxt.kind == "hold", (
+            f"收窄后应 hold（交由止损止盈离场），得到 {nxt.kind}")
+    # 止损不得被反复收紧
+    assert sl == p.tp_struct
+
+
+def test_tighten_never_returns_inverted_stops():
+    """收窄后的 SL/TP 必须仍在正确一侧（否则 MT5 报 Invalid stops）。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    for direction, px, sl, cur in (("LONG", 4300.0, 4280.0, 4310.0),
+                                   ("SHORT", 4300.0, 4320.0, 4290.0)):
+        pos = PositionRow(ticket=888, symbol="XAUUSDm", type=direction,
+                          volume=0.01, price_open=px, sl=sl, tp=0.0,
+                          profit=5.0, swap=0, time=time.time(),
+                          comment="", magic=CFG.mt5.magic)
+        ctx = _ctx(score=0.5, holding=[pos])
+        ctx.last_close = cur
+        out = e._tighten_levels(ctx, pos, direction, 0.5, 0.3)
+        if out is None:
+            continue
+        new_sl, new_tp = out
+        if direction == "LONG":
+            assert new_sl < cur < new_tp, f"LONG 收窄后价位颠倒：{new_sl} {cur} {new_tp}"
+        else:
+            assert new_sl > cur > new_tp, f"SHORT 收窄后价位颠倒：{new_sl} {cur} {new_tp}"
 
 
 def test_holding_llm_adverse_close():
@@ -766,22 +851,85 @@ def test_research_scripts_silence_logging():
 
     源码扫描 —— 这类"忘了加"的疏漏不会有任何运行期报错，
     只会安静地污染实盘日志，所以必须用测试锁住。
+
+    ⚠️ 2026-09-30 扩围：原测试只扫 `research/*.py`，而实测的第二次事故
+    是**仓库根目录的一次性回放脚本**（`_tmp_replay.py` 之类）造成的 ——
+    它同样调用了 `DecisionEngine.decide()`，却不在扫描范围内，
+    结果往生产日志灌了 19824 行伪造轮次。
+    现在同时扫根目录下所有 `*.py`（排除 `src/`、`tests/`、`research/`
+    这些已单独处理或有自身约定的目录）。
     """
-    import re
     from pathlib import Path
     root = Path(__file__).resolve().parents[1]
     offenders = []
-    for p in sorted((root / "research").glob("*.py")):
+    search = list((root / "research").glob("*.py")) + list(root.glob("*.py"))
+    for p in sorted(search):
         text = p.read_text(encoding="utf-8", errors="replace")
         if "DecisionEngine" not in text:
             continue
-        if "set_silent" not in text:
+        # 只要求"非实盘进程"这条新闸存在即可；set_silent 或 set_live 都算
+        if "set_silent" not in text and "set_live" not in text:
             offenders.append(p.name)
     assert not offenders, (
-        "以下研究脚本使用了 DecisionEngine 但未静默日志，"
+        "以下脚本使用了 DecisionEngine 但未静默日志，"
         f"回放会污染实盘 logs/：{offenders}\n"
         "修法：在 import DecisionEngine 之前调用 "
         "logging_util.set_silent(True)")
+
+
+def test_non_live_process_cannot_write_prod_logs(monkeypatch):
+    """回归：**默认拒绝**非实盘进程写生产 logs/（结构性防护）。
+
+    事故（2026-09-30）：`set_silent` 是自愿调用的，忘调就静默污染。
+    一次性回放脚本直接调 `DecisionEngine.decide()`，往 09-30 生产日志
+    写了 19824 行 `round=1` 的伪造轮次，并与真实轮次交错。
+    修法：`jlog` 默认拒绝写仓库根的 `logs/`，只有 `runner.main_async()`
+    调过 `set_live(True)` 之后才允许。
+    """
+    from pathlib import Path
+
+    from gold_agent.common import logging_util
+
+    prod = Path(__file__).resolve().parents[1] / "logs" / "decision_19700101.jsonl"
+    before = logging_util.blocked_writes()
+    logging_util.set_live(False)
+    logging_util.set_silent(False)
+    try:
+        logging_util.jlog(prod, {"event": "decision", "round": 1})
+    finally:
+        logging_util.set_live(True)     # 恢复，避免影响同进程其它测试
+    assert not prod.exists(), "非实盘进程竟然写进了生产 logs/"
+    assert logging_util.blocked_writes() > before, "应记录一次被拒绝的写入"
+
+
+def test_prod_log_guard_allows_live_and_temp(monkeypatch, tmp_path):
+    """守卫必须**只**拦生产目录：临时目录与 set_live 之后都要能正常写。"""
+    from pathlib import Path
+
+    from gold_agent.common import logging_util
+
+    logging_util.set_silent(False)
+    # 临时目录始终可写（测试隔离依赖这一点）
+    # ⚠️ 文件名必须和生产那个不同：`jlog` 的去重是按 `path.name` 记的
+    #    （同名的连续相同 payload 只写一条），同名会让这里的写入被去重吞掉。
+    tmp_log = tmp_path / "decision_19700202.jsonl"
+    logging_util.jlog(tmp_log, {"event": "decision", "round": 1})
+    assert tmp_log.exists(), "临时目录写入被误拦"
+
+    # set_live(True) 后生产目录可写
+    prod_dir = Path(__file__).resolve().parents[1] / "logs"
+    prod_dir.mkdir(parents=True, exist_ok=True)
+    prod = prod_dir / "decision_19700101.jsonl"
+    logging_util.set_live(True)
+    try:
+        logging_util.jlog(prod, {"event": "decision", "round": 1})
+        assert prod.exists(), "实盘进程应能写生产日志"
+    finally:
+        # ⚠️ 必须复位为 False：本进程是 pytest，不是实盘 runner。
+        #    留成 True 会让同进程后续测试（乃至误跑的脚本）重新获得
+        #    写生产日志的权限，等于把刚装上的闸又拆了。
+        logging_util.set_live(False)
+        prod.unlink(missing_ok=True)
 
 
 def test_console_output_never_crashes_on_gbk(monkeypatch):

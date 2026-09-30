@@ -262,7 +262,30 @@ class DecisionConfig:
     #: 平仓的 z 门槛。原 `exit_threshold` 的等效 z ≈ 1.2/0.4895 = 2.45。
     z_exit: float = _TOML.get("decision", {}).get("z_exit", 2.45)
     exit_threshold: float = _TOML.get("decision", {}).get("exit_threshold", 1.2)
-    exit_persist_rounds: int = _TOML.get("decision", {}).get("exit_persist_rounds", 3)
+    # ⚠️ `exit_persist_rounds` 已于 2026-09-30 **删除**：平仓判据改成
+    #    「窗口不一致率」后（见下方 `exit_adverse_window`），代码里已无人读它。
+    #    留着就是一个"改了没反应"的死配置 —— 用户明确反对
+    #    （"不能放一个没有作用的死代码在那吧，我这是商用项目"）。
+    # ---- 主动平仓闸（用户 2026-09-30 要求）----
+    # 用户原话：「除非行情和持仓方向不一致率非常高，否则不轻易主动平仓，
+    #            只修改止损和止盈位置」。
+    #
+    # 为什么用「窗口不一致率」而不是「连续 N 轮」：
+    #   原实现是 `连续 exit_persist_rounds(3) 轮逆向 → 平仓`。实测 09-23 起
+    #   2283 个持仓轮里 **46% 是逆向轮**（逐日 29%~69%），噪声很大 —— 3 轮
+    #   连续逆向在随机游走下极常见，实测按连续段去重触发 **129 次**，
+    #   是过度交易而非风控。改成尾部窗口的**比例**后，同一批数据只触发 **7 次**。
+    #   窗口取 20 轮：按实测轮间隔中位 76s ≈ 25 分钟，足够构成"持续"，
+    #   又不至于慢到错过真正的反转。
+    #   （以上数字在日志清除伪造轮次后重算，见 logging_util 的 `_live` 说明。）
+    exit_adverse_window: int = _TOML.get("decision", {}).get("exit_adverse_window", 20)
+    exit_adverse_rate: float = _TOML.get("decision", {}).get("exit_adverse_rate", 0.8)
+    #: 信号类平仓（连续不利 / 信号回吐）改为**只改止损止盈**时，
+    #: 用于**计算**目标 TP 位（新止损距离 × 本值）。
+    #: ⚠️ 这**不是**放行门槛：收窄 SL/TP（把止损止盈往里收）**不受 min_rr 限制**
+    #: （用户明确要求），因为它降低而非增加风险敞口。
+    #: `min_rr` 只约束开仓/挂单时刻的赔率。
+    signal_exit_tp_rr: float = _TOML.get("decision", {}).get("signal_exit_tp_rr", 1.2)
     # 利润回吐检测（用户选定：改用移动止损锁盈，不再砍掉浮盈）
     # ⚠️ 事故复盘：旧逻辑「浮盈回吐 50% 就平仓」实测砍掉 30%~75% 浮盈
     #    （2558982555 MFE$11.63 -> 平$2.96），实际 RR 0.64 < 计划 1.28。

@@ -410,6 +410,37 @@ def test_modify_sltp_keeps_existing_tp():
     assert res.plan["keep_tp"] == 4360.0, "plan 必须带出原持仓的 TP"
 
 
+def test_modify_sltp_can_narrow_tp_and_is_rr_exempt():
+    """用户 2026-09-30：收窄止损止盈**不受 min_rr(1.2) 限制**。
+
+    事件：用户要求「只修改止损和止盈位置（新止损止盈缩小时不受 1.2 倍的
+    比例影响）」。收窄是**降低**风险敞口，用开仓的赔率门去卡它语义上是错的。
+    实测：`rr_below_1.2` 在实盘触发 82 次，全部发生在开仓/挂单时刻，
+    从未来自 `modify_sltp` —— 本测试把这个性质锁住。
+    """
+    from gold_agent.mt5.executor import Executor, OrderPlan
+
+    gate = RiskGate(CircuitBreakers())
+    # 新 SL 距离 3.0、新 TP 距离 3.6 -> RR=1.2；故意让 TP 更近（RR=0.5）
+    res = gate.evaluate(Proposal(kind="modify_sltp", direction="LONG", entry=123456,
+                                 tp_struct=4347.0, new_tp=4348.5),
+                        _ev(), _acc(), _views([_pos(tp=4400.0)]), 0.1, None, 12.0, None)
+    assert res.ok, f"收窄动作被误拦（{res.reason}）—— 收窄应豁免 min_rr"
+    assert res.plan["new_sl"] == 4347.0
+    assert res.plan["keep_tp"] == 4348.5, "必须用新的止盈覆盖原止盈"
+    # 且 RR 确实低于 min_rr —— 证明豁免是真的生效，而不是碰巧没触发
+    rr = abs(res.plan["keep_tp"] - 4347.0) / 3.0
+    assert rr < CFG.risk.min_rr, "本用例应构造出低于 min_rr 的赔率"
+
+    # new_tp 必须真的送进 broker 请求（否则收窄止盈是空操作）
+    ex = Executor(_FakeClient())
+    req = ex._build_request(OrderPlan(kind="modify_sltp", direction="LONG",
+                                      position_ticket=123456,
+                                      sl=res.plan["new_sl"], tp=res.plan["keep_tp"]))
+    assert req.get("sl") == 4347.0 and req.get("tp") == 4348.5, \
+        "新止盈必须一并下发（SLTP 是整体覆盖）"
+
+
 def test_add_layer_carries_atr_sl_tp():
     """事故：加仓 plan 不含 tp/sl → 新仓位是 SL=0 TP=0 的裸仓。
 

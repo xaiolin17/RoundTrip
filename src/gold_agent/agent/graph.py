@@ -355,7 +355,8 @@ class Graph:
             _rev = ((st.get("llm") or {}).get("review") or None)
             approved: Approved = self.gate.evaluate(
                 Proposal(kind=prop.kind, direction=prop.direction, entry=prop.entry,
-                         tp_struct=prop.tp_struct, reasons=prop.reasons, evidence_ids=[]),
+                         tp_struct=prop.tp_struct, new_tp=prop.new_tp,
+                         reasons=prop.reasons, evidence_ids=[]),
                 ev, st["account"], st["positions"],
                 point_value_per_lot=self._point_value(),
                 df_5m=st["bundle"].frames["5m"], atr=atr,
@@ -446,14 +447,17 @@ class Graph:
                             idempotency_key=f"close-{plan['position_ticket']}")
             return await self.executor.execute(req)
         if kind == "modify_sltp":
-            # 保护性移损：SL 推到锁盈位（tp_struct 携带新 SL）；
-            # TP 保持原位（keep_tp 由风控从原持仓带出，None 才不动）
-            # 幂等键带上**目标 SL**：同一个 SL 值在同一轮内不会重复提交。
+            # 保护性移损 / 信号转弱收窄：SL 与 TP 一起改（tp_struct 携带新 SL，
+            # new_tp 携带新 TP；TP 未给则由风控从原持仓带出）
+            # 幂等键带上**目标 SL 与 TP**：同一对值在同一轮内不会重复提交。
+            # ⚠️ 必须同时含 TP：收窄场景下 SL 可能不变而只动 TP，若键里没有 TP，
+            #    两次不同的止盈会被当成同一个动作而被幂等表吞掉。
             req = OrderPlan(kind="modify_sltp", direction=plan.get("direction"),
                             position_ticket=int(plan["position_ticket"]),
                             sl=float(plan["new_sl"]), tp=plan.get("keep_tp"),
                             comment="goldagent-lock",
-                            idempotency_key=f"lock-{plan['position_ticket']}-{plan['new_sl']}")
+                            idempotency_key=(f"lock-{plan['position_ticket']}"
+                                             f"-{plan['new_sl']}-{plan.get('keep_tp')}"))
             res = await self.executor.execute(req)
             if res.ok:
                 # 回读对账：broker 实际持有的 SL 才算数（原先只看返回码）
