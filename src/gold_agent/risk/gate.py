@@ -84,14 +84,20 @@ class RiskGate:
         return None
 
     def _levels(self, direction: str, entry: float, ev, atr: float | None,
-                llm_review: dict | None = None):
+                llm_review: dict | None = None,
+                sl_from_tp: bool = False):
         """按 LLM 判断的压力位/支撑位算止损止盈（用户要求的正确语义）。
 
         ⚠️ 概念纠正：0.618 回调位是**入场点**，不是止损。
         止损止盈看**压力位/支撑位** —— 由 LLM 读 skill 输出判断，
         本地只做配套计算（方向/最小距离/盈亏比校验）。
+
+        `sl_from_tp=True` 走**加仓专用**路径：先定止盈、缩 58%、
+        再按 min_rr 反推止损（用户 2026-10-08 指定）。首仓/挂单不受影响。
         """
-        return trade_levels(direction, entry, llm_review, ev, atr)
+        return trade_levels(direction, entry, llm_review, ev, atr,
+                            tp_shrink=CFG.risk.add_tp_shrink if sl_from_tp else 1.0,
+                            sl_from_tp=sl_from_tp)
 
     def evaluate(self, prop: Proposal, ev: FusedEvidence, account: AccountInfo,
                  positions: PositionsView, point_value_per_lot: float,
@@ -297,7 +303,8 @@ class RiskGate:
             ref = self._current_price(frames, df_5m)
             if ref is None:
                 ref = pos.price_open if pos is not None else prop.entry
-            lv = self._levels(prop.direction, ref, ev, atr, llm_review)
+            lv = self._levels(prop.direction, ref, ev, atr, llm_review,
+                              sl_from_tp=True)
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
             plan = {"kind": "add_layer", "direction": prop.direction,
@@ -305,12 +312,18 @@ class RiskGate:
                     "entry": round(ref, 3),
                     "tp": lv.tp, "sl": lv.sl, "reasons": reasons,
                     "sl_source": lv.sl_source, "tp_source": lv.tp_source,
-                    "sl_dist": lv.sl_dist}
+                    "sl_dist": lv.sl_dist, "tp_dist": lv.tp_dist}
             trade_log({"event": "risk_decision", "kind": "add_layer",
                        "direction": prop.direction, "lots": add_lots,
                        "position": position_id, "score": round(r.score, 3),
                        "entry_ref": plan["entry"], "tp": plan["tp"], "sl": plan["sl"],
-                       "sl_source": lv.sl_source, "sl_dist": lv.sl_dist,
+                       "sl_source": lv.sl_source, "tp_source": lv.tp_source,
+                       "sl_dist": lv.sl_dist, "tp_dist": lv.tp_dist,
+                       # 实际盈亏比（止盈距离/止损距离）。加仓按用户 2026-10-08
+                       # 的新语义恒等于 min_rr，记下来便于事后核对。
+                       "rr": (round(lv.tp_dist / lv.sl_dist, 4)
+                              if lv.sl_dist else None),
+                       "notes": lv.notes,
                        "reasons": reasons})
             return Approved(ok=True, plan=plan)
 

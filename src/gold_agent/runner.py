@@ -144,6 +144,9 @@ def _src_suffix(plan: dict) -> str:
             parts.append("本地压力位")
         elif s.startswith("llm_hint"):
             parts.append("LLM建议")
+        elif s.startswith("rr_from_tp"):
+            # 加仓专用：止损由止盈按盈亏比反推（用户 2026-10-08 指定）
+            parts.append("止盈反推")
         elif s.startswith("chanlun"):
             parts.append("缠论结构")
         elif s.startswith("atr"):

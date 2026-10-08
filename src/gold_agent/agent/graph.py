@@ -384,6 +384,25 @@ class Graph:
                            "proposal": prop.__dict__})
                 return summary
 
+            # ---- t7b 加仓复核：算好的加仓点位再让 LLM 评判一次 ----
+            # 用户原话（2026-10-08）：
+            #   > 要注意计算了新的加仓位置和止盈止损点 让大模型再评判
+            #   > 这个单子是否还值得加仓 如果被否决就不加仓了
+            # ⚠️ 必须在**执行之前**，且只对 add_layer 生效（用户选定：
+            #    首仓/挂单不受影响）。LLM 不可用时**不加仓**（用户选定：
+            #    严格，宁可不加）—— 故障不得当成 approve。
+            if (approved.plan or {}).get("kind") == "add_layer" \
+                    and CFG.risk.add_llm_review:
+                rev_ok, rev_info = await self._review_add_layer(
+                    approved.plan, st, ev, summary["last_close"])
+                summary["add_review"] = rev_info
+                if not rev_ok:
+                    trade_log({"event": "risk_reject", "round": round_id,
+                               "kind": "add_layer",
+                               "reason": f"add_review: {rev_info.get('reason')}",
+                               "proposal": prop.__dict__})
+                    return summary
+
             # t8 execute
             exec_res = await self._execute(approved.plan, st)
             st["execution"] = exec_res
@@ -417,6 +436,56 @@ class Graph:
             summary["error"] = f"{type(e).__name__}: {e}"
             summary["action"] = "safe_hold"
             return summary
+
+    async def _review_add_layer(self, plan: dict, st: GraphState,
+                                ev, last_close: float) -> tuple[bool, dict]:
+        """让 LLM 复核算好的加仓点位。返回 (是否放行, 复核信息)。
+
+        用户原话（2026-10-08）：
+        > 要注意计算了新的加仓位置和止盈止损点 让大模型再评判这个单子
+        > 是否还值得加仓 如果被否决就不加仓了
+
+        放行条件 = LLM 明确返回 `decision == "approve"`。
+        其余情况（reject / 超时 / 接口 503 / 返回格式不对）一律**不加仓** ——
+        用户选定"严格"：复核不了就不加，故障不得当成默认放行。
+        """
+        info: dict = {"decision": None, "reason": "", "confidence": None}
+        if self.llm is None:
+            info["reason"] = "LLM 不可用（未初始化）"
+            return False, info
+        lc = float(last_close or 0.0)
+        if lc <= 0:
+            # 现价缺失时无法给 LLM 判断"还剩多少空间"
+            info["reason"] = "缺少现价，无法复核"
+            return False, info
+        # 该持仓的加仓进度（让 LLM 知道已经加了几层）
+        tid = str(plan.get("position_ticket", ""))
+        rec = (self._position_adds or {}).get(tid) or {}
+        pos_ctx = {
+            "adds_count": int(rec.get("count", 0)) if isinstance(rec, dict) else int(rec or 0),
+            "max_adds": CFG.risk.max_adds_per_position,
+            "price_open": plan.get("entry"),
+        }
+        try:
+            res = await self.llm.review_add_layer(
+                plan["direction"], float(plan["entry"]), float(plan["sl"]),
+                float(plan["tp"]), float(plan.get("sl_dist") or 0.0),
+                abs(float(plan["tp"]) - float(plan["entry"])), lc,
+                ev=ev, position=pos_ctx)
+        except Exception as e:
+            info["reason"] = f"复核异常: {type(e).__name__}: {e}"
+            log_warn(f"加仓复核异常，按用户选定策略不加仓: {e}")
+            return False, info
+        if not isinstance(res, dict):
+            info["reason"] = "复核无结果（大模型不可用）"
+            return False, info
+        info.update({k: res.get(k) for k in ("decision", "confidence", "reason")})
+        info["risk_flags"] = res.get("risk_flags") or []
+        trade_log({"event": "add_review", "round": st.get("round_id"),
+                   "plan": plan, "result": info})
+        if res.get("decision") != "approve":
+            return False, info
+        return True, info
 
     async def _execute(self, plan: dict, st: GraphState) -> ExecutionResult:
         kind = plan.get("kind")

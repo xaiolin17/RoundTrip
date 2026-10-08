@@ -59,6 +59,13 @@ class LLMConfig:
     per_hour_budget: int = _TOML.get("llm", {}).get("per_hour_budget", 24)
     #: 新闻面（LLM-B）每小时预算，独立于 review。
     news_per_hour_budget: int = _TOML.get("llm", {}).get("news_per_hour_budget", 24)
+    #: 加仓复核（LLM-C）每小时预算，独立于 review/news。
+    #: ⚠️ 必须独立：加仓复核是"每笔加仓一次"，若与 review 共用池子，
+    #:    会在加仓活跃时把主评审的额度吃光（research/20 已记录过同类事故：
+    #:    news 挤占 review 导致 review 覆盖率跌到 4.3%）。
+    #:    默认 24 与 review 同级；复核失败只是"不加仓"，不会影响主流程。
+    add_review_per_hour_budget: int = _TOML.get("llm", {}).get(
+        "add_review_per_hour_budget", 24)
     #: 评审最小间隔（分钟）。1h 决策周期下应为 0（每轮都评审）。
     min_interval_min: float = _TOML.get("llm", {}).get("min_interval_min", 0.0)
     #: review 失败重试次数（换温度 0）
@@ -143,6 +150,19 @@ class RiskConfig:
     level_pad_atr: float = _TOML.get("risk", {}).get("level_pad_atr", 0.25)
     # 最小盈亏比：止盈距离 < 止损距离 × 该值 → 不开仓
     min_rr: float = _TOML.get("risk", {}).get("min_rr", 1.2)
+    # ---- 加仓专用定价（用户 2026-10-08 指定）----
+    # 用户原话：
+    #   > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.2
+    #   > 然后加仓的单子止盈点不能按照计算的数值来 要对应缩小42% 也就是原值的58%
+    # 语义：加仓先由结构位算出止盈目标，其**距离**缩到 add_tp_shrink 倍，
+    #       再由缩后的止盈距离按 min_rr 反推止损（止损不再取自支撑位）。
+    # 0.58 = 缩 42%。设为 1.0 即关闭缩放（退回"止盈不缩"的行为）。
+    add_tp_shrink: float = _TOML.get("risk", {}).get("add_tp_shrink", 0.58)
+    # 加仓定价后是否再让 LLM 复核这一单是否值得加（用户 2026-10-08 指定）：
+    #   > 要注意计算了新的加仓位置和止盈止损点 让大模型再评判这个单子
+    #   > 是否还值得加仓 如果被否决就不加仓了
+    # LLM 不可用（超时/接口故障）时**不加仓**（用户选定：严格）。
+    add_llm_review: bool = _TOML.get("risk", {}).get("add_llm_review", True)
     # LLM 没给出可用压力位时是否仍允许开仓
     # 用户选定 False：**不开仓，等 LLM 可用**（猜点位比不交易更危险）
     allow_trade_without_llm_levels: bool = _TOML.get("risk", {}).get(

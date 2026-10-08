@@ -117,10 +117,14 @@ class RunningHubClient:
         self.base_url = cfg.base_url.rstrip("/")
         self.model = cfg.model
         self.api_key = cfg.api_key
-        # 分离预算：review 与 news 各自独立，互不挤占
+        # 分离预算：review / news / add_review 各自独立，互不挤占
+        # ⚠️ add_review 必须独立池子：它是"每笔加仓一次"，若与 review 共用，
+        #    加仓活跃时会把主评审额度吃光（research/20 记录过 news 挤占
+        #    review 导致覆盖率跌到 4.3% 的事故）。
         self.budgets: dict[str, Budget] = {
             "review": Budget(cfg.per_hour_budget),
             "news": Budget(cfg.news_per_hour_budget),
+            "add_review": Budget(cfg.add_review_per_hour_budget),
         }
         self._session: aiohttp.ClientSession | None = None
 

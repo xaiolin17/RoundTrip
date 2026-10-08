@@ -339,11 +339,27 @@ def _pick_src(level: float | None, llm_vals: list[float],
 
 
 def trade_levels(direction: str, entry: float, review: dict | None,
-                 ev=None, atr: float | None = None) -> TradeLevels:
+                 ev=None, atr: float | None = None,
+                 tp_shrink: float = 1.0,
+                 sl_from_tp: bool = False) -> TradeLevels:
     """按 LLM 判断的压力位/支撑位算止损止盈。
 
     做多：止损 = 下方最近**支撑**位再让开一点；止盈 = 上方最近**压力**位
     做空：止损 = 上方最近**压力**位再让开一点；止盈 = 下方最近**支撑**位
+
+    加仓专用模式（`sl_from_tp=True`，用户 2026-10-08 指定）
+    ------------------------------------------------------
+    加仓的**计算顺序与默认路径相反**，用户原话：
+
+    > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.2
+    > 然后加仓的单子止盈点不能按照计算的数值来 要对应缩小42% 也就是原值的58%
+
+    即：
+      1. 先由结构位算出止盈目标（"计算值"，距离 D）
+      2. 止盈距离缩到 `tp_shrink` 倍（0.58 = 缩 42%）
+      3. 再由**缩后的止盈距离**按 `min_rr` 反推止损
+         止损距离 = 止盈距离 / min_rr
+    → 加仓的止损**不再取自支撑位**，而是由止盈反推（`sl_source=rr_from_tp`）。
     """
     out = TradeLevels()
     if entry is None or entry <= 0:
@@ -477,6 +493,13 @@ def trade_levels(direction: str, entry: float, review: dict | None,
                     f"< {CFG.risk.conflict_atr_mult}×ATR {conf_d:.2f}，LLM位）"
                     f"-> 结构不利，降仓处理（不再硬拒）")
 
+    # ---- 加仓专用：先定止盈 → 缩 58% → 按 min_rr 反推止损 ----
+    # （用户 2026-10-08 指定，见函数 docstring；与下面的默认顺序相反）
+    if sl_from_tp:
+        return _levels_from_tp(direction, entry, out, res_all, sup_all,
+                               res, sup, s_res, s_sup, hint_tp, min_d,
+                               tp_shrink)
+
     # ---- 先定止损，再据此选"够赔率"的止盈压力位 ----
     if out.sl is None:
         out.reason = "no_support_below" if direction == "LONG" else "no_resistance_above"
@@ -533,6 +556,97 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     if out.tp_dist < out.sl_dist * CFG.risk.min_rr - 1e-9:
         out.reason = f"rr_below_{CFG.risk.min_rr}"
         return out
+
+    out.ok = True
+    return out
+
+
+def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
+                    res_all: list[float], sup_all: list[float],
+                    res: list[float], sup: list[float],
+                    s_res: list[float], s_sup: list[float],
+                    hint_tp: float | None, min_d: float,
+                    tp_shrink: float) -> TradeLevels:
+    """加仓定价：**由止盈反推止损**（用户 2026-10-08 指定）。
+
+    用户原话：
+    > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.2
+    > 然后加仓的单子止盈点不能按照计算的数值来 要对应缩小42% 也就是原值的58%
+
+    步骤（顺序与默认路径相反）：
+      1. 由结构位算出"计算值"止盈目标（做多取上方压力、做空取下方支撑）
+      2. 止盈**距离**缩到 `tp_shrink` 倍（0.58 = 缩 42%）
+      3. 止损距离 = 缩后止盈距离 / `min_rr`（1.2）
+         —— 止损不再取自支撑位，而是**由止盈反推**，故 `sl_source="rr_from_tp"`
+
+    为什么先缩止盈再反推止损：若先用未缩的结构距离反推止损、再缩止盈，
+    实际盈亏比会掉到 `tp_shrink/min_rr` = 0.58/1.2 ≈ 0.70，与用户
+    "盈亏比 1.2"的要求矛盾；先缩止盈再反推才能让实际盈亏比正好等于 1.2。
+    """
+    # ---- 1. 取"计算值"止盈目标（未缩）----
+    is_long = direction == "LONG"
+    if is_long:
+        raw_tp = _nearest_above(res_all, entry)
+        lv_src, s_list = res, s_res
+        kind = "resistance"
+    else:
+        raw_tp = _nearest_below(sup_all, entry)
+        lv_src, s_list = sup, s_sup
+        kind = "support"
+
+    if raw_tp is None and hint_tp is not None:
+        # 结构位没有可用目标时退到 LLM 的 tp_hint（也在正确一侧才算）
+        if (is_long and hint_tp > entry) or (not is_long and hint_tp < entry):
+            raw_tp = hint_tp
+            out.tp_source = "llm_hint"
+    if raw_tp is None:
+        out.reason = "no_resistance_above" if is_long else "no_support_below"
+        return out
+    if not out.tp_source:
+        out.tp_source = _pick_src(raw_tp, lv_src, s_list, kind)
+    out.used_tp_level = raw_tp
+
+    raw_tp_dist = abs(raw_tp - entry)
+    if raw_tp_dist <= 0:
+        out.reason = "tp_at_entry"
+        return out
+
+    # ---- 2. 止盈距离缩到 tp_shrink 倍（用户指定 58%）----
+    tp_dist = raw_tp_dist * tp_shrink
+    # 缩后仍要尊重 ATR 防贴脸下限，否则止盈贴脸毫无意义
+    if min_d and tp_dist < min_d:
+        out.notes.append(
+            f"缩短后止盈距离 {tp_dist:.3f} < 下限 {min_d:.3f} → 外扩到下限")
+        tp_dist = min_d
+    out.notes.append(
+        f"加仓止盈按用户要求缩 {1 - tp_shrink:.0%}："
+        f"结构距离 {raw_tp_dist:.3f} -> {tp_dist:.3f}")
+
+    # ---- 3. 由缩后的止盈距离反推止损（盈亏比 = min_rr）----
+    sl_dist = tp_dist / CFG.risk.min_rr
+    prev_sl = out.sl
+    out.sl = round(entry - sl_dist if is_long else entry + sl_dist, 3)
+    # ⚠️ 这里**刻意**覆盖掉上面按支撑/压力位算出的 out.sl：
+    #    用户要求加仓的止损来自止盈位置，不是支撑位。
+    out.sl_source = "rr_from_tp"
+    out.used_sl_level = None
+    out.notes.append(
+        f"加仓止损由止盈反推：止盈距离 {tp_dist:.3f} / 盈亏比 "
+        f"{CFG.risk.min_rr} = 止损距离 {sl_dist:.3f}"
+        f"（原支撑位止损 {prev_sl} 已被覆盖）")
+
+    out.tp = round(entry + tp_dist if is_long else entry - tp_dist, 3)
+    if sl_dist <= 0:
+        out.reason = "sl_at_entry"
+        return out
+    # ⚠️ 赔率校验用**未规整**的距离：sl_dist 恰好等于 tp_dist/min_rr，
+    #    规整到 3 位小数后会引入 ~0.0005 误差，若拿规整后的值比较，
+    #    本应恰好等于 1.2 的赔率会被误判为"低于 1.2"而拒绝。
+    if tp_dist < sl_dist * CFG.risk.min_rr - 1e-9:
+        out.reason = f"rr_below_{CFG.risk.min_rr}"
+        return out
+    out.sl_dist = round(abs(entry - out.sl), 3)
+    out.tp_dist = round(abs(out.tp - entry), 3)
 
     out.ok = True
     return out

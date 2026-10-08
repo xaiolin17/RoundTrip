@@ -167,6 +167,111 @@ def _fmt_num(x, nd: int = 2) -> str:
         return str(x)
 
 
+# ---------------------------------------------------------------------------
+# LLM-B：加仓复核（用户 2026-10-08 指定）
+# ---------------------------------------------------------------------------
+# 用户原话：
+#   > 要注意计算了新的加仓位置和止盈止损点 让大模型再评判这个单子
+#   > 是否还值得加仓 如果被否决就不加仓了
+_ADD_REVIEW_SYSTEM = """你是黄金（XAUUSD）交易的风险复核员。
+系统已经在**已有持仓**上算出了一笔新的加仓单（含入场价、止损、止盈、
+盈亏比）。你的唯一任务是判断：**在当前结构下，这一笔加仓还值不值得做**。
+
+必须遵守：
+- 只依据输入里给出的数字/结构，**禁止编造价格**。
+- 不确定就写 uncertain 并在 reason 里说明，不要猜。
+- 常见否决理由（举例，不限于此）：
+  · 现价已经贴近止盈目标 → 剩余空间太小，加仓是给别人接盘
+  · 现价离止损太近，或加仓方向与结构（中枢/OB/趋势）相反
+  · 已到阻力/支撑密集区，继续加仓的风险收益不成比例
+  · 加仓后总仓位在该方向上过度集中
+- **默认从严**：只有结构确实支持继续加，才给 approve。
+- 不要输出手数或下单指令（订单参数只出自 risk 模块）。"""
+
+
+ADD_REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        # 只有 approve 才允许加仓；其余一律不加
+        "decision": {"type": "string", "enum": ["approve", "reject"]},
+        "confidence": {"type": "number"},
+        "reason": {"type": "string"},
+        "risk_flags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["decision", "confidence", "reason"],
+}
+
+
+def build_add_review_user(direction: str, entry: float, sl: float, tp: float,
+                          sl_dist: float, tp_dist: float, rr: float,
+                          last_close: float,
+                          ev: FusedEvidence | None = None,
+                          position: dict | None = None) -> str:
+    """构造加仓复核输入：**新算出的点位** + 结构上下文。
+
+    必须把系统刚算出的入场/止损/止盈/盈亏比明确喂给 LLM —— 用户要求的是
+    "让它评判**这个单子**"，所以这一单的具体参数是复核的核心输入。
+    """
+    side = "做多" if direction == "LONG" else "做空"
+    lines = [
+        f"已有持仓方向: {side}",
+        f"当前市价: {_fmt_num(last_close)}",
+        "",
+        "═══ 系统算出的这一笔加仓单 ═══",
+        f"  方向: {side}",
+        f"  入场价: {_fmt_num(entry)}（市价成交）",
+        f"  止损: {_fmt_num(sl)}（距离 {_fmt_num(sl_dist)} 点）",
+        f"  止盈: {_fmt_num(tp)}（距离 {_fmt_num(tp_dist)} 点）",
+        f"  盈亏比: {rr:.2f}",
+    ]
+    if position:
+        lines.append(
+            f"  该持仓已有加仓次数: {position.get('adds_count', 0)} / "
+            f"{position.get('max_adds', 5)}")
+        lines.append(f"  该持仓开仓价: {_fmt_num(position.get('price_open'))}")
+    # 现价相对止盈/止损的位置 —— 判断"是不是已经没空间了"的关键
+    if direction == "LONG":
+        room_tp = tp - last_close
+        room_sl = last_close - sl
+    else:
+        room_tp = last_close - tp
+        room_sl = sl - last_close
+    lines.append(f"  现价到止盈还剩: {_fmt_num(room_tp)} 点")
+    lines.append(f"  现价到止损还有: {_fmt_num(room_sl)} 点")
+
+    if ev is not None:
+        r = ev.result
+        lines.append("")
+        lines.append("═══ 结构上下文 ═══")
+        lines.append(
+            f"融合分 S={r.score:+.2f}（校正后 {r.score - r.score_baseline:+.2f}，"
+            f"sigma={r.sigma:.2f}）regime={r.regime} 分歧={r.disagreement}")
+        # 缠论中枢（进出场位置判断的核心结构）
+        for tf, cr in (ev.chanlun or {}).items():
+            zs = getattr(cr, "center", None) or {}
+            if zs:
+                lines.append(
+                    f"  缠论[{tf}] 中枢 [{_fmt_num(zs.get('zd'))}, "
+                    f"{_fmt_num(zs.get('zg'))}] 现价位于 "
+                    f"{'中枢上方' if last_close > (zs.get('zg') or 0) else '中枢下方' if last_close < (zs.get('zd') or 0) else '中枢内部'}")
+        # SMC 的关键位
+        mob = ev.mobius
+        items = (mob.items() if isinstance(mob, dict)
+                 else ((("15m", mob),) if mob is not None else ()))
+        for tf, mr in items:
+            if mr is None or getattr(mr, "status", "") == "unavailable":
+                continue
+            ob = mr.active_order_blocks("swing") or []
+            if ob:
+                lines.append(
+                    f"  SMC[{tf}] 活跃OB x{len(ob)}: "
+                    f"{[(_fmt_num(o.get('bottom')), _fmt_num(o.get('top'))) for o in ob[-3:]]}")
+            lines.append(f"  SMC[{tf}] 现价区域: {mr.zone_of(last_close)}")
+    lines.append("")
+    lines.append("请判断这一笔加仓是否值得做，给出 approve 或 reject。")
+    return "\n".join(lines)
+
+
 def build_review_user(ev: FusedEvidence, news: NewsView | None, last_close: float) -> str:
     """构造评审输入：按 skill 要求的字段组织，并**显式标注缺失项**。
 
@@ -349,6 +454,42 @@ class Orchestrator:
                     self.review_failures += 1
                 llm_log({"event": f"{k}_failed", "error": str(v)})
         return out
+
+    # ---------- 加仓复核（用户 2026-10-08 指定） ----------
+    async def review_add_layer(self, direction: str, entry: float, sl: float,
+                               tp: float, sl_dist: float, tp_dist: float,
+                               last_close: float, ev: FusedEvidence | None = None,
+                               position: dict | None = None) -> dict | None:
+        """让 LLM 复核"这一笔加仓还值不值得做"。
+
+        用户原话：
+        > 要注意计算了新的加仓位置和止盈止损点 让大模型再评判这个单子
+        > 是否还值得加仓 如果被否决就不加仓了
+
+        返回：
+          {"decision": "approve"|"reject", "confidence": float,
+           "reason": str, "risk_flags": [...]}
+          **LLM 不可用/失败时返回 None** —— 调用方按用户选定的严格策略
+          处理（不加仓），不要把故障当成 approve。
+        """
+        if not self._ensure_client():
+            llm_log({"event": "add_review_client_init_fail",
+                     "error": self._init_error})
+            return None
+        rr = (tp_dist / sl_dist) if sl_dist > 0 else 0.0
+        user = build_add_review_user(direction, entry, sl, tp, sl_dist, tp_dist,
+                                     rr, last_close, ev=ev, position=position)
+        try:
+            res = await self.client.chat_json(
+                _ADD_REVIEW_SYSTEM, user, ADD_REVIEW_SCHEMA,
+                timeout_s=CFG.llm.review_timeout_s, kind="add_review")
+        except Exception as e:
+            llm_log({"event": "add_review_failed", "error": str(e)})
+            return None
+        if not isinstance(res, dict) or not res.get("decision"):
+            llm_log({"event": "add_review_failed", "error": f"bad result: {res!r}"})
+            return None
+        return res
 
     # ---------- 覆盖率诊断（research/20 的验收指标） ----------
     @property

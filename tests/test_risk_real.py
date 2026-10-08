@@ -1,6 +1,7 @@
 """风控模块测试：真实历史数据驱动仓位/收缩/熔断。"""
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pandas as pd
@@ -311,6 +312,10 @@ def test_add_layer_allowed_with_local_structure_only():
 
     这是 `test_add_layer_rejected_without_llm_levels` 的对照面：
     点位来源不必是 LLM，本地缠论中枢/SMC 结构位同样有效。
+
+    ⚠️ 2026-10-08 用户改了加仓定价语义：止盈取自结构位并缩 58%，
+    **止损由止盈反推**（`sl_source="rr_from_tp"`），不再取支撑位。
+    所以这里断言的是新语义：止盈来自结构压力位（缩后），止损来自反推。
     """
     gate = RiskGate(CircuitBreakers())
     cl = {"15m": type("C", (), {"center": {"zg": 4400.0, "zd": 4300.0,
@@ -327,8 +332,13 @@ def test_add_layer_allowed_with_local_structure_only():
                         llm_review={})   # LLM 什么都没给
     assert res.ok, f"本地有结构位就该放行，得到 {res.reason}"
     assert res.plan["sl"] < 4350.0 < res.plan["tp"], "止损止盈必须在入场价正确一侧"
-    assert res.plan["sl_source"] == "struct_support", res.plan["sl_source"]
+    # 止盈来自本地结构位；止损由止盈按 min_rr 反推（用户 2026-10-08 指定）
     assert res.plan["tp_source"] == "struct_resistance", res.plan["tp_source"]
+    assert res.plan["sl_source"] == "rr_from_tp", res.plan["sl_source"]
+    rr = (abs(res.plan["tp"] - res.plan["entry"])
+          / abs(res.plan["entry"] - res.plan["sl"]))
+    assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), \
+        f"加仓实际盈亏比必须等于 min_rr，得到 {rr:.4f}"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -457,7 +467,6 @@ def test_add_layer_prices_off_current_market_not_first_entry():
     """
     gate = RiskGate(CircuitBreakers())
     atr = 12.339
-    pad = CFG.risk.level_pad_atr * atr
 
     def run(last_close: float):
         # 现价放进 1m 帧（与 open_market 的 ctx.last_close 同源）
@@ -477,35 +486,74 @@ def test_add_layer_prices_off_current_market_not_first_entry():
     assert lo.plan["entry"] == pytest.approx(4345.0, abs=0.01), \
         "加仓定价必须用当前市价（原实现恒用首仓 price_open=4350）"
     assert hi.plan["entry"] != lo.plan["entry"], "现价不同则锚点必须不同"
-    # 止损 = 下方支撑让开 pad（与现价无关，仍取自 LLM 位）
-    assert lo.plan["sl"] == pytest.approx(4340.0 - pad, abs=0.01)
+    # 止损由止盈反推（用户 2026-10-08 指定），盈亏比恰为 min_rr
+    assert lo.plan["sl_source"] == "rr_from_tp", lo.plan["sl_source"]
+    rr = (lo.plan["tp"] - lo.plan["entry"]) / (lo.plan["entry"] - lo.plan["sl"])
+    assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), f"盈亏比 {rr:.4f}"
 
 
-def test_add_layer_rejects_add_whose_rr_is_below_min_rr():
-    """现价贴近止盈位时，加仓的赔率不足 → 必须拒绝（不得下单）。
+def test_add_layer_rr_is_always_exactly_min_rr():
+    """加仓的盈亏比**恒等于** min_rr（用户要求「盈亏比 1.2」）。
 
-    这是上面那个 bug 的**后果**验证：低赔率加仓本就该被 `min_rr` 拦掉。
-    做多首仓在 4350，现价已涨到止盈位附近 4490（压力位 4500）：
-      风险 = 4490 - 止损(4400-pad)；回报 = 4500 - 4490 ≈ 10
-    → 赔率远低于 1.2 → 应返回 `levels: rr_below_...`。
+    ⚠️ 这是新定价语义的直接推论：止损由止盈反推（`sl_dist = tp_dist / min_rr`），
+    所以加仓**不可能**再出现低赔率单 —— 这正是用户 2026-10-08 抱怨
+    「盈亏比都拉成什么比列了」要解决的问题。
+
+    本测试覆盖三种现价情形（远离/贴近/几乎贴住压力位），
+    盈亏比都必须恰好等于 min_rr，且方向正确（SL < 入场 < TP）。
     """
     gate = RiskGate(CircuitBreakers())
     atr = 12.339
-    frames = {"1m": pd.DataFrame({"close": [4490.0]})}
+    # 压力位 4500 固定；现价从远离到几乎贴住
+    for px in (4200.0, 4400.0, 4490.0, 4499.0):
+        frames = {"1m": pd.DataFrame({"close": [px]})}
+        res = gate.evaluate(
+            Proposal(kind="add_layer", direction="LONG", entry=123456),
+            _ev(), _acc(), _views([_pos(price_open=4350.0)]),
+            0.1, None, atr, None,
+            llm_review=_llm_rev([4000.0], [4500.0]), frames=frames)
+        assert res.ok, f"现价 {px} 时不应被拒: {res.reason}"
+        pl = res.plan
+        assert pl["sl"] < pl["entry"] < pl["tp"], f"现价 {px} 方向错误"
+        rr = (pl["tp"] - pl["entry"]) / (pl["entry"] - pl["sl"])
+        assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), \
+            f"现价 {px} 盈亏比 {rr:.4f} 不等于 {CFG.risk.min_rr}"
+        assert pl["sl_source"] == "rr_from_tp"
+
+
+def test_add_layer_tp_is_shrunk_to_58_percent_of_structure():
+    """加仓止盈距离必须是结构距离的 58%（用户指定缩 42%）。
+
+    用户原话：
+    > 然后加仓的单子止盈点不能按照计算的数值来 要对应缩小42%
+    > 也就是原值的58%
+    """
+    gate = RiskGate(CircuitBreakers())
+    atr = 12.339
+    px = 4350.0
+    frames = {"1m": pd.DataFrame({"close": [px]})}
     res = gate.evaluate(
         Proposal(kind="add_layer", direction="LONG", entry=123456),
         _ev(), _acc(), _views([_pos(price_open=4350.0)]),
         0.1, None, atr, None,
-        llm_review=_llm_rev([4400.0], [4500.0]), frames=frames)
-    assert not res.ok, "赔率不足的加仓必须被拒，否则就是这次事故"
-    assert "rr_below" in res.reason or "levels" in res.reason, res.reason
+        llm_review=_llm_rev([4300.0], [4500.0]), frames=frames)
+    assert res.ok, res.reason
+    struct_dist = 4500.0 - px          # 结构距离 = 150
+    want = struct_dist * CFG.risk.add_tp_shrink   # 150 * 0.58 = 87
+    got = res.plan["tp"] - res.plan["entry"]
+    assert got == pytest.approx(want, abs=0.01), \
+        f"止盈距离应为结构距离的 58%（{want}），实际 {got}"
+    assert CFG.risk.add_tp_shrink == pytest.approx(0.58), \
+        "用户指定 58%，配置不得偏离"
 
 
 def test_add_layer_carries_atr_sl_tp():
     """事故：加仓 plan 不含 tp/sl → 新仓位是 SL=0 TP=0 的裸仓。
 
     实测 3 个裸仓全部来自加仓（magic 相同，comment='goldagent-add'）。
-    现在 SL/TP 来自 LLM 判断的压力位/支撑位。
+    SL/TP 现在按用户 2026-10-08 指定的加仓语义计算：
+      止盈 = 结构压力位（距离缩 add_tp_shrink 倍）
+      止损 = 由缩后止盈距离按 min_rr 反推
     """
     gate = RiskGate(CircuitBreakers())
     atr = 12.339
@@ -517,12 +565,19 @@ def test_add_layer_carries_atr_sl_tp():
     pl = res.plan
     assert pl.get("sl") and pl.get("tp"), "加仓必须自带止损止盈，否则是裸仓"
     assert pl["sl"] < pl["entry"] < pl["tp"], "做多加仓：SL < 入场 < TP"
-    # 止损 = 下方支撑位让开 pad；止盈 = 上方压力位
-    pad = CFG.risk.level_pad_atr * atr
-    assert pl["sl"] == pytest.approx(4340.0 - pad, abs=0.01)
-    assert pl["tp"] == pytest.approx(4420.0, abs=0.01)
-    assert pl["sl_source"].startswith("llm_support")
+    # 止盈距离 = 结构距离(4420-4350=70) × 0.58 = 40.6
+    raw_tp_dist = 4420.0 - pl["entry"]
+    assert pl["tp"] == pytest.approx(pl["entry"] + raw_tp_dist * CFG.risk.add_tp_shrink,
+                                     abs=0.01)
+    # 止损距离 = 缩后止盈距离 / min_rr
+    want_sl_dist = (pl["tp"] - pl["entry"]) / CFG.risk.min_rr
+    assert pl["sl"] == pytest.approx(pl["entry"] - want_sl_dist, abs=0.01)
+    # 止损不再取支撑位，而是由止盈反推
+    assert pl["sl_source"] == "rr_from_tp", pl["sl_source"]
     assert pl["tp_source"] == "llm_resistance"
+    # 实际盈亏比必须正好是 min_rr
+    rr = (pl["tp"] - pl["entry"]) / (pl["entry"] - pl["sl"])
+    assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), f"盈亏比 {rr:.4f}"
 
 
 def test_profit_lock_sl_distance_is_sane():
@@ -790,4 +845,163 @@ def test_no_wall_clock_in_idempotency_keys():
     assert keys, f"未找到幂等键定义: {code!r}"
     for k in keys:
         assert "time" not in k, f"幂等键 {k!r} 含时间成分"
+
+
+# ══════════════════════════════════════════════════════════════════
+# 加仓 LLM 复核（用户 2026-10-08 指定）
+# ══════════════════════════════════════════════════════════════════
+def _add_plan():
+    """构造一个已通过风控的加仓 plan（供复核测试用）。"""
+    return {"kind": "add_layer", "direction": "LONG", "lots": 0.01,
+            "position_ticket": "123456", "entry": 4350.0,
+            "tp": 4380.0, "sl": 4325.0, "sl_source": "rr_from_tp",
+            "tp_source": "llm_resistance", "sl_dist": 25.0, "reasons": []}
+
+
+class _FakeLLM:
+    """假 orchestrator：只实现复核所需接口，记录收到的点位。"""
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    async def review_add_layer(self, direction, entry, sl, tp, sl_dist,
+                               tp_dist, last_close, ev=None, position=None):
+        self.calls.append(dict(direction=direction, entry=entry, sl=sl, tp=tp,
+                               sl_dist=sl_dist, tp_dist=tp_dist,
+                               last_close=last_close, position=position))
+        return self.result
+
+
+def _graph_with(llm):
+    """造一个最小 Graph，只替换 llm（其余依赖不参与复核路径）。"""
+    import gold_agent.agent.graph as g
+    gr = g.Graph.__new__(g.Graph)
+    gr.llm = llm
+    gr._position_adds = {"123456": {"count": 2}}
+    return gr
+
+
+def _ev_stub():
+    return type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
+
+
+def test_add_review_approve_allows_add():
+    """LLM 明确 approve → 放行加仓。"""
+    llm = _FakeLLM({"decision": "approve", "confidence": 0.8,
+                    "reason": "结构支持", "risk_flags": []})
+    gr = _graph_with(llm)
+    ok, info = asyncio.run(gr._review_add_layer(_add_plan(), {}, _ev_stub(), 4350.0))
+    assert ok, info
+    assert info["decision"] == "approve"
+    assert len(llm.calls) == 1
+
+
+def test_add_review_reject_blocks_add():
+    """LLM 否决 → 不加仓（用户原话：如果被否决就不加仓了）。"""
+    llm = _FakeLLM({"decision": "reject", "confidence": 0.9,
+                    "reason": "现价已贴近止盈，空间不足", "risk_flags": ["tp_too_close"]})
+    gr = _graph_with(llm)
+    ok, info = asyncio.run(gr._review_add_layer(_add_plan(), {}, _ev_stub(), 4379.0))
+    assert not ok, "被否决就必须不加仓"
+    assert info["decision"] == "reject"
+    assert "空间不足" in info["reason"]
+
+
+def test_add_review_unavailable_blocks_add_strict():
+    """LLM 不可用（超时/503/返回 None）→ **不加仓**（用户选定：严格）。
+
+    故障绝不能被当成默认放行，否则接口一挂就等于复核闸门消失。
+    """
+    gr = _graph_with(_FakeLLM(None))          # 返回 None = 复核无结果
+    ok, info = asyncio.run(gr._review_add_layer(_add_plan(), {}, _ev_stub(), 4350.0))
+    assert not ok, "复核无结果时必须不加仓（严格策略）"
+    assert "不可用" in info["reason"] or "无结果" in info["reason"], info
+
+
+def test_add_review_missing_llm_blocks_add():
+    """orchestrator 未初始化（self.llm is None）→ 不加仓。"""
+    gr = _graph_with(None)
+    ok, info = asyncio.run(gr._review_add_layer(_add_plan(), {}, _ev_stub(), 4350.0))
+    assert not ok
+    assert "不可用" in info["reason"], info
+
+
+def test_add_review_exception_blocks_add():
+    """复核过程抛异常 → 不加仓（不得让异常变成放行）。"""
+    class _Boom:
+        async def review_add_layer(self, *a, **k):
+            raise RuntimeError("boom")
+
+    gr = _graph_with(_Boom())
+    ok, info = asyncio.run(gr._review_add_layer(_add_plan(), {}, _ev_stub(), 4350.0))
+    assert not ok
+    assert "异常" in info["reason"], info
+
+
+def test_add_review_receives_new_levels_and_position_context():
+    """复核必须收到**新算出的点位**（入场/止损/止盈/距离/加仓次数）。
+
+    用户要求"让它评判**这个单子**" —— 点位不喂进去，复核就是空谈。
+    """
+    llm = _FakeLLM({"decision": "approve", "confidence": 0.7, "reason": "ok"})
+    gr = _graph_with(llm)
+    asyncio.run(gr._review_add_layer(_add_plan(), {}, _ev_stub(), 4350.0))
+    c = llm.calls[0]
+    assert (c["entry"], c["sl"], c["tp"]) == (4350.0, 4325.0, 4380.0)
+    assert c["sl_dist"] == 25.0
+    assert c["tp_dist"] == pytest.approx(30.0)     # 4380-4350
+    assert c["last_close"] == 4350.0
+    assert c["position"]["adds_count"] == 2
+    assert c["position"]["max_adds"] == CFG.risk.max_adds_per_position
+
+
+def test_add_review_prompt_contains_levels_and_rr():
+    """复核提示词必须包含止损/止盈/盈亏比和"还剩多少空间"。"""
+    from gold_agent.llm.orchestrator import build_add_review_user
+    txt = build_add_review_user("LONG", 4350.0, 4325.0, 4380.0, 25.0, 30.0,
+                                1.2, 4350.0, ev=None,
+                                position={"adds_count": 2, "max_adds": 5,
+                                          "price_open": 4300.0})
+    assert "4350" in txt and "4325" in txt and "4380" in txt
+    assert "1.20" in txt                      # 盈亏比
+    assert "止盈" in txt and "止损" in txt and "加仓" in txt
+    assert "2 / 5" in txt                     # 加仓进度
+    assert "还剩" in txt                      # 现价到止盈的空间
+
+
+def test_add_review_has_separate_llm_budget():
+    """加仓复核必须用**独立的** LLM 预算池，不得挤占主评审。
+
+    ⚠️ 事故前例（research/20）：news 与 review 共用 24/小时的池子时，
+    news 把 review 额度吃光，review 覆盖率跌到 4.3%。
+    加仓复核是"每笔加仓一次"，若不独立成池必然重演该事故。
+    """
+    from gold_agent.llm.client import RunningHubClient
+
+    class _Cfg:
+        api_key = "dummy"
+        base_url = "http://x"
+        model = "m"
+        per_hour_budget = 60
+        news_per_hour_budget = 24
+        add_review_per_hour_budget = 7
+
+    # 只验证预算池构造，不发起网络请求
+    budgets = {
+        "review": _Cfg.per_hour_budget,
+        "news": _Cfg.news_per_hour_budget,
+        "add_review": _Cfg.add_review_per_hour_budget,
+    }
+    assert len(set(budgets.values())) >= 2, "三个池子的额度应有区分度"
+    assert budgets["add_review"] != budgets["review"], \
+        "加仓复核必须独立于主评审预算"
+    # 确认源码里确实为 add_review 单独建了池子
+    import inspect
+    src = inspect.getsource(RunningHubClient.__init__)
+    assert '"add_review"' in src, "必须为 add_review 建独立预算池"
+    assert "add_review_per_hour_budget" in src, \
+        "add_review 预算必须走配置，不得硬编码"
+    assert hasattr(CFG.llm, "add_review_per_hour_budget")
+
 
