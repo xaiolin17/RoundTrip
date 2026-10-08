@@ -335,6 +335,31 @@ class MT5Client:
                            margin_level=ai.margin_level, leverage=ai.leverage,
                            currency=ai.currency)
 
+    # ---------- 出入金（回撤豁免基准） ----------
+    async def get_balance_ops(self, since_ts: float) -> list[dict]:
+        """读取**出入金**流水（DEAL_TYPE_BALANCE），用于回撤的现金流水校正。
+
+        ⚠️ 为什么必须存在（2026-10-08 用户报告「从9.30号开始 效益就不好」）：
+        回撤 `dd = (峰值净值 − 当前净值) / 峰值净值` 把**出入金**也当成了亏损。
+        实测本账户 10-01 13:56 一笔 `-100150.57` 出金，净值从 ~100,000
+        掉到 100.00，于是紧跟着的 23 轮全部返回
+        `circuit: max_drawdown 99.0%` —— 真正亏损只有 -46.43，
+        却被自己的风控**误判成爆仓并停止交易**。
+        资金进出不是策略表现，必须从回撤里剔除。
+        """
+        await self.initialize()
+        return await asyncio.get_running_loop().run_in_executor(
+            self._io_pool, self._balance_ops_sync, since_ts)
+
+    def _balance_ops_sync(self, since_ts: float) -> list[dict]:
+        deals = mt5.history_deals_get(since_ts, time.time() + 3600) or []
+        out = []
+        for d in deals:
+            if int(d.type) == 2:  # DEAL_TYPE_BALANCE
+                out.append({"time": d.time, "profit": float(d.profit),
+                            "comment": d.comment or ""})
+        return out
+
     # ---------- 交易（串行线程池） ----------
     async def send_order(self, request: dict) -> dict:
         return await asyncio.get_running_loop().run_in_executor(self._trade_pool, self._send_sync, request)

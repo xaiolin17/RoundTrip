@@ -112,7 +112,13 @@ class Graph:
 
             # t0b 交割单反馈闭环（胜率/盈亏 → 贝叶斯池 + 熔断器）
             if self.deal_feedback is not None:
-                closed = await self.deal_feedback.poll(self.client, self._pred_orders)
+                # ⚠️ 必须传**真实净值**：原实现让熔断器拿自己的 peak_equity
+                #    当输入喂回自己（自引用），峰值永远钉在 10000，
+                #    真实净值 ~100,000 从未被学到；10-01 出金后净值跌到 100，
+                #    回撤被算成 99% → 连续 23 轮风控误停机。
+                closed = await self.deal_feedback.poll(
+                    self.client, self._pred_orders,
+                    account_equity=float(st["account"].equity))
                 if closed:
                     # poll() 已把预测符号写进 rec["pred_sign"]（position_id 键桥接）
                     for d in closed:

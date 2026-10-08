@@ -5,7 +5,8 @@
 1. 读取自上次游标以来的平仓 deal（entry in (1,2)，magic 匹配）。
 2. 对每笔交易：
    - 累计统计（胜率、平均盈亏、盈亏比）写入 data/trade_stats.json；
-   - 更新 CircuitBreakers（day_pnl、连亏计数、peak_equity）；
+   - 更新 CircuitBreakers（day_pnl、连亏计数、峰值盈亏）；
+   - 把出入金（DEAL_TYPE_BALANCE）交给 `on_cash_flow`，从回撤基准里剔除；
    - 给各信号源记录 outcome：用当轮融合分符号 vs 该笔盈亏方向。
 3. 游标持久化到 data/deals_cursor.json，防止重复计数。
 """
@@ -17,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from gold_agent.common.config import CFG
-from gold_agent.common.logging_util import log_info
+from gold_agent.common.logging_util import log_info, log_warn
 from gold_agent.fusion.bayes import BayesianPool
 from gold_agent.risk.position import CircuitBreakers, wilson_lower
 
@@ -88,9 +89,12 @@ class DealFeedback:
         d.mkdir(parents=True, exist_ok=True)
         self.stats_path = d / "trade_stats.json"
         self.cursor_path = d / "deals_cursor.json"
+        self.cash_cursor_path = d / "cash_cursor.json"
         self.stats = TradeStats()
         self.history: list[dict] = []
         self.cursor = 0.0
+        #: 出入金流水的读取游标（避免同笔出入金被重复计入回撤基准）
+        self._cash_cursor = 0.0
         self.last_pred_by_position: dict[str, int | None] = {}
         self._load()
 
@@ -111,6 +115,16 @@ class DealFeedback:
                 self.cursor = json.loads(self.cursor_path.read_text(encoding="utf-8")).get("cursor", 0.0)
             except Exception:
                 pass
+        if self.cash_cursor_path.exists():
+            try:
+                self._cash_cursor = json.loads(
+                    self.cash_cursor_path.read_text(encoding="utf-8")).get("cursor", 0.0)
+            except Exception:
+                pass
+
+    def _save_cash_cursor(self) -> None:
+        self.cash_cursor_path.write_text(
+            json.dumps({"cursor": self._cash_cursor}), encoding="utf-8")
 
     def _save(self) -> None:
         self.stats_path.write_text(json.dumps(
@@ -119,17 +133,39 @@ class DealFeedback:
         self.cursor_path.write_text(json.dumps({"cursor": self.cursor}), encoding="utf-8")
 
     # ---------- 主流程 ----------
-    async def poll(self, client, pred_orders: dict | None = None) -> list[dict]:
+    async def poll(self, client, pred_orders: dict | None = None,
+                   account_equity: float | None = None) -> list[dict]:
         """返回本轮新发现的平仓 deal 列表；内部完成全部更新与持久化。
 
         pred_orders: {order_id_str: predicted_sign} 挂单→成交桥接（graph 维护）。
         网格限价成交的仓位没有 open_market 记录，必须经 order_id 桥接找回预测符号。
+
+        account_equity: **账户真实净值**（graph 从 `client.get_account()` 取）。
+        ⚠️ 必须传入，不能用熔断器自己的 `peak_equity` 顶替（见下方事故说明）。
         """
         try:
             deals = await client.get_deals(max(self.cursor, time.time() - 7 * 86400))
         except Exception as e:
             log_info(f"交割单反馈: 读取失败 {type(e).__name__}: {e}")
             return []
+        # 出入金流水（DEAL_TYPE_BALANCE）—— 从回撤里剔除，避免把出金当亏损。
+        # 实测 10-01 一笔 -100150.57 出金曾造成 23 轮 "max_drawdown 99.0%" 误熔断。
+        try:
+            n_cash = 0
+            for op in await client.get_balance_ops(self._cash_cursor):
+                # ⚠️ 必须严格 `>`：`history_deals_get(since, ...)` 的 since 是
+                #    **闭区间**，游标处那笔会被反复读出来 → net_deposits 被重复累加
+                #    （且它落盘持久化，错误会一直累积）。与上面成交 deal 的
+                #    `d["time"] > self.cursor` 过滤同理。
+                if float(op["time"]) <= self._cash_cursor:
+                    continue
+                self.breakers.on_cash_flow(op["profit"], ts=float(op["time"]))
+                self._cash_cursor = float(op["time"])
+                n_cash += 1
+            if n_cash:
+                self._save_cash_cursor()
+        except Exception as e:
+            log_warn(f"交割单反馈: 出入金流水读取失败 {type(e).__name__}: {e}")
         new = [d for d in deals if d["time"] > self.cursor and d.get("magic") == CFG.mt5.magic]
         if not new:
             if deals:
@@ -149,9 +185,23 @@ class DealFeedback:
             rec = {**d, "pnl": round(pnl, 2), "ts": time.time()}
             self.history.append(rec)
             # 熔断器更新（P2-2：同时记录方向，供方向偏置监控）
-            eq = getattr(self.breakers, "peak_equity", 0.0) or 0.0
+            #
+            # ⚠️ 事故修复（2026-10-08，用户报告「从9.30号开始 效益就不好」）：
+            #    原实现 `eq = getattr(self.breakers, "peak_equity", 0.0)` 然后
+            #    `on_trade_closed(pnl, max(eq, 10000.0))` —— **自引用**：
+            #    把熔断器自己的峰值当输入喂回它自己，于是
+            #    `peak_equity = max(peak_equity, 10000)` 永远钉在 10000，
+            #    真实净值（一度 ~100,000）**从未被学到**。
+            #    后果：10-01 出金后净值跌到 100，回撤算成
+            #    (10000-100)/10000 = 99.0% → 连续 23 轮风控停机。
+            #    现在必须用 graph 传入的**真实净值**。
             direction = _deal_direction(d)
-            self.breakers.on_trade_closed(pnl, max(eq, 10000.0), direction=direction)
+            if account_equity is None:
+                # 调用方未传（旧调用点/测试）→ 退化到最小可用值，但**不再自引用**
+                eq = max(self.breakers.peak_equity, 10000.0)
+            else:
+                eq = float(account_equity)
+            self.breakers.on_trade_closed(pnl, eq, direction=direction)
             rec["direction"] = direction
             # 预测符号：优先 order 桥接（挂单成交），其次 position 桥（市价/加仓）
             #

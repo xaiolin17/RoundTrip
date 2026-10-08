@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from gold_agent.common.config import CFG
-from gold_agent.common.logging_util import log_warn
+from gold_agent.common.logging_util import log_info, log_warn
 
 
 @dataclass
@@ -26,12 +26,78 @@ class CircuitBreakers:
     day_pnl: float = 0.0
     day_key: str = ""
     peak_equity: float = 0.0
+    #: ⚠️ 回撤用的**纯交易**权益峰值（累计交易盈亏的历史最高点）。
+    #: 与 `peak_equity` 的区别见 `_dd()`：出入金不进这条曲线。
+    peak_pnl: float = 0.0
+    #: 累计已计入的净出入金（正=入金）。用于把净值折算成纯交易盈亏。
+    net_deposits: float = 0.0
+    #: 本金锚点是否已定（首次看到净值时锚定）
+    anchored: bool = False
+    #: 锚定时刻（`time.time()`）。用于识别"锚定之后才被读到的历史出入金"，
+    #: 见 `on_cash_flow` 的补偿逻辑。
+    anchor_ts: float = 0.0
     martin_disabled_today: bool = False
     #: 近期平仓方向序列（1=LONG, -1=SHORT），用于方向偏置检测
     recent_directions: list = field(default_factory=list)
     direction_bias_halt: bool = False
     direction_bias_reason: str = ""
     extra: dict = field(default_factory=dict)
+
+    def on_cash_flow(self, profit: float, ts: float | None = None) -> None:
+        """记一笔出入金（正=入金，负=出金）。
+
+        ⚠️ 为什么必须剔除（2026-10-08 用户报告「从9.30号开始 效益就不好」）：
+        旧公式 `dd = (峰值净值 − 当前净值) / 峰值净值` 把**出入金**当成了亏损。
+        实测本账户 10-01 13:56 一笔 `-100150.57` 出金使净值 100,000 → 100，
+        紧接着 23 轮全部返回 `circuit: max_drawdown 99.0%` ——
+        而 magic=20260918 的**真正交易亏损只有 -46.43**，
+        即 agent 把自己的风控误判成爆仓并停机。
+        出入金是资金调动，不是策略表现。
+
+        一般情况下这里**只累加**净出入金，不动峰值：因为纯交易盈亏
+        `equity − net_deposits` 对出入金天然中性 —— 出金使 equity 与
+        net_deposits 同额下降，差额不变。故锚定之后发生的出入金
+        不需要（也不能）调整峰值。唯一的例外是下面 `ts` 描述的
+        "锚定后才补读到的历史流水"，那种情况下峰值必须同额补偿。
+
+        ts: 该笔出入金的成交时间。若它发生在**锚定时刻之前**却是锚定后
+        才被读到（例如首次拉取流水失败、下一轮才补上），则它本应已计入
+        锚点，必须把峰值同额挪回去，否则 `_pnl_now` 会瞬间偏离峰值一个
+        `profit`，凭空造出巨额回撤。方向推导：
+            锚点本应 = equity_锚定 − (nd_旧 + profit) = peak_pnl_旧 − profit
+        故补偿是 **减**（`peak_pnl -= profit`），不是加。
+        实测：迟到入金 +100000 若无补偿会造出 1043% 假回撤，
+        补偿方向写反（+=）反而恶化到 2086%；`-=` 后为 0%。
+        """
+        profit = float(profit)
+        if self.anchored and ts is not None and self.anchor_ts and float(ts) < self.anchor_ts:
+            self.peak_pnl -= profit
+        self.net_deposits += profit
+
+    def _pnl_now(self, equity: float) -> float:
+        """净值 → **纯交易累计盈亏**。
+
+        `net_deposits` 是累计净出入金，`equity` 是当前净值，两者口径一致
+        （净值 = 本金 + 累计出入金 + 交易盈亏），故二者之差就是纯交易盈亏。
+        """
+        return float(equity) - self.net_deposits
+
+    def _dd(self, equity: float) -> float:
+        """回撤比例 = (纯交易盈亏峰值 − 当前纯交易盈亏) / 当前净值。
+
+        分母用**当前净值**（账户实际规模）而非历史出入金：
+        否则净出入金一旦为负，比例会失去意义（本账户净出入金 +425665，
+        纯盈亏 -416079，相除得到荒谬的分母）。
+
+        峰值**可以**是负数（锚定时账户已累计亏损）——故只判 `anchored`，
+        不能判 `peak_pnl > 0`，否则永远返回 0 而静默失效。
+        """
+        if not self.anchored:
+            return 0.0
+        loss = self.peak_pnl - self._pnl_now(equity)
+        if loss <= 0.0:
+            return 0.0
+        return loss / max(float(equity), 1e-9)
 
     def check(self, account_equity: float, margin_used: float,
               high_risk_window: bool) -> str | None:
@@ -63,7 +129,22 @@ class CircuitBreakers:
             return f"consecutive_losses>={CFG.risk.consecutive_loss_n}"
         if self.day_pnl <= -CFG.risk.daily_loss_stop_pct * account_equity:
             return "daily_loss_stop"
-        dd = (self.peak_equity - account_equity) / max(self.peak_equity, 1e-9) if self.peak_equity else 0.0
+        # ---- 回撤熔断（基于**出入金中性**的纯交易盈亏曲线）----
+        # 锚点只定一次。`peak_equity` 是历史净值峰值（旧状态文件里
+        # 被自引用 bug 钉在 10000），它隐含的"本金+已实现盈亏"用来给
+        # 纯盈亏曲线定起点；出入金已由 `on_cash_flow` 记入 net_deposits。
+        pnl_now = self._pnl_now(account_equity)
+        if not self.anchored:
+            # 锚点 = 当前纯交易盈亏（**不是 0**）：此刻是"起点"，
+            # 从下一轮起的净亏损才算回撤。写成 max(...,0) 会在账户已亏损时
+            # 凭空造出回撤（例如纯盈亏 -500 锚成 0 → 立刻 -500 回撤）。
+            self.peak_pnl = pnl_now
+            self.anchored = True
+            self.anchor_ts = time.time()
+            log_info(f"回撤基准锚定：纯交易盈亏 {pnl_now:.2f}"
+                     f"（净值 {account_equity:.2f} 减去净出入金 {self.net_deposits:.2f}）")
+        self.peak_pnl = max(self.peak_pnl, pnl_now)
+        dd = self._dd(account_equity)
         if dd >= CFG.risk.max_drawdown_halt_pct:
             return f"max_drawdown {dd:.1%}"
         if margin_used > CFG.risk.margin_use_cap * account_equity:
@@ -120,7 +201,7 @@ class CircuitBreakers:
         return max(longs, n - longs) / n
 
     def deleverage_k(self, account_equity: float) -> float:
-        dd = (self.peak_equity - account_equity) / max(self.peak_equity, 1e-9) if self.peak_equity else 0.0
+        dd = self._dd(account_equity)
         if dd >= CFG.risk.max_drawdown_halt_pct:
             return 0.0
         if dd >= CFG.risk.max_drawdown_deleverage_pct:
@@ -143,7 +224,12 @@ class CircuitBreakers:
                 self.cooloff_until = time.time() + CFG.risk.consecutive_loss_cooloff_h * 3600
         else:
             self.consecutive_losses = 0
+        # 峰值按**纯交易盈亏**（出入金中性）更新；`peak_equity` 保留为
+        # 历史净值峰值的记录，不再参与回撤计算（旧状态里的自引用 bug 见
+        # `deal_feedback.poll`）。
         self.peak_equity = max(self.peak_equity, equity)
+        if self.anchored:
+            self.peak_pnl = max(self.peak_pnl, self._pnl_now(equity))
         self.record_direction(direction)
 
     # ---------- 持久化 ----------
