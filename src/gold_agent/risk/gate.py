@@ -61,6 +61,28 @@ class RiskGate:
     def __init__(self, breakers: CircuitBreakers) -> None:
         self.breakers = breakers
 
+    @staticmethod
+    def _current_price(frames, df_5m=None) -> float | None:
+        """取**当前市价**（最新 1m 收盘），供加仓定价用。
+
+        优先 1m（与 `open_market` 的 `ctx.last_close` 同源，口径一致），
+        其次 5m，都拿不到返回 None 由调用方降级。
+        加仓是市价成交，用**当前价**算止损止盈才与真实成交价一致；
+        用首仓的 `price_open` 会让赔率校验失真（见 `add_layer` 分支注释）。
+        """
+        for df in ((frames or {}).get("1m"), df_5m):
+            if df is None:
+                continue
+            try:
+                if len(df) == 0:
+                    continue
+                px = float(df["close"].iloc[-1])
+            except Exception:
+                continue
+            if px > 0:
+                return px
+        return None
+
     def _levels(self, direction: str, entry: float, ev, atr: float | None,
                 llm_review: dict | None = None):
         """按 LLM 判断的压力位/支撑位算止损止盈（用户要求的正确语义）。
@@ -257,7 +279,24 @@ class RiskGate:
             # 定价改用缠论结构（与 open_market 同一套）。
             pos = next((p for p in positions.positions
                         if getattr(p, "ticket", None) == int(prop.entry)), None)
-            ref = pos.price_open if pos is not None else prop.entry
+            # ⚠️ 定价锚点必须是**当前市价**，不是首仓的 `price_open`。
+            #
+            # 事故（2026-10-08 用户发现「止盈和止损点位差距这么大 盈亏比都拉成
+            # 什么比列了」）：原实现 `ref = pos.price_open` —— 拿**第一笔**的
+            # 入场价给加仓定价。但 MT5 对冲账户下加仓是**独立新持仓**，成交在
+            # **当时市价**，两者可以差很远（实测 293 笔加仓：差中位 3.13、
+            # 最大 36.06）。于是 `min_rr=1.2` 是在**错误的价格**上校验的：
+            #     日志记录盈亏比中位 1.58、<1.2 的 0 笔
+            #     按各自实际成交价重算   中位 1.23、<1.2 的 141 笔（48.1%）
+            # 即赔率门在加仓路径上**形同虚设**。实测这批低赔率加仓确实亏钱：
+            #     真实盈亏比 <1.2 共 136 笔 净 -136.26（每笔 -1.00）
+            #     真实盈亏比 >=1.2 共 149 笔 净 +146.71（每笔 +0.98）
+            # 现价取 1m 最新收盘（与 `open_market` 用的 `ctx.last_close` 同源，
+            # 保证两个入口的赔率口径一致）；取不到再退 5m；再取不到才退回
+            # `price_open`（旧行为，仅供无行情的单测/降级路径）。
+            ref = self._current_price(frames, df_5m)
+            if ref is None:
+                ref = pos.price_open if pos is not None else prop.entry
             lv = self._levels(prop.direction, ref, ev, atr, llm_review)
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")

@@ -441,6 +441,66 @@ def test_modify_sltp_can_narrow_tp_and_is_rr_exempt():
         "新止盈必须一并下发（SLTP 是整体覆盖）"
 
 
+def test_add_layer_prices_off_current_market_not_first_entry():
+    """加仓必须用**当前市价**定价，不能用首仓的 `price_open`。
+
+    ⚠️ 事故（2026-10-08 用户报告「止盈和止损点位差距这么大 盈亏比都拉成
+       什么比列了」）：原实现 `ref = pos.price_open` 拿**第一笔**的入场价
+       给加仓定价。但 MT5 对冲账户下加仓是**独立新持仓**、成交在当前市价。
+       实测 286 笔加仓：两者差中位 3.13、最大 36.06，导致 `min_rr=1.2`
+       在错误的价格上校验 —— 日志显示 <1.2 的 0 笔，按各自成交价重算
+       却有 137 笔（47.9%），这批净亏 -142.52；而 >=1.2 的 149 笔净赚
+       +146.71。即赔率门在加仓路径上形同虚设。
+
+    本测试锁住：同一组点位下，把现价从首仓价 4350 换到 4300，
+    定价锚点必须跟着变成 4300（止损止盈随之下移）。
+    """
+    gate = RiskGate(CircuitBreakers())
+    atr = 12.339
+    pad = CFG.risk.level_pad_atr * atr
+
+    def run(last_close: float):
+        # 现价放进 1m 帧（与 open_market 的 ctx.last_close 同源）
+        frames = {"1m": pd.DataFrame({"close": [last_close]})}
+        return gate.evaluate(
+            Proposal(kind="add_layer", direction="LONG", entry=123456),
+            _ev(), _acc(), _views([_pos(price_open=4350.0)]),
+            0.1, None, atr, None,
+            llm_review=_llm_rev([4340.0], [4420.0]), frames=frames)
+
+    hi = run(4350.0)
+    lo = run(4345.0)
+    assert hi.ok and lo.ok, (hi.reason, lo.reason)
+
+    # 关键断言：定价锚点跟随**当前市价**，而不是恒为首仓的 4350
+    assert hi.plan["entry"] == pytest.approx(4350.0, abs=0.01)
+    assert lo.plan["entry"] == pytest.approx(4345.0, abs=0.01), \
+        "加仓定价必须用当前市价（原实现恒用首仓 price_open=4350）"
+    assert hi.plan["entry"] != lo.plan["entry"], "现价不同则锚点必须不同"
+    # 止损 = 下方支撑让开 pad（与现价无关，仍取自 LLM 位）
+    assert lo.plan["sl"] == pytest.approx(4340.0 - pad, abs=0.01)
+
+
+def test_add_layer_rejects_add_whose_rr_is_below_min_rr():
+    """现价贴近止盈位时，加仓的赔率不足 → 必须拒绝（不得下单）。
+
+    这是上面那个 bug 的**后果**验证：低赔率加仓本就该被 `min_rr` 拦掉。
+    做多首仓在 4350，现价已涨到止盈位附近 4490（压力位 4500）：
+      风险 = 4490 - 止损(4400-pad)；回报 = 4500 - 4490 ≈ 10
+    → 赔率远低于 1.2 → 应返回 `levels: rr_below_...`。
+    """
+    gate = RiskGate(CircuitBreakers())
+    atr = 12.339
+    frames = {"1m": pd.DataFrame({"close": [4490.0]})}
+    res = gate.evaluate(
+        Proposal(kind="add_layer", direction="LONG", entry=123456),
+        _ev(), _acc(), _views([_pos(price_open=4350.0)]),
+        0.1, None, atr, None,
+        llm_review=_llm_rev([4400.0], [4500.0]), frames=frames)
+    assert not res.ok, "赔率不足的加仓必须被拒，否则就是这次事故"
+    assert "rr_below" in res.reason or "levels" in res.reason, res.reason
+
+
 def test_add_layer_carries_atr_sl_tp():
     """事故：加仓 plan 不含 tp/sl → 新仓位是 SL=0 TP=0 的裸仓。
 
