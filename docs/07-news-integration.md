@@ -11,7 +11,7 @@
 1. **金十 MCP**（`https://mcp.jin10.com/mcp`，token 在 `.env`）
    - `initialize` → `tools/call`（快讯/日历接口）。
    - 拉最近 30 分钟快讯；关键词分级（宏观/利率/地缘/黄金）。
-2. **LLM-B 快评**（`glm-5.3-flash`，结构化输出）
+2. **LLM-B 快评**（`deepseek/deepseek-v4.1-flash`，结构化输出，关闭思考）
    - 仅当金十失败或需要解读时调用；
    - **system prompt 含禁止编造规则**（`_NEWS_SYSTEM`）：
      只依据给定的快讯标题，不得虚构标题或数据。

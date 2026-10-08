@@ -44,13 +44,19 @@ class MT5Config:
 class LLMConfig:
     base_url: str = os.getenv("RUNNINGHUB_BASE_URL", "https://llm.runninghub.cn/v1")
     api_key: str = os.getenv("RUNNINGHUB_API_KEY", "")
-    model: str = os.getenv("RUNNINGHUB_MODEL", "glm/glm-5.3-flash")
+    # ⚠️ 兜底默认值必须与 .env 一致。原默认为 glm/glm-5.3-flash ——
+    #    那是**强制思考且关不掉**的旧模型（实测白天 review 中位 60.7 秒超时、
+    #    成功率仅 22.9%）。而 `.env` 被 .gitignore 忽略、不入库，
+    #    于是只要 .env 缺失或漏了这一行，项目就会**静默退回**旧模型，
+    #    症状是"每轮凭空多耗 120 秒"，极难排查。
+    model: str = os.getenv("RUNNINGHUB_MODEL", "deepseek/deepseek-v4.1-flash")
     #: 推理等级。界面上叫 off，**线上参数值是 "none"**（传 "off" 会 400
     #: InvalidParameter）。实测 deepseek/deepseek-v4.1-flash：
     #:   none -> 无 reasoning_content，completion 106 tok
     #:   low  -> reasoning_content 1506 字符，completion 560 tok
-    #: 留空则不带该参数（保持模型默认，即开启思考）。
-    reasoning_effort: str = os.getenv("RUNNINGHUB_REASONING_EFFORT", "")
+    #: ⚠️ 默认值由 "" 改为 "none"：留空 = 不带该参数 = 模型默认 = **开启思考**，
+    #:    与"关闭推理"的要求相反。改默认值后，即使 .env 漏了这一行也仍然关闭。
+    reasoning_effort: str = os.getenv("RUNNINGHUB_REASONING_EFFORT", "none")
     timeout_s: float = _TOML.get("llm", {}).get("timeout_s", 60.0)
     review_timeout_s: float = _TOML.get("llm", {}).get("review_timeout_s", 60.0)
     news_timeout_s: float = _TOML.get("llm", {}).get("news_timeout_s", 30.0)

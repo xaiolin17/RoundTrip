@@ -46,7 +46,7 @@
 │  │    ├─ openmobius SMC (Mobius API, 限速 10/min + 缓存, 7 步字段) │      │
 │  │    ├─ fusion (卡尔曼/贝叶斯 + **去均值 + IR 权重**)              │      │
 │  │    └─ news (金十快讯, 独立预算)                                 │      │
-│  │  [LLM 编排] runninghub glm-5.3-flash (每轮主路径, 按 skill 流程) │      │
+│  │  [LLM 编排] runninghub deepseek-v4.1-flash (每轮主路径, 按 skill 流程) │      │
 │  │  [Decision] 状态机 (S_eff = S−S0 判阈, 波动分位闸)              │      │
 │  │  [Risk] 仓位(Half-Kelly/**Wilson 下界**/ATR预算) + 熔断         │      │
 │  │         + **方向偏置监控**                                      │      │
@@ -57,7 +57,7 @@
         │                                  │
         ▼                                  ▼
  https://llm.runninghub.cn/v1      https://mcp.jin10.com/mcp
- (glm-5.3-flash)                   (快讯, token 见 .env)
+ (deepseek-v4.1-flash)             (快讯, token 见 .env)
         ▼
  https://api.mobiusquant.ai (openmobius, 匿名 10 req/min)
 ```

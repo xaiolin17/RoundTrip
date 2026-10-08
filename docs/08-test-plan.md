@@ -28,7 +28,7 @@
 | L3 | skills.chanlun | 真实 XAUUSD 数据 analyze；quality=pass 断言；**8 门 audit 断言** | 已实测通过 |
 | L4 | skills.openmobius | 真实 API + 限速器行为（403/429 处理）；**7 步字段采集断言** | 已实测通过 |
 | L5 | fusion | parquet 回放：每源 IC/命中率校准、S/σ 合理性；**去均值验收、零权重验收、双向性验收** | 真实历史 |
-| L6 | llm | 真实 key 调 glm-5.3-flash 结构化输出 + 超时降级路径 | 真实 endpoint |
+| L6 | llm | 真实 key 调 deepseek/deepseek-v4.1-flash 结构化输出（关闭思考）+ 超时降级路径 | 真实 endpoint |
 | L7 | news | 金十真实拉取 + LLM-B 真实调用 | 真实服务 |
 | L8 | risk | 用真实回放序列驱动熔断/网格/马丁逻辑断言；**Wilson 下界、方向偏置熔断** | 真实历史状态序列 |
 | L9 | decision+agent | 全图在回放模式（喂 parquet、executor 置 DRY——**唯一允许的"模拟"是执行层切到 dry_run**） | 混合：真实数据 + 执行层 dry |

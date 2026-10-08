@@ -61,7 +61,11 @@ LLM review 成功次数 = 38  →  覆盖率 4.3%
 ## 1. Provider 配置
 
 - 端点：`RUNNINGHUB_BASE_URL=https://llm.runninghub.cn/v1`（OpenAI 兼容，实测 `/v1/models` 可用）。
-- 主模型：`glm/glm-5.3-flash`（context 262k，tools/vision/reasoning/structuredOutputs 均支持）。
+- 主模型：`deepseek/deepseek-v4.1-flash`，**关闭思考模式**
+  （`RUNNINGHUB_REASONING_EFFORT=none`；界面上叫 off，线上传 `"off"` 会 400）。
+  ⚠️ 原用 `glm/glm-5.3-flash` —— 该模型强制思考且无法关闭，实测白天 review
+  中位 **60.7 秒**超时、成功率仅 **22.9%**，每轮因此多耗约 120 秒等超时。
+  留空该环境变量 = 不带参数 = 模型默认 = **开启思考**，所以必须显式设 `none`。
 - Key：`.env` `RUNNINGHUB_API_KEY`（用户写入）。
 
 ## 2. 两类 LLM 任务（并发、互不阻塞、独立预算）
