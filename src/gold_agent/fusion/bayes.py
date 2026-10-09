@@ -27,7 +27,24 @@ class SourceStats:
 
 
 class BayesianPool:
-    """维护每信号源滚动命中统计并给出 log_odds 权重。"""
+    """维护每信号源滚动命中统计并给出 log_odds 权重。
+
+    ⚠️ `state_path` 必须**按品种**给（多品种时每个品种一份）。
+
+    事故记录（2026-10-09，与 MT5Client 串台同批发现）：本类原先缺省写到
+    `data/bayes_state.json` 这一份**共享**文件，而 `FusionEngine` 建它时
+    没传路径（`BayesianPool()`）。于是 5 个品种共用一个命中统计池：
+
+      · A 品种上"某源命中"会累进 B 品种的命中率，反之亦然；
+      · `evidence()` 里 `st.n < 20` 的样本量门槛被**跨品种凑够**
+        —— 单个品种本不该有足够样本，却因为别的品种的记录而开始投票；
+      · 各品种的源有效性差异（黄金的趋势性 vs 欧元的均值回归）
+        被混成一个平均数，等于对每个品种都用错权重；
+      · 最后写入时互相覆盖（后保存的品种抹掉先保存的）。
+
+    表现为各品种的贝叶斯证据"趋同"，且随品种增加而系统性偏移 ——
+    不报错，只是安静地用错了统计量。
+    """
 
     def __init__(self, window: int | None = None, state_path: Path | None = None) -> None:
         self.window = window or CFG.fusion.bayes_window

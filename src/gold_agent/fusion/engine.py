@@ -287,7 +287,12 @@ class FusionEngine:
         #: 共用一份会让 A 品种的分布污染 B 品种的 z-score（量纲/尺度不同），
         #: 双方都判错强弱。状态文件也随之按品种分目录。
         self.symbol = symbol
-        self.bayes = BayesianPool()
+        # ⚠️ bayes 也必须按品种分文件：它的命中统计是**该品种**的信号源
+        #    有效性（黄金的趋势性 vs 欧元的均值回归并不相同）。
+        #    共用一份会让各品种互相累加命中率、跨品种凑够 20 样本门槛、
+        #    并互相覆盖保存 —— 不报错，只是安静地用错统计量。
+        #    见 `BayesianPool` 的类文档。
+        self.bayes = BayesianPool(state_path=self._state_file("bayes_state.json"))
         self.kalman = KalmanTrend()
         # P0-2：权重来自实测 IR 文件；文件缺失 → 全 0（未验证不得参与方向决策）
         self.weights = weight_table or WeightTable.load()
@@ -684,6 +689,20 @@ class FusionEngine:
         return primed
 
     # ---------- 持久化（实盘重启保留预热） ----------
+    def _state_file(self, name: str):
+        """本实例的状态文件路径（多品种时在 `data/<品种>/` 下）。
+
+        ⚠️ 与 `state_path()` 的区别：本方法在 `__init__` 期间也可用
+        （`state_path()` 同样可用，但这里把"目录是否存在"也一并处理，
+        避免 bayes 在首次保存时因目录缺失而失败）。
+        """
+        d = CFG.state_path_for(self.symbol) if self.symbol else CFG.state_path.parent
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return d / name
+
     def state_path(self, name: str):
         if self.symbol:
             return CFG.state_path_for(self.symbol) / name

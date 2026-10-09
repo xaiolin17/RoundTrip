@@ -384,6 +384,91 @@ def test_used_lots_filters_by_own_magic():
         f"_used_lots 把别的品种也算进来了：{got}"
 
 
+def test_bayes_state_is_isolated_per_symbol(monkeypatch):
+    """⚠️ 贝叶斯命中统计必须按品种分文件。
+
+    与 MT5Client 串台同批发现：`BayesianPool` 缺省写
+    `data/bayes_state.json` 这一份**共享**文件，而 `FusionEngine`
+    建它时没传路径。于是 5 个品种共用一份命中统计：
+      · 各品种互相累加源命中率；
+      · `evidence()` 的 `st.n < 20` 样本量门槛被**跨品种凑够**
+        （单品种本不该够，却因别的品种的记录而开始投票）；
+      · 黄金的趋势性源与欧元的均值回归源被混成一个平均数；
+      · 保存时互相覆盖。
+    """
+    from gold_agent.fusion.bayes import BayesianPool
+    from gold_agent.fusion.engine import FusionEngine
+
+    monkeypatch.setenv("TRADE_SYMBOLS", "XAUUSDm,BTCUSDm,USOILm")
+    paths = {}
+    for s in ("XAUUSDm", "BTCUSDm", "USOILm"):
+        e = FusionEngine(symbol=s)
+        paths[s] = e.bayes.state_path
+    assert len(set(map(str, paths.values()))) == 3, \
+        f"品种间 bayes 状态未隔离：{paths}"
+    for s, p in paths.items():
+        assert p.parent.name == s, f"{s} 的 bayes 状态不在自己的目录：{p}"
+
+    # 状态必须真的互不影响：给 A 记命中，B 的统计不得变化
+    a, b = BayesianPool(state_path=paths["XAUUSDm"]), \
+        BayesianPool(state_path=paths["BTCUSDm"])
+    for _ in range(25):
+        a.record_outcome("chanlun", 1, 1)          # A 命中 25 次
+    ea = a.evidence("chanlun", 1.0, 1.0)
+    eb = b.evidence("chanlun", 1.0, 1.0)
+    assert ea != 0.0, "A 有 25 次命中却无证据"
+    assert eb == 0.0, f"B 没有样本却给出了证据（串台）：{eb}"
+    b._load()                                       # 重新读盘仍应为空
+    assert b.evidence("chanlun", 1.0, 1.0) == 0.0, "B 读到了 A 的状态"
+
+
+def test_bayes_default_path_unchanged_for_single_symbol(monkeypatch):
+    """单品种时 bayes 状态路径必须**不变**（历史统计继续可用）。
+
+    ⚠️ 不断言绝对路径 —— pytest 会把 `project_root` 重定向到临时目录。
+    断言的是**相对结构**：单品种下 bayes 与其它融合状态同目录，
+    且**不**多出一层品种子目录。
+    """
+    from gold_agent.fusion.engine import FusionEngine
+
+    monkeypatch.delenv("TRADE_SYMBOLS", raising=False)
+    monkeypatch.setenv("MT5_SYMBOL", "XAUUSDm")
+    assert CFG.multi_symbol is False
+    e = FusionEngine()
+    assert e.bayes.state_path.name == "bayes_state.json"
+    # 与其它融合状态文件同目录（单品种 = 共享目录）
+    assert e.bayes.state_path.parent == e.state_path("score_baseline.json").parent, \
+        f"单品种 bayes 跑到别的目录去了：{e.bayes.state_path}"
+    # 且不含品种名子目录
+    assert e.bayes.state_path.parent.name == CFG.state_path.parent.name, \
+        f"单品种不应有品种子目录：{e.bayes.state_path}"
+
+
+def test_all_fusion_state_files_are_per_symbol(monkeypatch):
+    """⚠️ 融合层的**全部**状态文件都必须按品种隔离。
+
+    只隔离一部分最危险：normalizer 隔离了而 bayes 没隔离，
+    会导致"分数被本品种归一化、但证据权重来自混合池"这种半串台，
+    比全串台更难察觉（分数看着正常，权重是错的）。
+    """
+    from gold_agent.fusion.engine import FusionEngine
+
+    monkeypatch.setenv("TRADE_SYMBOLS", "XAUUSDm,BTCUSDm")
+    names = ["source_normalizer.json", "vol_percentile.json",
+             "score_baseline.json", "bayes_state.json"]
+    seen = {}
+    for s in ("XAUUSDm", "BTCUSDm"):
+        e = FusionEngine(symbol=s)
+        for n in names:
+            p = e.state_path(n)
+            assert p.parent.name == s, f"{s}/{n} 不在品种目录：{p}"
+            seen.setdefault(n, set()).add(str(p.parent))
+        # bayes 走 _state_file，也必须在品种目录
+        assert e.bayes.state_path.parent.name == s
+    for n, dirs in seen.items():
+        assert len(dirs) == 2, f"{n} 两个品种共用目录：{dirs}"
+
+
 def test_position_lots_is_symbol_consistent_with_broker_specs(monkeypatch):
     """⚠️ 真实调用 `position_lots`：手数换算必须与品种无关。
 
