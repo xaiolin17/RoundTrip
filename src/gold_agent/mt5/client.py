@@ -201,8 +201,9 @@ class MT5Client:
         report["ok"] = bool(ti and ti.connected and ai and si)
         return report
 
-    def symbol_info(self):
-        return mt5.symbol_info(CFG.mt5.symbol)
+    def symbol_info(self, symbol: str | None = None):
+        """symbol_info。多品种下按品种取 —— `symbol=None` 时用默认品种。"""
+        return mt5.symbol_info(symbol or CFG.mt5.symbol)
 
     # ---------- 行情 ----------
     async def get_ohlcv(self, bars_per_tf: int | None = None) -> OHLCVBundle:

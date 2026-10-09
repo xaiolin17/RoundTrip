@@ -30,6 +30,9 @@ class OrderPlan:
     expiration_s: int | None = None
     comment: str = "goldagent"
     idempotency_key: str = ""
+    #: 下单品种。None = 用 `CFG.mt5.symbol`（单品种兼容，行为不变）。
+    #: 多品种下必须显式带上 —— 否则所有品种的单都会发到默认品种上。
+    symbol: str | None = None
 
 
 @dataclass
@@ -99,10 +102,20 @@ class Executor:
             log_error(f"执行器异常: {e}")
             return ExecutionResult(ok=False, error=str(e))
 
+    def _symbol_info(self, symbol: str | None = None):
+        """按品种取 symbol_info，兼容旧的无参签名（测试桩/研究脚本）。"""
+        try:
+            return self.client.symbol_info(symbol)
+        except TypeError:
+            return self.client.symbol_info()
+
     def _build_request(self, plan: OrderPlan) -> dict:
-        si = self.client.symbol_info()
+        # ⚠️ 多品种：必须按 plan 的品种取 symbol_info 与填 "symbol" 字段，
+        #    否则所有品种的单都会发到默认品种（CFG.mt5.symbol）上。
+        sym = plan.symbol or CFG.mt5.symbol
+        si = self._symbol_info(sym)
         if si is None:
-            raise Mt5Error("symbol_info None during order build")
+            raise Mt5Error(f"symbol_info None during order build（{sym}）")
         # ⚠️ 所有价格必须**按 symbol 的 digits 规整**后才发出去。
         # 事故（2026-09-30 实测）：`modify_sltp` 提交 `sl=4178.211333333333`，
         # MT5 存回的是 `4178.211`（digits=3）。决策层下一轮拿 `pos.sl`
@@ -128,7 +141,7 @@ class Executor:
         else:
             filling = mt5.ORDER_FILLING_RETURN
         base = {
-            "symbol": CFG.mt5.symbol,
+            "symbol": sym,
             "magic": CFG.mt5.magic,
             "deviation": CFG.mt5.deviation,
             "comment": plan.comment,

@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 from gold_agent.common.config import CFG
+from gold_agent.common.symbols import get_profile
 from gold_agent.common.logging_util import log_error, log_info, log_warn
 from gold_agent.common.zh import (direction_label, kind_label, reason_label,
                                   regime_label, source_label)
@@ -263,8 +264,10 @@ def _order_lines(summary: dict) -> list[str]:
     return out
 
 
-def _format_summary(n: int, summary: dict) -> str:
+def _format_summary(n: int, summary: dict, symbol: str | None = None) -> str:
     """把一轮的 summary 拼成控制台摘要（中文，可含价位明细）。
+
+    `symbol`：多品种时在行首加品种标签，否则多品种摘要交错无法归属。
 
     ⚠️ **字符集约束**：Windows 控制台默认 GBK。
     中文在 GBK 内，可安全输出；但 `✓`(U+2713)、`⛔`(U+26D4) **不在** GBK 内，
@@ -282,9 +285,11 @@ def _format_summary(n: int, summary: dict) -> str:
     抽成纯函数是为了让测试能直接覆盖这条拼接路径
     （在 print 行上做源码扫描会漏掉上一行的字面量）。
     """
+    # 多品种：行首加品种标签（GBK 内，安全）。
+    _tag = f"[{symbol}] " if symbol else ""
     score = summary.get("score")
     if score is None:
-        return json.dumps(summary, ensure_ascii=False, default=str)
+        return _tag + json.dumps(summary, ensure_ascii=False, default=str)
     prop = summary.get("proposal") or {}
     direction = prop.get("direction")
     action = summary.get("action", "?")
@@ -310,7 +315,7 @@ def _format_summary(n: int, summary: dict) -> str:
     #
     # ⚠️ 缺失字段**整段省略**，不填 `?`：测试 `test_*_console_format`
     #    断言下单轮次不得出现 `?`（曾因 action 未设而打出 `-> ?`）。
-    head = f"[第{n}轮] 融合分={score:+.2f}"
+    head = f"{_tag}[第{n}轮] 融合分={score:+.2f}"
     if summary.get("vol_percentile") is not None:
         head += f" 波动分位={_pct(summary.get('vol_percentile'))}"
     if summary.get("regime"):
@@ -436,22 +441,51 @@ async def main_async(dry: bool, rounds: int | None) -> None:
     # 声明本进程为实盘进程 —— 只有这里会调 `set_live()`。
     # 研究/回放脚本默认**不允许**写生产 logs/（见 logging_util 的 `_live` 说明：
     # 一次忘调 set_silent 的回放就往生产日志灌了 19824 条伪造轮次）。
-    from gold_agent.common.logging_util import set_live, set_source
+    from gold_agent.common.logging_util import set_live, set_source, set_symbol
     set_live(True)
     set_source("dry" if dry else "live")
     if dry:
         CFG.trade_mode = "dry_run"
     lock_path = _acquire_single_instance_lock(dry)
-    graph = Graph.build()
-    # 启动自检
-    report = await graph.client.doctor()
-    if not report.get("ok"):
-        print(json.dumps({"fatal": "doctor failed", "report": report}, ensure_ascii=False))
-        sys.exit(1)
-    log_info(f"启动自检通过：{report['checks']['account']}")
-    if CFG.trade_mode == "live" and not getattr(graph.client, "_connected", False):
-        # doctor 内部线程初始化成功但 _connected 标志未同步；显式补一次
-        await graph.client.initialize()
+
+    # 单进程多品种：**一个进程内**并发跑各品种。
+    # ⚠️ 为什么不做多进程：用户明确要求日志统一可见
+    #    （"不同进程日志看不到啊"）。同一进程写同一批日志文件，
+    #    每条记录带 `symbol` 标签（见 logging_util.set_symbol）。
+    # ⚠️ 单进程也不再是"MT5 只能单连接"的限制：实测同进程多线程并发
+    #    读/下单均安全（5 线程 × 8 并发读 40 次无异常；5 品种 order_check
+    #    全部 retcode=0）。所以用 asyncio 并发即可，无需进程隔离。
+    symbols = list(CFG.trade_symbols)
+    for _s in symbols:
+        get_profile(_s)          # 未注册品种**立刻报错**，不要跑到下单才发现
+    multi = len(symbols) > 1
+
+    graphs: dict[str, Graph] = {}
+    for _s in symbols:
+        try:
+            set_symbol(_s if multi else None)
+            graphs[_s] = Graph.build(_s)
+        except Exception as e:
+            log_error(f"{_s}: 构建决策图失败 {type(e).__name__}: {e}")
+            raise
+    log_info(f"启动：{len(graphs)} 个品种 {'、'.join(symbols)}"
+             f"（{'多品种并发' if multi else '单品种'}）")
+
+    # 启动自检（逐个品种检查）
+    for _s, _g in graphs.items():
+        set_symbol(_s if multi else None)
+        try:
+            report = await _g.client.doctor()
+        except Exception as e:
+            report = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        if not report.get("ok"):
+            print(json.dumps({"fatal": "doctor failed", "symbol": _s, "report": report},
+                             ensure_ascii=False))
+            sys.exit(1)
+        log_info(f"{_s} 启动自检通过：{report['checks']['account']}")
+        if CFG.trade_mode == "live" and not getattr(_g.client, "_connected", False):
+            # doctor 内部线程初始化成功但 _connected 标志未同步；显式补一次
+            await _g.client.initialize()
 
     # 轮号跨进程持久（用户要求：重启不从 1 开始，便于日志对照）
     round_state_path = CFG.state_path.parent / "runner_state.json"
@@ -459,14 +493,30 @@ async def main_async(dry: bool, rounds: int | None) -> None:
         n = int(json.loads(round_state_path.read_text(encoding="utf-8")).get("round", 0))
     except Exception:
         n = 0
+
+    async def _one_round(sym: str, g: "Graph", rid: int) -> tuple[str, dict]:
+        """单品种一轮（异常不外抛，避免一个品种拖垮其它品种）。"""
+        set_symbol(sym if multi else None)
+        try:
+            s = await g.run_round(rid)
+        except Exception as e:
+            log_error(f"{sym} 第 {rid} 轮异常 {type(e).__name__}: {e}")
+            s = {"round": rid, "error": f"{type(e).__name__}: {e}", "symbol": sym}
+        return sym, s
+
     try:
         while rounds is None or n < rounds:
             n += 1
             round_state_path.parent.mkdir(parents=True, exist_ok=True)
             round_state_path.write_text(json.dumps({"round": n}), encoding="utf-8")
+
             # 市场休市检测（周六全天 / 周日早段 MT5 无新K线 → 空转烧限额，跳过）
+            # 多品种下按**第一个品种**判断即可：休市是全局的（同一券商同一时段），
+            # 逐个品种查只是浪费调用。
+            _first = graphs[symbols[0]]
             try:
-                st_now = graph.client.symbol_info_tick() if hasattr(graph.client, "symbol_info_tick") else None
+                st_now = (_first.client.symbol_info_tick()
+                          if hasattr(_first.client, "symbol_info_tick") else None)
             except Exception:
                 st_now = None
             if st_now is None:
@@ -477,16 +527,28 @@ async def main_async(dry: bool, rounds: int | None) -> None:
                     _safe_print(f"【休市】{_utc:%Y-%m-%d %H:%M} UTC 市场休市，跳过本轮")
                     await asyncio.sleep(max(CFG.decision.loop_interval_s * 10, 600))
                     continue
-            summary = await graph.run_round(n)
-            # 一行式控制台摘要（信号分 / 动作 / 风控 / 执行），PyCharm 运行窗直接可见
-            _safe_print(_format_summary(n, summary))
+
+            # 多品种并发：各品种独立决策，互不阻塞。
+            # ⚠️ `return_exceptions=True`：某品种抛错时必须让**其余品种照常**
+            #    完成本轮，而不是整轮作废（黄金出错不该拖累比特币）。
+            results = await asyncio.gather(
+                *[_one_round(s, graphs[s], n) for s in symbols],
+                return_exceptions=True)
+            for item in results:
+                if isinstance(item, BaseException):
+                    log_error(f"第 {n} 轮某品种异常：{type(item).__name__}: {item}")
+                    continue
+                sym, summary = item
+                _safe_print(_format_summary(n, summary, symbol=sym if multi else None))
+
             interval = CFG.decision.loop_interval_s
             await asyncio.sleep(interval)
     except KeyboardInterrupt:
         log_info("已被用户中断")
     finally:
-        with contextlib.suppress(Exception):
-            await graph.close()
+        for _g in graphs.values():
+            with contextlib.suppress(Exception):
+                await _g.close()
         # 释放单实例锁（进程崩溃时残留锁会被下一个进程识别为 stale 并接管）
         if lock_path is not None:
             with contextlib.suppress(Exception):

@@ -50,7 +50,7 @@ from gold_agent.news.collector import NewsView
 # ---------------------------------------------------------------------------
 # LLM-A：双 skill 分析评审
 # ---------------------------------------------------------------------------
-_REVIEW_SYSTEM = """你是资深黄金（XAUUSD）交易评审员，同时执行两个标准分析 skill。
+_REVIEW_SYSTEM = """你是资深{asset}交易评审员，同时执行两个标准分析 skill。
 你必须**严格按 skill 规定的流程**分析，不得跳步、不得用捷径。
 
 ═══ 必须遵守的通用纪律 ═══
@@ -147,7 +147,7 @@ sl/tp 并做方向、最小距离、盈亏比校验；你**不要**输出手数�
 rationale 必须说明你**依据的是哪个 skill 的哪一步**，以及哪些步骤缺失/降级。
 """
 
-_NEWS_SYSTEM = """你是财经新闻分析师。给你一组最近黄金市场相关快讯。
+_NEWS_SYSTEM = """你是财经新闻分析师。给你一组最近与{asset}相关的市场快讯。
 
 输出严格 JSON：
 {"sentiment":"bullish|bearish|neutral",
@@ -155,9 +155,9 @@ _NEWS_SYSTEM = """你是财经新闻分析师。给你一组最近黄金市场�
  "note":"一句话",
  "headline_directions":["bullish|bearish|neutral", ...]}
 
-impact 表示对金价短期方向的影响强度；不确定时低分。
+impact 表示对{asset}短期方向的影响强度；不确定时低分。
 **不要编造新闻标题之外的信息**（openmobius 无编造原则）。
-若快讯为空或与黄金无关，sentiment 必须为 neutral 且 impact 为 0。"""
+若快讯为空或与{asset}无关，sentiment 必须为 neutral 且 impact 为 0。"""
 
 
 def _fmt_num(x, nd: int = 2) -> str:
@@ -173,7 +173,7 @@ def _fmt_num(x, nd: int = 2) -> str:
 # 用户原话：
 #   > 要注意计算了新的加仓位置和止盈止损点 让大模型再评判这个单子
 #   > 是否还值得加仓 如果被否决就不加仓了
-_ADD_REVIEW_SYSTEM = """你是黄金（XAUUSD）交易的风险复核员。
+_ADD_REVIEW_SYSTEM = """你是{asset}交易的风险复核员。
 系统已经在**已有持仓**上算出了一笔新的加仓单（含入场价、止损、止盈、
 盈亏比）。你的唯一任务是判断：**在当前结构下，这一笔加仓还值不值得做**。
 
@@ -414,12 +414,38 @@ class Orchestrator:
     变成主路径的确认环节。
     """
 
-    def __init__(self, client: RunningHubClient | None = None) -> None:
+    def __init__(self, client: RunningHubClient | None = None,
+                 symbol: str | None = None) -> None:
         self.client = client
+        #: 本实例负责的品种与其档案。提示词里的品种名由它渲染 ——
+        #: 写死"黄金（XAUUSD）"会让模型在分析比特币/原油时被误导
+        #: （会用黄金的驱动逻辑解释别的品种）。
+        self.symbol = symbol
+        try:
+            from gold_agent.common.symbols import get_profile
+            self.profile = get_profile(symbol)
+        except Exception:
+            self.profile = None
         self._last_review_at = 0.0
         self._init_error: str = ""
         self.review_calls = 0
         self.review_failures = 0
+
+    def _asset(self) -> str:
+        """提示词里用的品种描述。无档案时退回黄金（单品种兼容）。"""
+        return getattr(self.profile, "prompt_asset", "") or "黄金（XAUUSD）"
+
+    def _render(self, template: str) -> str:
+        """把提示词模板里的 `{asset}` 换成品种描述。
+
+        ⚠️ **必须用 replace，不能用 `str.format()`。**
+        这些提示词里含 JSON 示例（`{"verdict":...}`），`format()` 会把
+        单个 `{` 当成占位符起点 → `KeyError: '"verdict"'`，
+        于是**每次 review 调用都抛异常**，LLM 直接不可用。
+        实测：改用 `.format()` 后 `_REVIEW_SYSTEM.format(...)` 立即崩溃；
+        而这正是"提示词里写 JSON 示例"与"用 format 渲染"的必然冲突。
+        """
+        return template.replace("{asset}", self._asset())
 
     def _ensure_client(self) -> bool:
         if self.client is not None:
@@ -442,10 +468,12 @@ class Orchestrator:
         tasks = {}
         if need_review:
             tasks["review"] = asyncio.create_task(self.client.chat_json(
-                _REVIEW_SYSTEM, build_review_user(ev, news, last_close),
+                self._render(_REVIEW_SYSTEM),
+                build_review_user(ev, news, last_close),
                 REVIEW_SCHEMA, timeout_s=CFG.llm.review_timeout_s, kind="review"))
         tasks["news_assessment"] = asyncio.create_task(self.client.chat_json(
-            _NEWS_SYSTEM, build_news_user(news), NEWS_SCHEMA,
+            self._render(_NEWS_SYSTEM),
+            build_news_user(news), NEWS_SCHEMA,
             timeout_s=CFG.llm.news_timeout_s, kind="news"))
         keys = list(tasks)
         results = await asyncio.gather(*[tasks[k] for k in keys], return_exceptions=True)
@@ -488,7 +516,8 @@ class Orchestrator:
                                      rr, last_close, ev=ev, position=position)
         try:
             res = await self.client.chat_json(
-                _ADD_REVIEW_SYSTEM, user, ADD_REVIEW_SCHEMA,
+                self._render(_ADD_REVIEW_SYSTEM), user,
+                ADD_REVIEW_SCHEMA,
                 timeout_s=CFG.llm.review_timeout_s, kind="add_review")
         except Exception as e:
             llm_log({"event": "add_review_failed", "error": str(e)})

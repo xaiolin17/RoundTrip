@@ -82,9 +82,15 @@ class DealFeedback:
     """交割单 → 统计/熔断/贝叶斯的闭环。"""
 
     def __init__(self, bayes: BayesianPool, breakers: CircuitBreakers,
-                 state_dir: Path | None = None) -> None:
+                 state_dir: Path | None = None,
+                 magic: int | None = None,
+                 symbol: str | None = None) -> None:
         self.bayes = bayes
         self.breakers = breakers
+        #: 本品种的 magic。多品种下必须按它过滤交割单 —— 否则各品种会把
+        #: 别人的盈亏计入自己的胜率/熔断/贝叶斯（统计被跨品种污染）。
+        self.magic = int(magic if magic is not None else CFG.mt5.magic)
+        self.symbol = symbol
         d = state_dir or (CFG.project_root / "data")
         d.mkdir(parents=True, exist_ok=True)
         self.stats_path = d / "trade_stats.json"
@@ -166,7 +172,8 @@ class DealFeedback:
                 self._save_cash_cursor()
         except Exception as e:
             log_warn(f"交割单反馈: 出入金流水读取失败 {type(e).__name__}: {e}")
-        new = [d for d in deals if d["time"] > self.cursor and d.get("magic") == CFG.mt5.magic]
+        new = [d for d in deals if d["time"] > self.cursor
+               and d.get("magic") == self.magic]
         if not new:
             if deals:
                 self.cursor = max(d["time"] for d in deals)

@@ -302,7 +302,8 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
                   volume_min: float = 0.01, volume_step: float = 0.01,
                   volume_max: float = 10.0,
                   sl_dist: float | None = None,
-                  reserve_lots: float = 0.0) -> tuple[float, str | None]:
+                  reserve_lots: float = 0.0,
+                  point: float = 0.001) -> tuple[float, str | None]:
     """风险预算 + Half-Kelly 上限 + 波动率目标系数。
 
     返回 (lots, reject_reason)。
@@ -311,6 +312,21 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     由 0.618 回调位决定，与 ATR 无关；仓位必须按同一个距离反推，
     否则单笔风险会随止损加宽等比放大（实测 4h 分型两倍 149 → 单笔
     风险 1.49% 而非预算的 0.5%）。传 None 时退回 ATR 距离（旧行为）。
+
+    `point`：该品种的最小价格变动单位（`SymbolProfile.point`）。默认 0.001
+    保持单品种（XAUUSDm）行为不变。
+
+    ⚠️ `point` 与 `point_value_per_lot` 必须**同源**（都来自同一个
+       `SymbolProfile.point`）。它们是配套的一对：
+           sl_points    = sl_dist / point
+           per_lot_risk = sl_points * point_value_per_lot
+       代入 `point_value_per_lot = tick_value * (point / tick_size)` 得
+           per_lot_risk = sl_dist * tick_value / tick_size
+       即 point **在代数上消掉**，结果与品种无关。
+       这正是原实现的真实情形：两处各自硬编码 0.001，于是"碰巧正确"。
+       实测 5 个品种（含 EURUSDm 的 0.00001）per_lot_risk 与正确公式一致。
+       但这是**脆弱的巧合** —— 只改一处会产生成百倍的手数误差
+       （EURUSDm 恰好 100 倍）。修改时必须两处一起改。
 
     最小手数兜底（用户选定）
     ------------------------
@@ -342,7 +358,9 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     risk_usd *= vol_k
     if sl_dist is None:
         sl_dist = CFG.risk.sl_atr_mult * atr          # 旧行为：按 ATR
-    sl_points = sl_dist / 0.001                        # XAUUSDm point=0.001
+    # ⚠️ 用**该品种的** point，不是硬编码 0.001。必须与
+    #    `graph._point_value()` / `machine._point(ctx)` 同源（见 docstring）。
+    sl_points = sl_dist / (point or 0.001)
     per_lot_risk = sl_points * point_value_per_lot
     if per_lot_risk <= 0:
         return 0.0, "bad_point_value"

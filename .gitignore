@@ -69,6 +69,13 @@ data/*.json
 data/*.csv
 data/runner.lock
 data/*.log
+# 多品种后状态按品种分目录（data/<品种>/…），同样的累积状态多了一层。
+# ⚠️ 必须补这条：`data/*.json` 只匹配一层，`data/BTCUSDm/trade_stats.json`
+#    之类的会漏网入库 —— 每次运行都产生无意义 diff 和跨机器状态冲突。
+data/*/*.json
+data/*/*.csv
+data/*/*.log
+data/*/runner.lock
 
 # data/source_ir.json 是**生产权重的来源**（research/21 产出），必须入库
 !data/source_ir.json

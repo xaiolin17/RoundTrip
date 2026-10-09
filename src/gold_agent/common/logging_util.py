@@ -23,6 +23,17 @@ _silent: bool = os.environ.get("GOLD_AGENT_NO_FILE_LOG", "") not in ("", "0", "f
 #: 记录来源，便于事后区分实盘 / 研究 / 测试产生的日志
 _source: str = os.environ.get("GOLD_AGENT_LOG_SOURCE", "live")
 
+#: 当前品种。多品种单进程运行时，各品种的日志会**交错写入同一文件**，
+#: 没有品种标签就无法归属某条记录属于哪个品种（也无法按品种做统计）。
+#: 单品种时保持 None，日志格式与改造前**完全一致**（不新增字段）。
+_symbol: str | None = None
+
+
+def set_symbol(sym: str | None) -> None:
+    """设置当前品种标签（多品种 runner 在每个品种的轮次前调用）。"""
+    global _symbol
+    _symbol = str(sym) if sym else None
+
 #: 本进程是否为**实盘 runner**。只有 `runner.main()` 会置 True。
 #:
 #: ⚠️ 为什么需要这个开关（2026-09-30 二次事故）：
@@ -97,6 +108,11 @@ def jlog(path: Path, record: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     record.setdefault("ts", time.time())
     record.setdefault("src", _source)
+    # 多品种：给每条记录打上品种标签（单品种时不加，保持日志格式不变）。
+    # ⚠️ 必须放在**去重 key 之前**：否则两个品种的同类记录（其余字段相同）
+    #    会被误判为"重复"而互相吞掉，其中一个品种的日志凭空消失。
+    if _symbol:
+        record.setdefault("symbol", _symbol)
     # 去重：按 (event, 业务内容) 判断（ts 除外），连续重复只写一条，段尾补汇总
     key = json.dumps({k: v for k, v in record.items() if k != "ts"},
                      ensure_ascii=False, sort_keys=True, default=str)

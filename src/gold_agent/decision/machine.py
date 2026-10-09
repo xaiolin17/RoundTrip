@@ -43,12 +43,45 @@ from gold_agent.news.collector import NewsView
 from gold_agent.risk.gate import Proposal, RiskGate
 from gold_agent.risk.zhongshu import center_of, edge_side
 
-#: 报价小数位（XAUUSDm digits=3）。所有**提交给 MT5 的价格**都必须先按它规整，
-#: 否则"我提交的值"与"MT5 存回的值"永不相等，幂等判定会退化成死循环。
-#: 实测事故见 `_decide_holding` 的移动止损分支（同一持仓重复提交 83 次）。
+#: 报价小数位与 point 的**默认值**，仅当上下文未提供品种档案时使用。
+#: ⚠️ 这两个常量原为 XAUUSDm 的硬编码（3 / 0.001），多品种下会出错：
+#:    EURUSDm（digits=5）的止损 `1.12419` 按 3 位规整成 `1.12400`，
+#:    偏离 **19 个 point** —— 与 2026-09-30"同一持仓重复提交 83 次"
+#:    属同一类故障（提交值与 MT5 存回值永不相等 → 幂等判定不收敛）。
+#: 现在一律经 `_px(ctx)` / `_point(ctx)` 从 `SymbolProfile` 取实际值，
+#: 这两个常量只在无档案的旧调用路径（研究脚本/测试桩）里兜底。
 _PX_DIGITS = 3
-#: XAUUSDm point（1 point = 0.001 价格单位）。
 _POINT = 0.001
+
+
+def _px(ctx) -> int:
+    """该品种的报价小数位（提交 MT5 前必须按它规整）。"""
+    p = getattr(ctx, "profile", None)
+    return int(getattr(p, "digits", _PX_DIGITS) or _PX_DIGITS)
+
+
+def _point(ctx) -> float:
+    """该品种的 point（最小价格变动单位）。
+
+    ⚠️ 必须与 `point_value_per_lot` 的构造**同源**：两者都由
+       `SymbolProfile.point` 推出。历史上它们各自硬编码 0.001，
+       乘起来正好自消（实测 5 品种下 per_lot_risk 与正确公式一致）——
+       那是**脆弱的巧合**：任何一处单独改成按 point 计算，
+       立刻产生成百倍的手数误差（EURUSDm 是 100 倍）。
+    """
+    p = getattr(ctx, "profile", None)
+    return float(getattr(p, "point", _POINT) or _POINT)
+
+
+def _magic_of(ctx) -> int:
+    """本品种的 magic（持仓/挂单过滤用）。
+
+    ⚠️ 每品种 magic 必须唯一，否则各品种会互相认领对方的持仓。
+    无档案时退回 `CFG.mt5.magic`（单品种兼容）。
+    """
+    p = getattr(ctx, "profile", None)
+    m = getattr(p, "magic", None)
+    return int(m) if m else int(CFG.mt5.magic)
 
 
 class State(str, Enum):
@@ -81,6 +114,10 @@ class DecisionContext:
     max_lots_cap: float = 0.0
     #: LLM 是否真的被调用并返回了 review（用于区分"LLM 说中性"与"LLM 没参与"）
     llm_available: bool = False
+    #: 当前品种档案（SymbolProfile）。多品种下 digits/point 必须按它取 ——
+    #: 见模块顶部 `_px` / `_point` 的说明。为 None 时退回旧硬编码默认值，
+    #: 使研究脚本与单元测试的旧调用方式继续可用。
+    profile: object | None = None
 
 
 def effective_score(s: float, baseline: float) -> float:
@@ -177,8 +214,14 @@ class DecisionEngine:
         """纯函数式判定一轮行为；执行与对账在 runner。"""
         r = ctx.ev.result
         try:
-            holding = [p for p in ctx.positions.positions if p.magic == CFG.mt5.magic]
-            pending = [o for o in ctx.positions.pending_orders if o.magic == CFG.mt5.magic]
+            # ⚠️ 多品种：过滤必须用**本品种的** magic。
+            #    全仓库原先只按 `CFG.mt5.magic` 过滤、**没有一处按 symbol 过滤**。
+            #    若各品种共用同一 magic，每个品种会把别的品种的持仓当成自己的
+            #    （已用总手数被跨品种求和、止损/平仓提案可能发到别人持仓上）。
+            #    `SymbolProfile.magic` 每品种唯一，使这些过滤**自动变正确**。
+            _magic = _magic_of(ctx)
+            holding = [p for p in ctx.positions.positions if p.magic == _magic]
+            pending = [o for o in ctx.positions.pending_orders if o.magic == _magic]
             self._prune_closed(holding)
             # P1-3：所有阈值判定都用校正后的分数
             s_eff = effective_score(r.score, r.score_baseline)
@@ -424,7 +467,7 @@ class DecisionEngine:
             if new_sl <= cur or new_tp >= cur:
                 return None
         self._tightened.add(str(getattr(pos, "ticket", "")))
-        return round(new_sl, _PX_DIGITS), round(new_tp, _PX_DIGITS)
+        return round(new_sl, _px(ctx)), round(new_tp, _px(ctx))
 
     def _decide_holding(self, ctx: DecisionContext, holding, s: float, sigma: float) -> Proposal:
         pos = holding[0]
@@ -524,7 +567,7 @@ class DecisionEngine:
         cur_profit = pos.profit
         self._profit_peak[key_pos] = max(peak, cur_profit)
         usd_per_price_unit = (getattr(ctx, "point_value_per_lot", 1.0)
-                              / _POINT * pos.volume)
+                              / _point(ctx) * pos.volume)
         lock_gap = CFG.decision.lock_profit_gap_usd / max(usd_per_price_unit, 1e-9)
         locked_sl = (pos.price_open + lock_gap
                      if direction == "LONG"
@@ -536,7 +579,7 @@ class DecisionEngine:
             # `4178.211`，下一轮 `pos.sl < locked_sl`（3.3e-4 的差）恒为真
             # → 每轮重发同一个值，MT5 恒回 `10025 No changes`。
             # 实测同一持仓重复 **83 次**，375 拒 / 35 成（91.5% 纯浪费）。
-            locked_sl = round(locked_sl, _PX_DIGITS)
+            locked_sl = round(locked_sl, _px(ctx))
             sl_is_old = (pos.sl is None
                          or (direction == "LONG" and pos.sl < locked_sl)
                          or (direction == "SHORT" and pos.sl > locked_sl))
@@ -597,10 +640,16 @@ class DecisionEngine:
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
                             reasons=[f"持仓 {age_h:.1f} 小时且亏损"])
         # ---- 保护性移损（用户规则：利润 > $10 时，把 SL 推到盈利 $2 处，锁底搏上限）----
-        # `point_value_per_lot` 的单位是「每 **point**(0.001) / 每手」的美元数
-        # （XAUUSDm = 0.1，见 position_lots 里 `sl_points * point_value_per_lot`）。
-        # 要把它换算成「每 1.0 价格单位 / 每手」须再除以 point(0.001)：
-        #     每手每 1.0 价格单位 = 0.1 / 0.001 = $100
+        # `point_value_per_lot` 的单位是「每 **point** / 每手」的美元数
+        # （XAUUSDm: point=0.001，值为 0.1，见 position_lots 里
+        #  `sl_points * point_value_per_lot`）。
+        # 要换算成「每 1.0 价格单位 / 每手」须除以**该品种的** point：
+        #     XAUUSDm: 0.1 / 0.001 = $100
+        # ⚠️ 这里原先硬编码 `/ _POINT`(=0.001)。多品种下必须用品种实际 point，
+        #    否则 EURUSDm（point=0.00001）算出的 usd_per_price_unit 会差 100 倍，
+        #    锁盈止损距离随之差 100 倍 → 要么贴太近被扫、要么远到无意义。
+        #    注意 `_point(ctx)` 与 `point_value_per_lot` 必须**同源**
+        #    （都由 SymbolProfile.point 推出），两者是配套的。
         # ⚠️ 原实现写 `2.0 / (point_value_per_lot * volume)`，漏了 /point，
         #    算出 SL = 开仓价 + 2000（远超现价）→ MT5 报 'Invalid stops'，
         #    移损从未成功过一次。

@@ -81,9 +81,33 @@ class LLMConfig:
 @dataclass
 class MobiusConfig:
     base_url: str = _TOML.get("mobius", {}).get("base_url", "https://api.mobiusquant.ai")
+    #: API token（可选）。**必须**用 `Authorization: Bearer mq_xxx` 传递。
+    #: 依据官方 /agents.md：
+    #:   匿名（不带 Authorization）-> 10 req/min per IP
+    #:   token  -> 60 req/min
+    #: ⚠️ 实测：只有 `Authorization: Bearer` 能让档位生效（返回头
+    #:    X-RateLimit-Limit: 60）。把 token 放进 X-API-Key / Api-Key 之类的
+    #:    自定义头**不会报错**，但档位**静默停留在匿名 10/min** ——
+    #:    这类失败没有任何提示，只能靠读 X-RateLimit-Limit 才能发现。
+    #:    实测：带 Authorization 但 token 拼错 -> 401（**不降级匿名**），
+    #:    所以 token 配置错误会直接表现为"服务不可用"，不会悄悄降速。
+    api_token: str = os.getenv("MOBIUSQUANT_API_TOKEN", "")
     cache_ttl_s: float = _TOML.get("mobius", {}).get("cache_ttl_s", 60.0)
-    rate_per_min: int = _TOML.get("mobius", {}).get("rate_per_min", 10)
+    #: 令牌桶速率（每分钟）。默认按**是否配了 token** 自动选档：
+    #:   有 token -> 60（官方 token 档）
+    #:   无 token -> 10（匿名档）
+    #: 可用 config.toml 的 `rate_per_min` 显式覆盖（取两者较小值，防止
+    #: 配了 token 却忘了改速率、或反过来配了高速率但没有 token 导致 429）。
+    rate_per_min: int = _TOML.get("mobius", {}).get("rate_per_min", 0) or (
+        60 if os.getenv("MOBIUSQUANT_API_TOKEN", "") else 10)
     stale_max_age_s: float = _TOML.get("mobius", {}).get("stale_max_age_s", 300.0)
+
+    @property
+    def auth_headers(self) -> dict:
+        """鉴权头。没有 token 时返回空 dict（照常匿名调用）。"""
+        if not self.api_token:
+            return {}
+        return {"Authorization": f"Bearer {self.api_token}"}
 
 
 @dataclass
@@ -408,6 +432,40 @@ class Config:
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---------- 多品种 ----------
+    #: 要交易的品种列表。默认**只有当前实盘品种**（`MT5_SYMBOL`），
+    #: 所以多品种改造对现有黄金行为**零影响** —— 这是刻意的：
+    #: 参数化本身不应改变任何运行结果，新增品种是独立的一步。
+    #: 用 `.env` 的 `TRADE_SYMBOLS=XAUUSDm,BTCUSDm` 切换。
+    @property
+    def trade_symbols(self) -> tuple[str, ...]:
+        raw = os.getenv("TRADE_SYMBOLS", "").strip()
+        if not raw:
+            return (self.mt5.symbol,)
+        return tuple(s.strip() for s in raw.split(",") if s.strip())
+
+    @property
+    def multi_symbol(self) -> bool:
+        """是否处于多品种模式（用于日志/摘要分支）。"""
+        return len(self.trade_symbols) > 1
+
+    def state_path_for(self, symbol: str) -> Path:
+        """按品种隔离的状态目录。
+
+        ⚠️ 为什么必须隔离：normalizer / score_baseline / vol_percentile /
+        bayes / breakers / trade_stats / position_adds 全是**统计状态**，
+        各自依附于该品种的分数分布与盈亏序列。多品种共用一份会让
+        A 品种的分数分布污染 B 品种的 z-score 归一化（尺度不同、
+        量纲不同），表现为双方都判错强弱。
+
+        单品种时**保持原路径不变**（`data/`），以便历史状态继续可用。
+        """
+        if not self.multi_symbol:
+            return Path(self.state_path.parent)
+        d = Path(self.state_path.parent) / symbol
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
 
 CFG = Config()

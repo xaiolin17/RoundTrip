@@ -280,7 +280,13 @@ class FusedEvidence:
 
 class FusionEngine:
     def __init__(self, weight_table: WeightTable | None = None,
-                 normalizer: SourceNormalizer | None = None) -> None:
+                 normalizer: SourceNormalizer | None = None,
+                 symbol: str | None = None) -> None:
+        #: 本引擎负责的品种。多品种下**必须**每品种一个实例 ——
+        #: normalizer/vol_pct/baseline 都是**该品种**的分数分布与波动统计，
+        #: 共用一份会让 A 品种的分布污染 B 品种的 z-score（量纲/尺度不同），
+        #: 双方都判错强弱。状态文件也随之按品种分目录。
+        self.symbol = symbol
         self.bayes = BayesianPool()
         self.kalman = KalmanTrend()
         # P0-2：权重来自实测 IR 文件；文件缺失 → 全 0（未验证不得参与方向决策）
@@ -679,6 +685,8 @@ class FusionEngine:
 
     # ---------- 持久化（实盘重启保留预热） ----------
     def state_path(self, name: str):
+        if self.symbol:
+            return CFG.state_path_for(self.symbol) / name
         return CFG.state_path.parent / name
 
     def save_state(self) -> None:

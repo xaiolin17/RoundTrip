@@ -105,7 +105,20 @@ class RiskGate:
                  win_rate: float | None = None,
                  position_adds: dict | None = None,
                  llm_review: dict | None = None,
-                 frames: dict | None = None) -> Approved:
+                 frames: dict | None = None,
+                 point: float = 0.001,
+                 magic: int | None = None) -> Approved:
+        """`point`：该品种的最小价格变动单位（`SymbolProfile.point`）。
+
+        ⚠️ 必须与 `point_value_per_lot` 同源。默认 0.001 保持 XAUUSDm
+        行为不变；多品种下由调用方传入实际值（见 `position_lots` docstring
+        关于"两处必须一起改"的说明）。
+
+        `magic`：该品种的 magic。持仓/挂单过滤**必须**按它 —— 全仓库原先
+        只按 `CFG.mt5.magic` 过滤、没有任何一处按 symbol 过滤，多品种共用
+        magic 会让每个品种认领别人的持仓。默认 None = `CFG.mt5.magic`。
+        """
+        magic = int(magic if magic is not None else CFG.mt5.magic)
         reasons = prop.reasons or []
         # ---------- 平仓/修改类直接放行（风控永不阻止离场） ----------
         if prop.kind == "modify_sltp":
@@ -226,7 +239,7 @@ class RiskGate:
             reserve = CFG.add_layer_lots * CFG.risk.max_adds_per_position
             lots, rej = position_lots(account.equity, atr, point_value_per_lot,
                                       win_rate, vol_k=vol_k, sl_dist=lv.sl_dist or None,
-                                      reserve_lots=reserve)
+                                      reserve_lots=reserve, point=point)
             if rej:
                 decision_log({"event": "risk_reject", "kind": prop.kind,
                               "reason": rej, "win_rate": round(win_rate, 3)})
@@ -260,7 +273,8 @@ class RiskGate:
             adds_count = int(rec.get("count", 0)) if isinstance(rec, dict) else int(rec or 0)
             if adds_count >= CFG.risk.max_adds_per_position:
                 return Approved(ok=False, reason=f"adds capped at {CFG.risk.max_adds_per_position}")
-            my_lots = sum(p.volume for p in positions.positions if p.magic == CFG.mt5.magic)
+            my_lots = sum(p.volume for p in positions.positions
+                          if p.magic == magic)
             # --- 加仓手数：原为硬编码 0.01，且上限判定也用同一个字面量 ---
             # 实测问题（153 次 `max_lot cap` 全部来自这里）：
             # `max_adds_per_position = 5` 声明允许加 5 层，但每层固定 0.01、
@@ -334,7 +348,7 @@ class RiskGate:
             if atr is None:
                 return Approved(ok=False, reason="no_atr")
             # 防重复：已有本策略挂单 → 不再放（决策层已拦，此处是第二道闸）
-            my_pending = [o for o in positions.pending_orders if o.magic == CFG.mt5.magic]
+            my_pending = [o for o in positions.pending_orders if o.magic == magic]
             if my_pending:
                 return Approved(ok=False, reason=f"pending x{len(my_pending)} already waiting")
 
@@ -376,7 +390,8 @@ class RiskGate:
                              else CFG.risk.cold_start_win_rate)
             base_lots, rej = position_lots(account.equity, atr, point_value_per_lot,
                                            win_rate_grid,
-                                           vol_k=vol_k_grid, sl_dist=lv.sl_dist or None)
+                                           vol_k=vol_k_grid, sl_dist=lv.sl_dist or None,
+                                           point=point)
             if rej:
                 return Approved(ok=False, reason=f"grid base: {rej}")
             order = {"level": pe.entry, "lots": base_lots,

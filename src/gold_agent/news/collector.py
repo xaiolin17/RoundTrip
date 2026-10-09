@@ -15,8 +15,13 @@ import aiohttp
 from gold_agent.common.config import CFG
 from gold_agent.common.logging_util import news_log
 
+#: 黄金关键词（默认品种，保持历史行为不变）。
+#: 多品种改用 `SymbolProfile.news_keywords` —— 每个品种的驱动因素不同，
+#: 用黄金关键词筛比特币/原油新闻会漏掉真正相关的消息（且误纳无关的）。
 _GOLD_KEYWORDS = ("黄金", "金价", "XAU", "美元", "美联储", "非农", "CPI", "PCE",
                   "利率", "降息", "加息", "地缘", "战争", "关税", "通胀", "就业")
+#: 高影响事件关键词。这些是**跨品种**的宏观事件（利率决议/通胀数据），
+#: 对所有品种都适用，所以不随品种变化。
 _HIGH_RISK_KEYWORDS = ("非农", "CPI", "PCE", "FOMC", "议息", "利率决议", "鲍威尔", "PPI")
 
 
@@ -52,9 +57,20 @@ def _news_age_seconds(ts: str, now: float) -> float | None:
 
 
 class Jin10Collector:
-    def __init__(self) -> None:
+    def __init__(self, keywords: tuple[str, ...] | None = None,
+                 symbol: str | None = None) -> None:
+        """`keywords`：本品种的新闻关键词。省略时按品种档案取，
+        再退回黄金关键词（单品种兼容，行为与改造前一致）。"""
         self._cache: NewsView | None = None
         self._cache_at = 0.0
+        self.symbol = symbol
+        if keywords is None:
+            try:
+                from gold_agent.common.symbols import get_profile
+                keywords = get_profile(symbol).news_keywords or _GOLD_KEYWORDS
+            except Exception:
+                keywords = _GOLD_KEYWORDS
+        self.keywords = tuple(keywords) or _GOLD_KEYWORDS
 
     async def fetch(self, force: bool = False) -> NewsView:
         now = time.time()
@@ -76,7 +92,7 @@ class Jin10Collector:
             if any(k in it.title for k in _HIGH_RISK_KEYWORDS):
                 it.level = "high_risk"
                 it.gold_relevant = True
-            elif any(k in it.title for k in _GOLD_KEYWORDS):
+            elif any(k in it.title for k in self.keywords):
                 it.level = "gold"
                 it.gold_relevant = True
         recent_hr = False
