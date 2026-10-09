@@ -266,6 +266,18 @@ def main() -> int:
     p("  分组：高影响（>= 阈值，闸门实际使用）/ 低影响（< 阈值，仅供参考）")
     p("")
 
+    # ── ⚠️ 有效独立样本数 ──
+    # 相邻 assessment 只隔约 73 秒，而前瞻窗口是 15~120 分钟 → 窗口**大量重叠**，
+    # 名义 n 会严重高估统计功效。实测踩过：24 条样本跨度仅 28.7 分钟，
+    # 15 分钟窗口下真正独立的观测只有约 2 个，却算出了"命中率 100% / t=+8.70"。
+    # 那是**同一段趋势被重复计数 24 次**，不是 24 个独立证据。
+    ts_all = sorted(float(r["ts"]) for r in rows if r.get("ts"))
+    span_min = (ts_all[-1] - ts_all[0]) / 60.0 if len(ts_all) > 1 else 0.0
+    p(f"  样本时间跨度：{span_min:.1f} 分钟（{len(ts_all)} 条）")
+    p(f"  → 15 分钟前瞻下**真正独立**的观测数约 {max(1.0, span_min/15):.1f} 个")
+    p("     （窗口重叠会把名义 n 放大成假功效，下面每行都按此折算判读）")
+    p("")
+
     for group, pred in (("高影响", lambda r: float(r.get("impact") or 0) >= thr),
                         ("低影响", lambda r: float(r.get("impact") or 0) < thr)):
         sub = [r for r in rows if pred(r)]
@@ -309,14 +321,21 @@ def main() -> int:
             mean_gross = sum(rets) / used
             mean_net = mean_gross - COST
             t = tstat(rets)
+            # 有效独立样本 ≈ 时间跨度 / 前瞻窗口（重叠修正）
+            n_eff = max(1.0, span_min / h) if span_min > 0 else 1.0
             flag = ""
-            if used < args.min_n:
-                flag = f"  ⚠️ 样本 {used} < {args.min_n}，不可结论"
+            if used < args.min_n or n_eff < args.min_n:
+                flag = (f"  ⚠️ 名义 n={used}，但**有效独立样本仅 {n_eff:.1f} 个**"
+                        f" -> 不可结论")
+                # 有效样本这么少时 t 值没有意义，不展示以免被误读
+                t_show = "  n/a"
+            else:
+                t_show = f"{t:>+5.2f}"
             if n_no_fwd:
                 flag += f"  (另有 {n_no_fwd} 条尚未走满该窗口)"
             p(f"    {h:>4} 分钟：n={used:>4}  命中率={hr:>6.1%}  "
               f"平均毛利={mean_gross:>+7.3f}  净={mean_net:>+7.3f}  "
-              f"t={t:>+5.2f}{flag}")
+              f"t={t_show}{flag}")
         p("")
 
     p("=" * 96)
