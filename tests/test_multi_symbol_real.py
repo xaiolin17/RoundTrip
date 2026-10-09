@@ -160,6 +160,99 @@ def test_machine_prices_round_to_symbol_digits():
         assert abs(got - want) < 1e-12, f"{sym}: {raw} -> {got}，期望 {want}"
 
 
+def test_levels_and_shrink_round_to_symbol_digits():
+    """`levels.py` / `shrink.py` 的**定价**规整也必须按品种 digits。
+
+    ⚠️ 这是与 `_PX_DIGITS=3` 同一类缺陷的另一半（2026-10-09 审计发现）：
+    `machine.py` 已改成 `_px(ctx)`，但 `levels.py`（11 处）与
+    `shrink.py`（3 处）**漏改了**，全都写死 `round(..., 3)`。
+
+    危害不只是显示：`levels.py` 的 `out.sl_dist` / `out.tp_dist`
+    会**进入手数反推**（`gate.py` -> `position_lots(sl_dist=...)`）与
+    `min_rr` 赔率校验，所以错价会直接改变**实际下单手数与单笔风险**。
+
+    实测（EURUSDm，1 point = 1e-5）：
+        digits=5 -> entry=1.1242
+        digits=3 -> entry=1.124      <- 旧行为，偏 **20 个 point**
+    """
+    import inspect
+    import pandas as pd
+
+    from gold_agent.risk import levels as LV
+    from gold_agent.risk import shrink
+
+    df = pd.DataFrame({"high": [1.13] * 30, "low": [1.12] * 30,
+                       "close": [1.125] * 30, "open": [1.125] * 30})
+
+    # 5 位小数的价位：digits=5 与 digits=3 必须给出不同（且 5 更精确）的结果
+    entry = 1.12419555
+    r5 = shrink.shrink_for_pending("LONG", entry, 0.0008, df, digits=5)
+    r3 = shrink.shrink_for_pending("LONG", entry, 0.0008, df, digits=3)
+    assert r5["entry"] != r3["entry"], "digits 参数没生效（仍是写死 3）"
+    assert abs(r5["entry"] - entry) < 1e-5, \
+        f"digits=5 的结果应保留 5 位精度，实为 {r5['entry']}"
+    pe_pt = get_profile("EURUSDm").point
+    assert abs(r5["entry"] - r3["entry"]) / pe_pt >= 1, \
+        "写死 3 位应造成至少 1 个 point 的偏差"
+
+    # ⚠️ 必须**逐字段**验证 tp/sl/entry 三个都按 digits 走。
+    #    只验证 entry 会漏掉"只改了一个字段"的半吊子修复
+    #    （实测：把 shrink 的 `round(tp, digits)` 退回 3 位，只查 entry 的测试仍通过）。
+    for field in ("entry", "tp", "sl"):
+        a = shrink.shrink_for_pending("LONG", entry, 0.0008, df, digits=5)[field]
+        b = shrink.shrink_for_pending("LONG", entry, 0.0008, df, digits=3)[field]
+        assert a != b, (
+            f"shrink 的 `{field}` 没按 digits 规整（digits=5 与 3 都得到 {a}）"
+            f" —— 该字段仍被写死为 3 位")
+
+    # 每个品种用自己的 digits 规整，误差必须小于 1 个 point
+    for sym, p in PROFILES.items():
+        px = 1.12419555 if p.digits == 5 else 4175.704321
+        r = shrink.shrink_for_pending("LONG", px, 0.0008, df, digits=p.digits)
+        for field in ("entry", "tp", "sl"):
+            assert abs(r[field] - round(r[field], p.digits)) < 1e-12, \
+                f"{sym}(digits={p.digits}): {field}={r[field]} 位数不对"
+
+    # levels.py 源码里不得再有写死的定价规整（`round(x, 3)`）
+    src = inspect.getsource(LV)
+    import re as _re
+    hard = _re.findall(r"round\([^)\n]*,\s*3\)", src)
+    assert not hard, f"levels.py 仍有写死的 round(...,3) 定价：{hard}"
+    # 加仓止损（由止盈反推）必须按 digits
+    assert "round(entry - sl_dist if is_long else entry + sl_dist, digits)" in src, \
+        "加仓止损仍未按 digits 规整"
+
+    # levels.py 的**行为**验证：加仓路径的 SL/TP 也必须按 digits
+    # （源码断言只能防"写死 3"，防不了"传了 digits 但没往下传"）
+    for sym, p in PROFILES.items():
+        out5 = LV.trade_levels("LONG", 1.12419555, None, atr=None,
+                               sl_from_tp=True, digits=5)
+        out3 = LV.trade_levels("LONG", 1.12419555, None, atr=None,
+                               sl_from_tp=True, digits=3)
+        if out5.ok and out3.ok and out5.sl is not None and out3.sl is not None:
+            assert out5.sl != out3.sl or out5.tp != out3.tp, \
+                f"{sym}: trade_levels 的 digits 参数没生效"
+
+
+def test_levels_default_digits_keeps_gold_behaviour():
+    """不传 digits 时必须与显式传 3 完全一致（单品种黄金行为不变）。"""
+    import inspect
+
+    from gold_agent.risk.levels import trade_levels
+    from gold_agent.risk import shrink
+    import pandas as pd
+
+    df = pd.DataFrame({"high": [1.13] * 30, "low": [1.12] * 30,
+                       "close": [1.125] * 30, "open": [1.125] * 30})
+    a = shrink.shrink_for_pending("LONG", 4175.704, 3.5, df)
+    b = shrink.shrink_for_pending("LONG", 4175.704, 3.5, df, digits=3)
+    assert a == b, f"默认行为变了：{a} vs {b}"
+    assert get_profile("XAUUSDm").digits == 3
+    # trade_levels 的默认值也必须是 3
+    sig = inspect.signature(trade_levels)
+    assert sig.parameters["digits"].default == 3, "trade_levels 默认 digits 应为 3"
+
+
 # ══════════════════════════════════════════════════════════════════
 # 3. 手数换算：point 必须与 point_value 同源（真实券商规格验证）
 # ══════════════════════════════════════════════════════════════════
@@ -1136,6 +1229,79 @@ def test_collector_defaults_to_gold_keywords():
     from gold_agent.news.collector import Jin10Collector, _GOLD_KEYWORDS
 
     assert Jin10Collector(symbol="XAUUSDm").keywords == _GOLD_KEYWORDS
+
+
+def test_news_search_query_uses_own_primary_keyword():
+    """⚠️ 金十 `search_flash` 的**上游查询关键词**必须按品种走。
+
+    原实现写死 `keyword="黄金"`（`collector._mcp_call`），于是多品种下只拉回
+    与黄金相关的快讯，再用本品种关键词在**这个子集**里筛 —— 比特币的
+    ETF/监管、原油的 OPEC/EIA 新闻根本拉不回来，`news_keywords` 形同虚设，
+    `high_risk_window` 与新闻事件闸对这些品种基本失效。
+
+    原有测试只断言了 `collector.keywords`（本地筛选用），
+    **没有断言请求体里的 keyword**，所以漏掉了这个缺陷。
+    """
+    import inspect
+
+    from gold_agent.news import collector as C
+
+    # 源码级：不得再写死黄金关键词做上游查询
+    src = inspect.getsource(C.Jin10Collector._mcp_call)
+    assert '"keyword": "黄金"' not in src, \
+        '上游查询仍写死 "黄金" —— 必须用本品种主关键词'
+
+    # 行为级：主关键词必须是各品种自己的
+    for sym, p in PROFILES.items():
+        c = C.Jin10Collector(symbol=sym)
+        assert c.keywords[0] == p.news_keywords[0], \
+            f"{sym}: 主关键词错为 {c.keywords[0]!r}"
+    # 黄金必须仍是"黄金"（单品种行为不变）
+    assert C.Jin10Collector(symbol="XAUUSDm").keywords[0] == "黄金"
+
+
+def test_profile_max_lot_is_not_dead_config(monkeypatch):
+    """⚠️ `SymbolProfile.max_lot` 不能是"声明了却从不生效"的死配置。
+
+    `symbols.py` 明确注释 `max_lot` **覆盖 CFG.max_lot**，且 5 个品种都填了
+    值，但原实现全仓库**只读 `CFG.max_lot`**，`profile.max_lot` 零引用
+    （对比 `risk_pct` 是正确按品种取的）。
+
+    今天不会产生错值（5 个品种的 max_lot 恰好都等于 CFG.max_lot=0.06），
+    但任何人给某品种单独设上限会**完全没反应**。
+
+    ⚠️ 必须做**行为**验证，不能只 grep 源码：
+    实测把 `_max_lots_cap` 改回 `return float(CFG.max_lot)` 时，
+    纯源码 grep 的断言**仍然通过**（因为别处也出现了 `profile.max_lot`）。
+    """
+    from gold_agent.common.symbols import PROFILES as _P, SymbolProfile
+    from gold_agent.agent.graph import Graph
+
+    # 行为验证：改掉档案里的 max_lot，Graph 的真实上限必须跟着变
+    g = Graph.build("XAUUSDm")
+    orig = g.profile.max_lot
+    try:
+        object.__setattr__(g.profile, "max_lot", 0.99) \
+            if not isinstance(g.profile, SymbolProfile) else None
+        # dataclass 默认可变，直接改实例字段即可
+        g.profile.__dict__["max_lot"] = 0.99
+        got = g._max_lots_cap(None)
+        assert abs(got - 0.99) < 1e-12, (
+            f"改了 profile.max_lot=0.99，_max_lots_cap 仍返回 {got} —— "
+            f"说明它读的是 CFG.max_lot 而不是档案（死配置）")
+    finally:
+        g.profile.__dict__["max_lot"] = orig
+
+    # 风控层的口径必须与决策层同源：evaluate 收 max_lot 参数
+    import inspect
+    from gold_agent.risk.gate import RiskGate
+    sig = inspect.signature(RiskGate.evaluate)
+    assert "max_lot" in sig.parameters, \
+        "RiskGate.evaluate 没有 max_lot 参数 —— 风控层无法与档案同源"
+    assert sig.parameters["max_lot"].default is None, \
+        "max_lot 默认应为 None（回退 CFG.max_lot，单品种行为不变）"
+    for sym, p in PROFILES.items():
+        assert isinstance(p.max_lot, float) and p.max_lot > 0, f"{sym}: max_lot 非法"
 
 
 def test_llm_prompts_are_asset_templated_and_render_per_symbol():

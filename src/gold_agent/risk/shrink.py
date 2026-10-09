@@ -66,8 +66,14 @@ def _last_atr(df: pd.DataFrame) -> float:
 
 
 def shrink_for_pending(direction: str, entry: float, atr: float,
-                       df: pd.DataFrame, tp_raw: float | None = None) -> dict:
-    """统一入口：返回 {entry, tp, sl}，全部经过收缩与可达性校验。"""
+                       df: pd.DataFrame, tp_raw: float | None = None,
+                       digits: int = 3) -> dict:
+    """统一入口：返回 {entry, tp, sl}，全部经过收缩与可达性校验。
+
+    `digits`：该品种的价格小数位。⚠️ 不能写死 3（XAUUSDm 的位数）——
+    对 EURUSDm（digits=5）会把 `1.12419` 截成 `1.12400`（偏 19 个 point）。
+    默认 3 保持单品种黄金行为不变。
+    """
     atr = max(atr, 1e-9)
     if entry is None:
         entry = pull_entry_inside(entry or 0.0, direction, atr)
@@ -80,7 +86,7 @@ def shrink_for_pending(direction: str, entry: float, atr: float,
     tp = entry + tp_dist if direction == "LONG" else entry - tp_dist
     sl = entry - sl_dist if direction == "LONG" else entry + sl_dist
     tp = reachable_tp(tp, direction, df)
-    tp = round(tp, 3)
-    sl = round(sl, 3)
-    entry = round(entry, 3)
+    tp = round(tp, digits)
+    sl = round(sl, digits)
+    entry = round(entry, digits)
     return {"entry": entry, "tp": tp, "sl": sl}

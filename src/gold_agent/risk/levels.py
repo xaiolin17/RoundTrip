@@ -168,8 +168,9 @@ def _structure_levels(ev, atr: float | None = None) -> tuple[list[float], list[f
 
 
 def _structure_levels_tagged(
-        ev, atr: float | None = None) -> tuple[list[tuple[float, str]],
-                                              list[tuple[float, str]]]:
+        ev, atr: float | None = None,
+        digits: int = 3) -> tuple[list[tuple[float, str]],
+                                  list[tuple[float, str]]]:
     """同 `_structure_levels`，但每个位带**来源标签**（缠论 / SMC）。
 
     返回值 `[(价格, 标签), ...]`，标签形如 `chanlun` / `smc` / `chanlun+smc`
@@ -180,6 +181,8 @@ def _structure_levels_tagged(
     后者是既有接口（`tests/test_structure_real.py`、
     `tests/test_risk_real.py` 都直接断言 `struct_support` 等标签），
     改签名会破坏契约。本函数只用于审计展示。
+
+    `digits`：该品种价格小数位（见 `trade_levels` 的说明）。
     """
     sup_t: list[tuple[float, str]] = []
     res_t: list[tuple[float, str]] = []
@@ -225,22 +228,25 @@ def _structure_levels_tagged(
             continue
     gap = (0.25 * atr) if atr else 1.0
     if gap > 0:
-        sup_t = _cluster_tagged(sup_t, gap)
-        res_t = _cluster_tagged(res_t, gap)
+        sup_t = _cluster_tagged(sup_t, gap, digits)
+        res_t = _cluster_tagged(res_t, gap, digits)
     return sup_t, res_t
 
 
-def _cluster(levels: list[float], gap: float) -> list[float]:
+def _cluster(levels: list[float], gap: float,
+             digits: int = 3) -> list[float]:
     """把相距 < gap 的位合并为均值簇，只返回**显著位**。
 
     196 个未聚合位 -> 合并后通常只剩几十个真正独立的位，
     `_nearest_below` 不会再命中 0.3 点外的 1m 噪音位。
+
+    `digits`：该品种价格小数位（见 `trade_levels` 的说明）。
     """
-    return [v for v, _ in _cluster_tagged([(x, "") for x in levels], gap)]
+    return [v for v, _ in _cluster_tagged([(x, "") for x in levels], gap, digits)]
 
 
 def _cluster_tagged(levels: list[tuple[float, str]],
-                    gap: float) -> list[tuple[float, str]]:
+                    gap: float, digits: int = 3) -> list[tuple[float, str]]:
     """同 `_cluster`，但**保留来源标签**（证明某个位是谁给的）。
 
     ⚠️ 为什么需要它：`_cluster` 返回裸浮点，聚合后无法分辨某个位来自
@@ -251,25 +257,31 @@ def _cluster_tagged(levels: list[tuple[float, str]],
     合并规则与 `_cluster` 完全一致（间距 < gap 归为一簇、取均值），
     标签取簇内**所有来源的并集**（排序去重后以 `+` 连接），
     这样合并后仍能看出"这个位是缠论和 SMC 共同给出的"。
+
+    `digits`：该品种价格小数位（见 `trade_levels` 的说明）。
+    本函数在**聚合前**把价位规整到 digits —— 写死 3 会让 EURUSDm 的
+    1m 结构位被截断到同一个值，把**本来独立的位误合并成一簇**，
+    进而改变止损/止盈的选取。默认 3 保持单品种黄金行为不变。
     """
     if not levels:
         return []
-    vals = sorted(set((round(float(x), 3), str(t)) for x, t in levels))
+    vals = sorted(set((round(float(x), digits), str(t)) for x, t in levels))
     out: list[tuple[float, str]] = []
     cur: list[tuple[float, str]] = [vals[0]]
     for v, t in vals[1:]:
         if v - cur[-1][0] < gap:
             cur.append((v, t))
         else:
-            out.append(_merge_cluster(cur))
+            out.append(_merge_cluster(cur, digits))
             cur = [(v, t)]
-    out.append(_merge_cluster(cur))
+    out.append(_merge_cluster(cur, digits))
     return out
 
 
-def _merge_cluster(cur: list[tuple[float, str]]) -> tuple[float, str]:
+def _merge_cluster(cur: list[tuple[float, str]],
+                   digits: int = 3) -> tuple[float, str]:
     """把一簇 (值, 标签) 合成 (均值, 并集标签)。"""
-    mean = round(sum(v for v, _ in cur) / len(cur), 3)
+    mean = round(sum(v for v, _ in cur) / len(cur), digits)
     tags = sorted({t for _, t in cur if t})
     return mean, "+".join(tags)
 
@@ -341,11 +353,19 @@ def _pick_src(level: float | None, llm_vals: list[float],
 def trade_levels(direction: str, entry: float, review: dict | None,
                  ev=None, atr: float | None = None,
                  tp_shrink: float = 1.0,
-                 sl_from_tp: bool = False) -> TradeLevels:
+                 sl_from_tp: bool = False,
+                 digits: int = 3) -> TradeLevels:
     """按 LLM 判断的压力位/支撑位算止损止盈。
 
     做多：止损 = 下方最近**支撑**位再让开一点；止盈 = 上方最近**压力**位
     做空：止损 = 上方最近**压力**位再让开一点；止盈 = 下方最近**支撑**位
+
+    `digits`：该品种的价格小数位（`SymbolProfile.digits`）。
+    ⚠️ 本函数内所有 `round(x, digits)` 必须用它，**不能写死 3**。
+    `3` 是 XAUUSDm 的位数；对 EURUSDm（digits=5）会把
+    `1.12419` 截成 `1.12400`（**偏 19 个 point**），对 USDJPYm 同理。
+    与 `machine.py` 的 `_PX_DIGITS=3` 是同一类缺陷（那边已修）。
+    默认 `3` 保持单品种黄金行为逐字节不变。
 
     加仓专用模式（`sl_from_tp=True`，用户 2026-10-08 指定）
     ------------------------------------------------------
@@ -422,11 +442,11 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         # 止损：下方最近支撑，再让开 pad
         lv = _nearest_below(sup_all, entry)
         if lv is not None:
-            out.sl = round(lv - pad, 3)
+            out.sl = round(lv - pad, digits)
             out.sl_source = _pick_src(lv, sup, s_sup, "support")
             out.used_sl_level = lv
         elif hint_sl is not None and hint_sl < entry:
-            out.sl = round(hint_sl, 3)
+            out.sl = round(hint_sl, digits)
             out.sl_source = "llm_hint"
             out.used_sl_level = hint_sl
         # ---- 融合分与压力位矛盾检测（用户选定）----
@@ -465,11 +485,11 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     else:
         lv = _nearest_above(res_all, entry)
         if lv is not None:
-            out.sl = round(lv + pad, 3)
+            out.sl = round(lv + pad, digits)
             out.sl_source = _pick_src(lv, res, s_res, "resistance")
             out.used_sl_level = lv
         elif hint_sl is not None and hint_sl > entry:
-            out.sl = round(hint_sl, 3)
+            out.sl = round(hint_sl, digits)
             out.sl_source = "llm_hint"
             out.used_sl_level = hint_sl
         # ---- 融合分与压力位矛盾检测（用户选定）----
@@ -498,7 +518,7 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     if sl_from_tp:
         return _levels_from_tp(direction, entry, out, res_all, sup_all,
                                res, sup, s_res, s_sup, hint_tp, min_d,
-                               tp_shrink)
+                               tp_shrink, digits)
 
     # ---- 先定止损，再据此选"够赔率"的止盈压力位 ----
     if out.sl is None:
@@ -511,7 +531,7 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     if min_d and sl_dist < min_d:
         # 贴脸 → 按 ATR 下限外扩（保持方向不变）
         out.notes.append(f"止损距离 {sl_dist:.3f} < 下限 {min_d:.3f} → 外扩")
-        out.sl = round(entry - min_d if direction == "LONG" else entry + min_d, 3)
+        out.sl = round(entry - min_d if direction == "LONG" else entry + min_d, digits)
         sl_dist = min_d
         out.sl_source += "+atr_floor"
 
@@ -520,11 +540,11 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         cands = [x for x in res_all if x > entry]
         lv2 = _target_beyond(res_all, entry, need, "LONG")
         if lv2 is not None:
-            out.tp = round(lv2, 3)
+            out.tp = round(lv2, digits)
             out.tp_source = _pick_src(lv2, res, s_res, "resistance")
             out.used_tp_level = lv2
         elif hint_tp is not None and hint_tp - entry >= need:
-            out.tp = round(hint_tp, 3)
+            out.tp = round(hint_tp, digits)
             out.tp_source = "llm_hint"
             out.used_tp_level = hint_tp
         elif not cands and hint_tp is None:
@@ -534,11 +554,11 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         cands = [x for x in sup_all if x < entry]
         lv2 = _target_beyond(sup_all, entry, need, "SHORT")
         if lv2 is not None:
-            out.tp = round(lv2, 3)
+            out.tp = round(lv2, digits)
             out.tp_source = _pick_src(lv2, sup, s_sup, "support")
             out.used_tp_level = lv2
         elif hint_tp is not None and entry - hint_tp >= need:
-            out.tp = round(hint_tp, 3)
+            out.tp = round(hint_tp, digits)
             out.tp_source = "llm_hint"
             out.used_tp_level = hint_tp
         elif not cands and hint_tp is None:
@@ -551,8 +571,8 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         out.reason = f"rr_below_{CFG.risk.min_rr}"
         return out
 
-    out.sl_dist = round(abs(entry - out.sl), 3)
-    out.tp_dist = round(abs(out.tp - entry), 3)
+    out.sl_dist = round(abs(entry - out.sl), digits)
+    out.tp_dist = round(abs(out.tp - entry), digits)
     if out.tp_dist < out.sl_dist * CFG.risk.min_rr - 1e-9:
         out.reason = f"rr_below_{CFG.risk.min_rr}"
         return out
@@ -566,7 +586,7 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
                     res: list[float], sup: list[float],
                     s_res: list[float], s_sup: list[float],
                     hint_tp: float | None, min_d: float,
-                    tp_shrink: float) -> TradeLevels:
+                    tp_shrink: float, digits: int = 3) -> TradeLevels:
     """加仓定价：**由止盈反推止损**（用户 2026-10-08 指定）。
 
     用户原话：
@@ -625,7 +645,7 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
     # ---- 3. 由缩后的止盈距离反推止损（盈亏比 = min_rr）----
     sl_dist = tp_dist / CFG.risk.min_rr
     prev_sl = out.sl
-    out.sl = round(entry - sl_dist if is_long else entry + sl_dist, 3)
+    out.sl = round(entry - sl_dist if is_long else entry + sl_dist, digits)
     # ⚠️ 这里**刻意**覆盖掉上面按支撑/压力位算出的 out.sl：
     #    用户要求加仓的止损来自止盈位置，不是支撑位。
     out.sl_source = "rr_from_tp"
@@ -635,7 +655,7 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
         f"{CFG.risk.min_rr} = 止损距离 {sl_dist:.3f}"
         f"（原支撑位止损 {prev_sl} 已被覆盖）")
 
-    out.tp = round(entry + tp_dist if is_long else entry - tp_dist, 3)
+    out.tp = round(entry + tp_dist if is_long else entry - tp_dist, digits)
     if sl_dist <= 0:
         out.reason = "sl_at_entry"
         return out
@@ -645,8 +665,8 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
     if tp_dist < sl_dist * CFG.risk.min_rr - 1e-9:
         out.reason = f"rr_below_{CFG.risk.min_rr}"
         return out
-    out.sl_dist = round(abs(entry - out.sl), 3)
-    out.tp_dist = round(abs(out.tp - entry), 3)
+    out.sl_dist = round(abs(entry - out.sl), digits)
+    out.tp_dist = round(abs(out.tp - entry), digits)
 
     out.ok = True
     return out

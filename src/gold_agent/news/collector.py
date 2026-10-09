@@ -121,9 +121,15 @@ class Jin10Collector:
                                "clientInfo": {"name": "goldagent", "version": "0.1"}}}
             async with s.post(CFG.jin10.base_url, json=body, headers=headers) as r:
                 await r.text()
-            # search_flash 关键词拉取黄金快讯（实测可用；金十无快讯流式推送工具）
+            # search_flash 按关键词拉快讯（实测可用；金十无快讯流式推送工具）。
+            # ⚠️ 关键词必须用**本品种的主关键词**，不能写死"黄金"。
+            #    原实现写死 "黄金"，于是多品种下只拉回与黄金相关的快讯，
+            #    再用本品种关键词在**这个子集**里筛 —— 比特币的 ETF/监管、
+            #    原油的 OPEC/EIA 新闻根本拉不回来，`news_keywords` 形同虚设，
+            #    `high_risk_window` 与新闻事件闸对这些品种基本失效。
+            kw = self.keywords[0] if self.keywords else "黄金"
             body = {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                    "params": {"name": "search_flash", "arguments": {"keyword": "黄金"}}}
+                    "params": {"name": "search_flash", "arguments": {"keyword": kw}}}
             async with s.post(CFG.jin10.base_url, json=body, headers=headers) as r:
                 return self._read_sse(await r.text())
 

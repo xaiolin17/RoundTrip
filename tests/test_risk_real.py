@@ -723,6 +723,49 @@ def test_news_high_risk_window_actually_triggers_when_enabled():
     assert b.check(10000, 0.0, False) is None
 
 
+def test_add_layer_gate_honours_its_max_lot_parameter():
+    """⚠️ `RiskGate.evaluate(max_lot=...)` 必须真的被用上，不能只读 `CFG.max_lot`。
+
+    `SymbolProfile.max_lot` 的注释写明"覆盖 CFG.max_lot"，且
+    `Graph._max_lots_cap` 已改成读档案。若风控层仍写死 `CFG.max_lot`，
+    两层口径就不一致 —— 决策层按档案算、风控层按全局算，
+    正是历史 259 次"总手数上限"拒绝的成因（同类问题）。
+
+    这里**驱动真实的 gate**（而不是重算一遍算术），
+    用一个明显更小的 max_lot 让加仓被拒、再用大的让它通过。
+    """
+    gate = RiskGate(CircuitBreakers())
+    ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
+    acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
+                      margin=0, margin_level=0, leverage=2000, currency="USD")
+    pos = type("P", (), {"ticket": 123456, "volume": 0.01, "price_open": 4350.0,
+                         "magic": CFG.mt5.magic})()
+    views = type("V", (), {"positions": [pos], "pending_orders": []})()
+
+    def run(max_lot):
+        return gate.evaluate(Proposal(kind="add_layer", direction="LONG",
+                                      entry=123456),
+                             ev, acc, views, 0.1, None, 5.0, None,
+                             llm_review=_llm_rev([4340.0], [4420.0]),
+                             max_lot=max_lot)
+
+    # 已用 0.01，上限给 0.0101 → 剩余 0.0001 < min_lot → 必须被拒
+    tight = run(0.0101)
+    assert not tight.ok, (
+        "max_lot=0.0101（已用 0.01，余量不足最小手数）却没被拒 —— "
+        "说明 gate 没用传入的 max_lot，仍在读 CFG.max_lot")
+    assert "max_lot cap" in tight.reason, f"拒绝原因不对：{tight.reason}"
+
+    # 上限放宽到 1.0 → 必须通过
+    loose = run(1.0)
+    assert loose.ok, f"max_lot=1.0 时加仓不应被拦：{loose.reason}"
+
+    # 默认（不传）必须等价于 CFG.max_lot（单品种行为不变）
+    default = run(None)
+    explicit = run(CFG.max_lot)
+    assert default.ok == explicit.ok, "默认 max_lot 与 CFG.max_lot 不等价"
+
+
 def test_add_layer_room_uses_config_not_hardcoded_lot():
     """加仓额度必须按「剩余额度」判定，而不是拿硬编码 0.01 去比上限。
 

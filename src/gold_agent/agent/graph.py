@@ -418,7 +418,9 @@ class Graph:
                 # 自研回调检测需要小周期 K 线（缠论代理在小周期上不准）
                 frames=st["bundle"].frames,
                 point=self.profile.point,
-                magic=self.profile.magic)
+                magic=self.profile.magic,
+                digits=self.profile.digits,
+                max_lot=self.profile.max_lot)
             st["approved"] = approved
             # plan 必须放进 summary：控制台要靠它显示方向/入场/止损/止盈
             # （只放 ok/reason 的话，显示层读不到价位，会打出 "None手"）
@@ -973,12 +975,22 @@ class Graph:
     def _max_lots_cap(self, account) -> float:
         """**总敞口**上限（加仓额度判定用）。
 
-        ⚠️ 必须与 `RiskGate.add_layer` 里的 `room = CFG.max_lot − my_lots`
+        ⚠️ 必须与 `RiskGate.add_layer` 里的 `room = max_lot − my_lots`
         用**同一个口径**。决策层若按别的口径算（例如按 broker 的单笔上限
         `volume_max=200`），就会持续提出风控必然拒掉的加仓 ——
         两处口径不一致正是实测 259 次"总手数上限"拒绝的成因。
+
+        ⚠️ 用 `self.profile.max_lot`（`SymbolProfile` 里注释写明"覆盖
+        CFG.max_lot"），而不是直接读 `CFG.max_lot`。原实现只读后者，
+        导致 `profile.max_lot` 成了**声明了却从不生效的死配置**：
+        给某品种单独设上限会完全没反应，且多品种下每个品种各自吃满
+        全局上限（合计 n×max_lot），与档案的设计意图不符。
+        当前 5 个品种的 `max_lot` 恰好都等于 `CFG.max_lot`，所以行为不变。
         """
-        return float(CFG.max_lot)
+        try:
+            return float(self.profile.max_lot)
+        except Exception:
+            return float(CFG.max_lot)
 
     def _point_value(self, symbol: str | None = None) -> float:
         """每手每 **point** 的美元值（与 `SymbolProfile.point` 配套）。

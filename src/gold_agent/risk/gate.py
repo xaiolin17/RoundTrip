@@ -85,7 +85,8 @@ class RiskGate:
 
     def _levels(self, direction: str, entry: float, ev, atr: float | None,
                 llm_review: dict | None = None,
-                sl_from_tp: bool = False):
+                sl_from_tp: bool = False,
+                digits: int = 3):
         """按 LLM 判断的压力位/支撑位算止损止盈（用户要求的正确语义）。
 
         ⚠️ 概念纠正：0.618 回调位是**入场点**，不是止损。
@@ -94,10 +95,14 @@ class RiskGate:
 
         `sl_from_tp=True` 走**加仓专用**路径：先定止盈、缩 58%、
         再按 min_rr 反推止损（用户 2026-10-08 指定）。首仓/挂单不受影响。
+
+        `digits`：该品种价格小数位。⚠️ 必须传，不能沿用 `levels.py` 里
+        写死的 3 —— 对 EURUSDm（digits=5）会把 `1.12419` 截成 `1.12400`
+        （偏 19 个 point），且该误差会**进入手数计算**（`sl_dist` 反推手数）。
         """
         return trade_levels(direction, entry, llm_review, ev, atr,
                             tp_shrink=CFG.risk.add_tp_shrink if sl_from_tp else 1.0,
-                            sl_from_tp=sl_from_tp)
+                            sl_from_tp=sl_from_tp, digits=digits)
 
     def evaluate(self, prop: Proposal, ev: FusedEvidence, account: AccountInfo,
                  positions: PositionsView, point_value_per_lot: float,
@@ -107,7 +112,9 @@ class RiskGate:
                  llm_review: dict | None = None,
                  frames: dict | None = None,
                  point: float = 0.001,
-                 magic: int | None = None) -> Approved:
+                 magic: int | None = None,
+                 digits: int = 3,
+                 max_lot: float | None = None) -> Approved:
         """`point`：该品种的最小价格变动单位（`SymbolProfile.point`）。
 
         ⚠️ 必须与 `point_value_per_lot` 同源。默认 0.001 保持 XAUUSDm
@@ -117,8 +124,20 @@ class RiskGate:
         `magic`：该品种的 magic。持仓/挂单过滤**必须**按它 —— 全仓库原先
         只按 `CFG.mt5.magic` 过滤、没有任何一处按 symbol 过滤，多品种共用
         magic 会让每个品种认领别人的持仓。默认 None = `CFG.mt5.magic`。
+
+        `digits`：该品种价格小数位（`SymbolProfile.digits`），用于
+        止损/止盈定价规整。默认 3 保持 XAUUSDm 行为不变；写死 3 会让
+        EURUSDm 的 `1.12419` 被截成 `1.12400`（偏 19 个 point）。
+
+        `max_lot`：该品种总手数上限（`SymbolProfile.max_lot`，注释写明
+        "覆盖 CFG.max_lot"）。默认 None 回退 `CFG.max_lot` —— 二者当前相等，
+        所以单品种行为不变。**必须与 `Graph._max_lots_cap` 同源**，
+        否则决策层与风控层口径不一致（这正是历史 259 次
+        "总手数上限"拒绝的成因）。
         """
         magic = int(magic if magic is not None else CFG.mt5.magic)
+        if max_lot is None:
+            max_lot = float(CFG.max_lot)
         reasons = prop.reasons or []
         # ---------- 平仓/修改类直接放行（风控永不阻止离场） ----------
         if prop.kind == "modify_sltp":
@@ -210,7 +229,8 @@ class RiskGate:
                         else CFG.risk.cold_start_win_rate)   # 冷启动先验胜率（可配）
             entry = prop.entry   # 市价由 executor 取当前 bid/ask
             # ---- 止损止盈看压力位/支撑位（LLM 判断 + 本地配套计算）----
-            lv = self._levels(prop.direction, entry, ev, atr, llm_review)
+            lv = self._levels(prop.direction, entry, ev, atr, llm_review,
+                              digits=digits)
             if not lv.ok:
                 # 用户选定：LLM 没给出可用压力位 → **不开仓**，等 LLM 可用
                 # （猜点位比不交易更危险）
@@ -285,12 +305,12 @@ class RiskGate:
             # 改为按**剩余额度**推导本次可加手数：只有剩余确实不足
             # 最小手数时才算"加无可加"（真正的资金上限），而不是固定拿 0.01
             # 去比。这样 add_no 的 5 层阶梯重新可达。
-            room = CFG.max_lot - my_lots
+            room = max_lot - my_lots
             add_lots = round(min(CFG.add_layer_lots, room), 2)
             if add_lots < CFG.min_lot:
                 return Approved(
                     ok=False,
-                    reason=f"max_lot cap: 已用 {my_lots:.2f} 上限 {CFG.max_lot} "
+                    reason=f"max_lot cap: 已用 {my_lots:.2f} 上限 {max_lot} "
                            f"剩余 {room:.2f} < 最小手数 {CFG.min_lot}")
             # ⚠️ 加仓必须自带 SL/TP。
             # 原实现 plan 里没有 tp/sl，executor 用 `plan.tp or 0.0` →
@@ -318,12 +338,12 @@ class RiskGate:
             if ref is None:
                 ref = pos.price_open if pos is not None else prop.entry
             lv = self._levels(prop.direction, ref, ev, atr, llm_review,
-                              sl_from_tp=True)
+                              sl_from_tp=True, digits=digits)
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
             plan = {"kind": "add_layer", "direction": prop.direction,
                     "lots": add_lots, "position_ticket": prop.entry,
-                    "entry": round(ref, 3),
+                    "entry": round(ref, digits),
                     "tp": lv.tp, "sl": lv.sl, "reasons": reasons,
                     "sl_source": lv.sl_source, "tp_source": lv.tp_source,
                     "sl_dist": lv.sl_dist, "tp_dist": lv.tp_dist}
@@ -366,7 +386,8 @@ class RiskGate:
                                 reason=f"pullback passed band ({pe.band_far})")
 
             # ---- 止损止盈：LLM 判断的压力位/支撑位 ----
-            lv = self._levels(prop.direction, pe.entry, ev, atr, llm_review)
+            lv = self._levels(prop.direction, pe.entry, ev, atr, llm_review,
+                              digits=digits)
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
 
