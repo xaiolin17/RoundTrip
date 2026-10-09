@@ -195,12 +195,35 @@ def test_same_direction_limit_rejects(multi):
         direction_by_symbol={"XAUUSDm": "LONG", "BTCUSDm": "LONG",
                              "USOILm": "LONG", "EURUSDm": None},
         equity=10000.0, pnl_now=0.0)
-    v = pf.check_for("EURUSDm", 0.005, st)
-    # 本笔若为 LONG，则同向已有 3 个 >= limit -> 拒绝
-    st.direction_by_symbol["EURUSDm"] = "LONG"
-    v = pf.check_for("EURUSDm", 0.005, st)
+    # 本笔要开 LONG，而同向已有 3 个 >= limit -> 拒绝
+    v = pf.check_for("EURUSDm", 0.005, st, this_direction="LONG")
     assert v.ok is False
     assert v.reason and "portfolio_same_direction" in v.reason
+
+
+def test_same_direction_gate_uses_intent_not_existing_position(multi):
+    """⚠️ 同向闸必须按**本笔意图方向**判定，不能按"该品种已有持仓方向"。
+
+    初版实现去读 `direction_by_symbol[symbol]`，而正在开新仓时该品种
+    还没有持仓（方向为 None）→ 同向闸**在最需要它的时刻静默失效**。
+    实测：3 个品种已做多，第 4 个再做多仍被放行。
+
+    这条测试锁死该失败模式：同一份 state 下，
+    传 this_direction="LONG" 必须拒绝，传 "SHORT" 必须放行。
+    """
+    pf = PortfolioRisk(("XAUUSDm", "BTCUSDm", "USOILm", "EURUSDm"))
+    st = PortfolioState(
+        risk_by_symbol={},
+        direction_by_symbol={"XAUUSDm": "LONG", "BTCUSDm": "LONG",
+                             "USOILm": "LONG", "EURUSDm": None},
+        equity=10000.0, pnl_now=0.0)
+    long_v = pf.check_for("EURUSDm", 0.005, st, this_direction="LONG")
+    short_v = pf.check_for("EURUSDm", 0.005, st, this_direction="SHORT")
+    assert long_v.ok is False, "本笔做多但同向已有 3 个，未拒绝（接线错误）"
+    assert short_v.ok is True, "本笔做空不该被同向限制拦"
+    # 对照：不传方向（旧实现的行为）会**误放行**
+    none_v = pf.check_for("EURUSDm", 0.005, st)
+    assert none_v.ok is True, "不传方向时本就无法判定 —— 故必须显式传"
 
 
 def test_opposite_direction_not_limited(multi):
@@ -211,7 +234,7 @@ def test_opposite_direction_not_limited(multi):
         direction_by_symbol={"XAUUSDm": "SHORT", "BTCUSDm": "SHORT",
                              "USOILm": "SHORT", "EURUSDm": "LONG"},
         equity=10000.0, pnl_now=0.0)
-    v = pf.check_for("EURUSDm", 0.005, st)
+    v = pf.check_for("EURUSDm", 0.005, st, this_direction="LONG")
     assert v.ok is True, "反向开仓被同向限制误拦"
 
 
@@ -224,7 +247,8 @@ def test_same_direction_limit_zero_disables_gate(multi, monkeypatch):
         direction_by_symbol={"XAUUSDm": "LONG", "BTCUSDm": "LONG",
                              "USOILm": "LONG", "EURUSDm": "LONG"},
         equity=10000.0, pnl_now=0.0)
-    assert pf.check_for("EURUSDm", 0.005, st).ok is True
+    assert pf.check_for("EURUSDm", 0.005, st,
+                        this_direction="LONG").ok is True
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -313,3 +337,124 @@ def test_build_state_uses_conservative_full_risk(multi):
                      equity=10000.0, pnl_now=0.0, risk_pct=0.005)
     assert st.risk_by_symbol == {"XAUUSDm": 0.005, "BTCUSDm": 0.005}
     assert sum(st.risk_by_symbol.values()) == pytest.approx(0.01)
+
+
+# ══════════════════════════════════════════════════════════════════
+# 跨品种方向登记表（同向集中闸的数据来源）
+# ══════════════════════════════════════════════════════════════════
+def test_direction_registry_starts_all_none(multi):
+    """⚠️ 登记表必须**预先包含全部品种**且初值为 None。
+
+    若不预置，未上报的品种在 `direction_map()` 里根本不存在，
+    同向计数会**漏算**（把已持仓的品种当没持仓）。
+    """
+    pf = PortfolioRisk(("XAUUSDm", "BTCUSDm", "USOILm"))
+    d = pf.direction_map()
+    assert set(d) == {"XAUUSDm", "BTCUSDm", "USOILm"}
+    assert all(v is None for v in d.values())
+
+
+def test_direction_registry_accumulates_across_symbols(multi):
+    """各品种分别上报后，全局视图必须**看得到彼此**。
+
+    这是同向集中闸能生效的前提：每个 Graph 只看得到自己的持仓
+    （按 magic 过滤），拿不到别人的方向。
+    """
+    pf = PortfolioRisk(("XAUUSDm", "BTCUSDm", "USOILm", "EURUSDm"))
+    pf.report_direction("XAUUSDm", "LONG")
+    pf.report_direction("BTCUSDm", "LONG")
+    pf.report_direction("USOILm", "LONG")
+    d = pf.direction_map()
+    assert d["XAUUSDm"] == "LONG" and d["BTCUSDm"] == "LONG" \
+        and d["USOILm"] == "LONG"
+    assert d["EURUSDm"] is None, "未上报的品种不该被算作有持仓"
+
+    # 于是 EURUSDm 若要开 LONG，会看到同向已有 3 个 >= 上限 -> 拒绝
+    st = PortfolioState(risk_by_symbol={},
+                        direction_by_symbol=d,
+                        equity=10000.0, pnl_now=0.0)
+    v = pf.check_for("EURUSDm", 0.005, st, this_direction="LONG")
+    assert v.ok is False
+    assert v.reason and "portfolio_same_direction" in v.reason
+
+
+def test_direction_registry_clears_when_position_closed(multi):
+    """平仓后上报 None，必须**立刻释放**同向名额。
+
+    ⚠️ 若平仓不清零，名额会被永久占用 —— 交易几次后同向闸
+    永远拒绝，系统静默停止开仓（与 09-30 连亏熔断死锁同类）。
+    """
+    pf = PortfolioRisk(("XAUUSDm", "BTCUSDm", "USOILm", "EURUSDm"))
+    for s in ("XAUUSDm", "BTCUSDm", "USOILm"):
+        pf.report_direction(s, "LONG")
+    pf.report_direction("XAUUSDm", None)          # XAUUSDm 平仓
+    st = PortfolioState(risk_by_symbol={},
+                        direction_by_symbol=pf.direction_map(),
+                        equity=10000.0, pnl_now=0.0)
+    v = pf.check_for("EURUSDm", 0.005, st, this_direction="LONG")
+    assert v.ok is True, "平仓后名额未释放，同向闸形成死锁"
+
+
+def test_direction_map_returns_copy_not_reference(multi):
+    """`direction_map()` 必须返回**副本**，否则调用方改动会污染登记表。"""
+    pf = PortfolioRisk(("XAUUSDm", "BTCUSDm"))
+    d = pf.direction_map()
+    d["XAUUSDm"] = "LONG"
+    assert pf.direction_map()["XAUUSDm"] is None, "返回了引用而非副本"
+
+
+# ══════════════════════════════════════════════════════════════════
+# Graph 侧的接入（防止"登记表没人写"这类接线遗漏）
+# ══════════════════════════════════════════════════════════════════
+def test_graph_portfolio_check_writes_and_reads_registry(multi):
+    """⚠️ 这是**接线测试**：登记表必须真的被 Graph 写入。
+
+    初版 `_portfolio_check` 去读 `st["portfolio_peers"]`，但那个键
+    **全仓库无人写入** —— 于是同向闸在生产中永远看不到别的品种，
+    静默退化成空操作（测试若不覆盖接线就发现不了）。
+    """
+    from gold_agent.agent.graph import Graph
+
+    g = Graph.build("EURUSDm")
+    pf = PortfolioRisk(("XAUUSDm", "BTCUSDm", "USOILm", "EURUSDm"))
+    g.portfolio = pf
+    # 先让另外 3 个品种上报为同向（各自只看得到自己的持仓）
+    for s in ("XAUUSDm", "BTCUSDm", "USOILm"):
+        pf.report_direction(s, "LONG")
+
+    # 构造一个"EURUSDm 自己无持仓"的最小上下文
+    class _Pos:
+        positions = []
+
+    class _Acct:
+        equity = 10000.0
+
+    st = {"positions": _Pos(), "account": _Acct()}
+    v = g._portfolio_check({"kind": "open_market"}, st)
+    # 本笔方向未知（自己无持仓）-> 同向闸不触发；但登记表必须被写入
+    assert pf.direction_map()["EURUSDm"] is None, "本品种方向未被上报"
+    assert v.ok in (True, False)
+
+
+def test_graph_portfolio_check_reads_peers_direction(multi):
+    """本品种已有持仓时，必须上报自己的方向供**其它**品种读取。"""
+    from gold_agent.agent.graph import Graph
+
+    g = Graph.build("XAUUSDm")
+    pf = PortfolioRisk(("XAUUSDm", "BTCUSDm"))
+    g.portfolio = pf
+
+    class _P:
+        magic = g.profile.magic
+        type = 0                     # 0 = BUY -> LONG
+
+    class _Pos:
+        positions = [_P()]
+
+    class _Acct:
+        equity = 10000.0
+
+    g._portfolio_check({"kind": "open_market"},
+                       {"positions": _Pos(), "account": _Acct()})
+    assert pf.direction_map()["XAUUSDm"] == "LONG", \
+        "自己的持仓方向没有被登记（其它品种看不到）"

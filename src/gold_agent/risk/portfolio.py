@@ -83,6 +83,29 @@ class PortfolioRisk:
         self.symbols = tuple(symbols) if symbols else tuple(CFG.trade_symbols)
         self.peak_pnl: float = 0.0
         self.anchored: bool = False
+        #: 各品种**最近一次观测到**的持仓方向：{品种: "LONG"|"SHORT"|None}。
+        #
+        # ⚠️ 为什么需要这个共享登记表：同向集中闸（"5 个品种都看多其实是
+        #    一个仓位"）必须看到**其它**品种的方向。但各品种是 asyncio
+        #    并发跑的，每个 Graph 只看得到自己的持仓（按 magic 过滤），
+        #    拿不到别人的。故由各品种每轮**上报**自己观测到的方向，
+        #    再从这里读取全局视图。
+        #
+        # ⚠️ 这是**近似**：并发下读到的是"最近一次"的值，可能比当前
+        #    实际持仓**晚一轮**（60 秒）。对同向集中判定是可接受的 ——
+        #    持仓方向不会在 60 秒内大规模翻转，且该闸本身是保守的
+        #    （宁可误判为集中而拒开，不可漏放）。真正的持仓仍以
+        #    `st["positions"]`（按 magic 过滤）为准，用于别的用途。
+        self.directions: dict[str, str | None] = {
+            s: None for s in self.symbols}
+
+    def report_direction(self, symbol: str, direction: str | None) -> None:
+        """某品种上报它观测到的自身持仓方向（每轮调用一次）。"""
+        self.directions[symbol] = direction
+
+    def direction_map(self) -> dict[str, str | None]:
+        """全局方向视图（含所有品种，未观测到的为 None）。"""
+        return dict(self.directions)
 
     # ---------- 组合回撤 ----------
     def update_pnl(self, pnl_now: float) -> None:
@@ -105,12 +128,21 @@ class PortfolioRisk:
 
     # ---------- 主判定 ----------
     def check_for(self, symbol: str, this_risk: float,
-                  state: PortfolioState) -> PortfolioVerdict:
+                  state: PortfolioState,
+                  this_direction: str | None = None) -> PortfolioVerdict:
         """开新仓前的组合闸。
 
-        `symbol`    ：本次要开的品种。
-        `this_risk` ：**本笔**的单笔风险（占净值比例）。
-        `state`     ：组合快照，其中 `risk_by_symbol` **不含**本笔。
+        `symbol`         ：本次要开的品种。
+        `this_risk`      ：**本笔**的单笔风险（占净值比例）。
+        `state`          ：组合快照，其中 `risk_by_symbol` **不含**本笔。
+        `this_direction` ：**本笔要开的方向**（"LONG"/"SHORT"）。
+
+        ⚠️ `this_direction` 必须由调用方显式传入，**不能**从
+        `state.direction_by_symbol[symbol]` 推 —— 那个字段是
+        "该品种**已有持仓**的方向"，而正在开新仓时它恰恰是 `None`
+        （还没有持仓）。早先的实现就是去读它，于是同向集中闸
+        **永远不触发**（测试实测：3 个品种已做多，第 4 个再做多仍放行）。
+        这是在最需要它的时刻静默失效 —— 典型的接线错误。
 
         ⚠️ 判据是"**含本笔**"的合计风险，不是"当前已有"的风险 ——
         否则最后一笔永远能通过，总风险总能超标。
@@ -146,18 +178,18 @@ class PortfolioRisk:
                                     reason=f"portfolio_risk_scale {mult:.2f}")
 
         # ---- 3. 同向品种数上限 ----
+        # 用**本笔要开的方向**（this_direction），不是该品种已有持仓的方向。
         limit = int(CFG.risk.portfolio_max_same_direction)
-        if limit > 0:
-            d = state.direction_by_symbol.get(symbol)
-            if d:
-                n = sum(1 for k, v in state.direction_by_symbol.items()
-                        if k != symbol and v
-                        and str(v).upper() == str(d).upper())
-                if n >= limit:
-                    log_warn(f"同向（{d}）已有 {n} 个品种，达到上限 {limit}，拒绝开仓")
-                    return PortfolioVerdict(
-                        ok=False,
-                        reason=f"portfolio_same_direction {d}={n}>={limit}")
+        d = this_direction
+        if limit > 0 and d:
+            n = sum(1 for k, v in state.direction_by_symbol.items()
+                    if k != symbol and v
+                    and str(v).upper() == str(d).upper())
+            if n >= limit:
+                log_warn(f"同向（{d}）已有 {n} 个品种，达到上限 {limit}，拒绝开仓")
+                return PortfolioVerdict(
+                    ok=False,
+                    reason=f"portfolio_same_direction {d}={n}>={limit}")
 
         # ---- 4. 组合保证金 ----
         if state.margin_by_symbol:

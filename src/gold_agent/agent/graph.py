@@ -451,7 +451,7 @@ class Graph:
             # 所以黄金实盘行为不变。
             if self.portfolio is not None and (approved.plan or {}).get("kind") \
                     in ("open_market", "place_grid"):
-                _verdict = self._portfolio_check(approved.plan, st)
+                _verdict = self._portfolio_check(approved.plan, st, prop.direction)
                 if not _verdict.ok:
                     summary["risk"] = {"ok": False,
                                        "reason": _verdict.reason,
@@ -886,24 +886,34 @@ class Graph:
         except Exception as e:
             log_warn(f"融合预热失败：{e}")
 
-    def _portfolio_check(self, plan: dict, st: GraphState):
+    def _portfolio_check(self, plan: dict, st: GraphState,
+                         this_direction: str | None = None):
         """构造组合快照并做组合级判定（多品种）。
+
+        `this_direction`：**本笔要开的方向**，必须显式传入。
+
+        ⚠️ 不能拿"该品种已有持仓的方向"当本笔方向 —— 正在开新仓时
+        该品种还没有持仓（方向为 None），同向集中闸会在**最需要它的
+        时刻**静默失效。初版就是犯了这个错（测试当场抓住：
+        3 个品种已做多，第 4 个再做多仍被放行）。
 
         ⚠️ 单品种时 `PortfolioRisk.check_for` 内部直接放行 —— 本方法
         仍会被调用，但结果恒为 ok（不改变黄金实盘行为）。
         """
         from gold_agent.risk.portfolio import PortfolioState
 
-        # 各品种当前持仓方向：本实例只看得到自己的持仓，
-        # 其余品种的方向由 runner 在 `st` 里注入（`portfolio_peers`）。
-        peers = dict(st.get("portfolio_peers") or {})
+        sym = self.symbol or CFG.mt5.symbol
+
+        # 本实例只按 magic 看得到**自己**的持仓；其它品种的方向由
+        # 共享的 `PortfolioRisk.directions` 登记表提供（各品种每轮上报）。
+        # 所以这里必须**先上报自己、再读全局**，否则自己永远是 None。
         mine = None
         for p in st["positions"].positions:
             if p.magic == self.profile.magic:
                 mine = "LONG" if int(getattr(p, "type", 0)) == 0 else "SHORT"
                 break
-        dirs = dict(peers)
-        dirs[self.symbol or CFG.mt5.symbol] = mine
+        self.portfolio.report_direction(sym, mine)
+        dirs = self.portfolio.direction_map()
 
         account = st["account"]
         equity = float(getattr(account, "equity", 0.0) or 0.0)
@@ -911,16 +921,18 @@ class Graph:
         pnl_now = equity - float(getattr(self.breakers, "net_deposits", 0.0) or 0.0)
         self.portfolio.update_pnl(pnl_now)
 
-        risk_now = {s: self.profile.risk_pct for s, d in dirs.items() if d}
+        # 已持仓品种的风险预算（**不含本笔**，本笔由 check_for 的
+        # this_risk 单独给 —— 否则同一品种旧仓与本笔会被重复计入）。
+        risk_now = {s: self.profile.risk_pct
+                    for s, d in dirs.items() if d and s != sym}
         pstate = PortfolioState(
             risk_by_symbol=risk_now,
             direction_by_symbol=dirs,
             margin_by_symbol={},
             equity=equity, pnl_now=pnl_now)
-        # 本笔的风险：单品种单笔预算 × 缩仓系数（近似满额，保守方向）
-        this_risk = self.profile.risk_pct
-        return self.portfolio.check_for(self.symbol or CFG.mt5.symbol,
-                                        this_risk, pstate)
+        # 本笔风险：单品种单笔预算（满额近似，保守方向）
+        return self.portfolio.check_for(sym, self.profile.risk_pct, pstate,
+                                        this_direction=this_direction)
 
     def _used_lots(self, positions) -> float:
         """本品种当前**已用**总手数（加仓额度判定用）。
