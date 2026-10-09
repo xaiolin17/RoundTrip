@@ -84,6 +84,19 @@ data/*/runner.lock
 logs/*
 !logs/.gitkeep
 
+# ---- 临时/备份文件（禁止入库）----
+# 本次事故：用脚本做批量替换时留下了 `graph.py.bakM`，
+# 随后 `git add -A` 把它一起提交了（58000 字节的源码副本）。
+# 备份文件**一律不入库** —— 它们只是操作过程中的残留，
+# 入库会污染仓库、且未来有人可能误读为真实源码。
+*.bak
+*.bak.*
+*.orig
+*.rej
+*.py.bak*
+*~
+*.swp
+
 # ---- 行情数据（体积大，可用 scripts/fetch_history*.py 重新抓取）----
 *.parquet
 *.h5
