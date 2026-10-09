@@ -61,8 +61,7 @@ class TradeLevels:
     #: llm_resistance | llm_support | llm_hint | chanlun_center | smc_ob | atr
     sl_source: str = ""
     tp_source: str = ""
-    #: 用到的压力/支撑位
-    used_sl_level: float | None = None
+    #: 用到的止盈目标位（结构位或 LLM 建议值，= 缩放前的"计算值"）
     used_tp_level: float | None = None
     #: 「紧贴反向位」标记：非空时表示结构不利，由 gate 决定降仓（不再硬拒）。
     #: 取值 "resistance"（做多贴压力）| "support"（做空贴支撑）。
@@ -311,27 +310,6 @@ def _entangled(level: float, opposite_levels: list[float], gap: float) -> bool:
     return False
 
 
-def _target_beyond(levels: list[float], price: float, need_dist: float,
-                   direction: str) -> float | None:
-    """选**最近且距离足够**的压力/支撑位作止盈目标。
-
-    只取"最近的压力位"会让盈亏比频繁不达标 —— 近处常有小压力位，
-    但它太近、不够赔率。正确做法是：在满足最小盈亏比的前提下取**最近**的
-    那个结构位，这样既尊重压力位结构，又不会因为一个小压力位放弃整笔交易。
-    """
-    if direction == "LONG":
-        cands = sorted(x for x in levels if x > price)
-        for x in cands:
-            if x - price >= need_dist:
-                return x
-    else:
-        cands = sorted((x for x in levels if x < price), reverse=True)
-        for x in cands:
-            if price - x >= need_dist:
-                return x
-    return None
-
-
 def _pick_src(level: float | None, llm_vals: list[float],
               struct_vals: list[float], kind: str) -> str:
     """判断选中的点位来自 LLM 还是本地结构位（决定 sl_source/tp_source）。
@@ -352,34 +330,42 @@ def _pick_src(level: float | None, llm_vals: list[float],
 
 def trade_levels(direction: str, entry: float, review: dict | None,
                  ev=None, atr: float | None = None,
-                 tp_shrink: float = 1.0,
-                 sl_from_tp: bool = False,
+                 tp_shrink: float | None = None,
                  digits: int = 3) -> TradeLevels:
     """按 LLM 判断的压力位/支撑位算止损止盈。
-
-    做多：止损 = 下方最近**支撑**位再让开一点；止盈 = 上方最近**压力**位
-    做空：止损 = 上方最近**压力**位再让开一点；止盈 = 下方最近**支撑**位
 
     `digits`：该品种的价格小数位（`SymbolProfile.digits`）。
     ⚠️ 本函数内所有 `round(x, digits)` 必须用它，**不能写死 3**。
     `3` 是 XAUUSDm 的位数；对 EURUSDm（digits=5）会把
     `1.12419` 截成 `1.12400`（**偏 19 个 point**），对 USDJPYm 同理。
     与 `machine.py` 的 `_PX_DIGITS=3` 是同一类缺陷（那边已修）。
-    默认 `3` 保持单品种黄金行为逐字节不变。
 
-    加仓专用模式（`sl_from_tp=True`，用户 2026-10-08 指定）
-    ------------------------------------------------------
-    加仓的**计算顺序与默认路径相反**，用户原话：
+    `tp_shrink`：止盈**距离**的缩放比例；`None` = 用配置的
+    `CFG.risk.first_tp_shrink`（首仓，0.70）。加仓路径显式传
+    `CFG.risk.add_tp_shrink`（0.58）。
 
-    > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.2
+    ---- 统一定价语义（用户 2026-10-09 合并首仓与加仓）----
+
+    首仓（用户原话）：
+    > 我们每个品种首仓止盈点数为计算的70% 比如100买入 计算止盈110
+    > 那么实际止盈107 止损按照盈亏比1.8计算
+    > （有点和之前的加仓止盈也是百分比减小一样）
+
+    加仓（用户原话，2026-10-08）：
+    > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.8
     > 然后加仓的单子止盈点不能按照计算的数值来 要对应缩小42% 也就是原值的58%
 
-    即：
+    步骤（首仓与加仓**完全同形**，只有缩放比例不同）：
       1. 先由结构位算出止盈目标（"计算值"，距离 D）
-      2. 止盈距离缩到 `tp_shrink` 倍（0.58 = 缩 42%）
-      3. 再由**缩后的止盈距离**按 `min_rr` 反推止损
+      2. 止盈距离缩到 `tp_shrink` 倍（首仓 0.70 / 加仓 0.58）
+      3. 由**缩后的止盈距离**按 `min_rr` 反推止损
          止损距离 = 止盈距离 / min_rr
-    → 加仓的止损**不再取自支撑位**，而是由止盈反推（`sl_source=rr_from_tp`）。
+    → 止损**不再取自支撑位**，而是由止盈反推（`sl_source=rr_from_tp`）。
+
+    ⚠️ 旧的"止损取支撑位、再找够赔率的压力位当止盈"路径已被用户本次
+    要求**取代并删除**（不留双路径死代码）。但**融合分与压力/支撑位
+    矛盾检测**（`conflict_side` / `conflict_dist`，供降仓用）仍然保留 ——
+    它只依赖结构位、不依赖定价顺序。
     """
     out = TradeLevels()
     if entry is None or entry <= 0:
@@ -431,24 +417,13 @@ def trade_levels(direction: str, entry: float, review: dict | None,
 
     # 最小距离（防贴脸）：用 ATR 定下限
     min_d = (CFG.risk.structure_sl_min_atr * atr) if atr else 0.0
-    pad = (CFG.risk.level_pad_atr * atr) if atr else 0.0
     # ⚠️ 冲突判定阈值原为 6 处硬编码 `0.3`，是实测 180 次
     # `fusion_vs_levels_conflict` 拒绝里 159 次的**唯一驱动常数**，
-    # 却无法调参（同段的 structure_sl_min_atr / level_pad_atr 早已走配置）。
+    # 却无法调参（同段的 structure_sl_min_atr 早已走配置）。
     # 收敛到 CFG.risk.conflict_atr_mult，默认 0.3 保持行为不变。
     conf_d = CFG.risk.conflict_atr_mult * atr if atr else 0.0
 
     if direction == "LONG":
-        # 止损：下方最近支撑，再让开 pad
-        lv = _nearest_below(sup_all, entry)
-        if lv is not None:
-            out.sl = round(lv - pad, digits)
-            out.sl_source = _pick_src(lv, sup, s_sup, "support")
-            out.used_sl_level = lv
-        elif hint_sl is not None and hint_sl < entry:
-            out.sl = round(hint_sl, digits)
-            out.sl_source = "llm_hint"
-            out.used_sl_level = hint_sl
         # ---- 融合分与压力位矛盾检测（用户选定）----
         # 做多但**上方紧贴压力位** -> 进场就是买在压力位下方，随时被压回。
         # ⚠️ 只对 **LLM 给的位** 判定（用户语义：LLM 读 skill 输出判断的
@@ -483,15 +458,6 @@ def trade_levels(direction: str, entry: float, review: dict | None,
                     f"< {CFG.risk.conflict_atr_mult}×ATR {conf_d:.2f}，LLM位）"
                     f"-> 结构不利，降仓处理（不再硬拒）")
     else:
-        lv = _nearest_above(res_all, entry)
-        if lv is not None:
-            out.sl = round(lv + pad, digits)
-            out.sl_source = _pick_src(lv, res, s_res, "resistance")
-            out.used_sl_level = lv
-        elif hint_sl is not None and hint_sl > entry:
-            out.sl = round(hint_sl, digits)
-            out.sl_source = "llm_hint"
-            out.used_sl_level = hint_sl
         # ---- 融合分与压力位矛盾检测（用户选定）----
         # 做空但**下方紧贴支撑位** -> 进场就是卖在支撑位上方，随时被弹回。
         # ⚠️ 只对 LLM 给的位判定（原因见做多分支注释；本地 1m SMC 位
@@ -513,72 +479,14 @@ def trade_levels(direction: str, entry: float, review: dict | None,
                     f"< {CFG.risk.conflict_atr_mult}×ATR {conf_d:.2f}，LLM位）"
                     f"-> 结构不利，降仓处理（不再硬拒）")
 
-    # ---- 加仓专用：先定止盈 → 缩 58% → 按 min_rr 反推止损 ----
-    # （用户 2026-10-08 指定，见函数 docstring；与下面的默认顺序相反）
-    if sl_from_tp:
-        return _levels_from_tp(direction, entry, out, res_all, sup_all,
-                               res, sup, s_res, s_sup, hint_tp, min_d,
-                               tp_shrink, digits)
-
-    # ---- 先定止损，再据此选"够赔率"的止盈压力位 ----
-    if out.sl is None:
-        out.reason = "no_support_below" if direction == "LONG" else "no_resistance_above"
-        return out
-    sl_dist = abs(entry - out.sl)
-    if sl_dist <= 0:
-        out.reason = "sl_at_entry"
-        return out
-    if min_d and sl_dist < min_d:
-        # 贴脸 → 按 ATR 下限外扩（保持方向不变）
-        out.notes.append(f"止损距离 {sl_dist:.3f} < 下限 {min_d:.3f} → 外扩")
-        out.sl = round(entry - min_d if direction == "LONG" else entry + min_d, digits)
-        sl_dist = min_d
-        out.sl_source += "+atr_floor"
-
-    need = sl_dist * CFG.risk.min_rr
-    if direction == "LONG":
-        cands = [x for x in res_all if x > entry]
-        lv2 = _target_beyond(res_all, entry, need, "LONG")
-        if lv2 is not None:
-            out.tp = round(lv2, digits)
-            out.tp_source = _pick_src(lv2, res, s_res, "resistance")
-            out.used_tp_level = lv2
-        elif hint_tp is not None and hint_tp - entry >= need:
-            out.tp = round(hint_tp, digits)
-            out.tp_source = "llm_hint"
-            out.used_tp_level = hint_tp
-        elif not cands and hint_tp is None:
-            out.reason = "no_resistance_above"
-            return out
-    else:
-        cands = [x for x in sup_all if x < entry]
-        lv2 = _target_beyond(sup_all, entry, need, "SHORT")
-        if lv2 is not None:
-            out.tp = round(lv2, digits)
-            out.tp_source = _pick_src(lv2, sup, s_sup, "support")
-            out.used_tp_level = lv2
-        elif hint_tp is not None and entry - hint_tp >= need:
-            out.tp = round(hint_tp, digits)
-            out.tp_source = "llm_hint"
-            out.used_tp_level = hint_tp
-        elif not cands and hint_tp is None:
-            out.reason = "no_support_below"
-            return out
-
-    # ---- 校验 ----
-    if out.tp is None:
-        # 有候选位但都不够赔率 —— 与"根本没有位"区分开，便于排查
-        out.reason = f"rr_below_{CFG.risk.min_rr}"
-        return out
-
-    out.sl_dist = round(abs(entry - out.sl), digits)
-    out.tp_dist = round(abs(out.tp - entry), digits)
-    if out.tp_dist < out.sl_dist * CFG.risk.min_rr - 1e-9:
-        out.reason = f"rr_below_{CFG.risk.min_rr}"
-        return out
-
-    out.ok = True
-    return out
+    # ---- 统一定价：先定止盈 → 缩 N% → 按 min_rr 反推止损 ----
+    # 首仓与加仓**同一套顺序**，只有缩放比例不同（0.70 / 0.58）。
+    # 用户 2026-10-09 合并二者语义，旧的"止损取支撑位"路径已删除。
+    if tp_shrink is None:
+        tp_shrink = CFG.risk.first_tp_shrink
+    return _levels_from_tp(direction, entry, out, res_all, sup_all,
+                           res, sup, s_res, s_sup, hint_tp, min_d,
+                           tp_shrink, digits)
 
 
 def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
@@ -587,21 +495,25 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
                     s_res: list[float], s_sup: list[float],
                     hint_tp: float | None, min_d: float,
                     tp_shrink: float, digits: int = 3) -> TradeLevels:
-    """加仓定价：**由止盈反推止损**（用户 2026-10-08 指定）。
+    """统一定价核心：**由止盈反推止损**（首仓与加仓共用）。
 
-    用户原话：
-    > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.2
+    用户原话（首仓，2026-10-09）：
+    > 我们每个品种首仓止盈点数为计算的70% 比如100买入 计算止盈110
+    > 那么实际止盈107 止损按照盈亏比1.8计算
+
+    用户原话（加仓，2026-10-08）：
+    > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.8
     > 然后加仓的单子止盈点不能按照计算的数值来 要对应缩小42% 也就是原值的58%
 
-    步骤（顺序与默认路径相反）：
+    步骤（首仓与加仓同形，只有 `tp_shrink` 不同：0.70 / 0.58）：
       1. 由结构位算出"计算值"止盈目标（做多取上方压力、做空取下方支撑）
-      2. 止盈**距离**缩到 `tp_shrink` 倍（0.58 = 缩 42%）
-      3. 止损距离 = 缩后止盈距离 / `min_rr`（1.2）
+      2. 止盈**距离**缩到 `tp_shrink` 倍
+      3. 止损距离 = 缩后止盈距离 / `min_rr`
          —— 止损不再取自支撑位，而是**由止盈反推**，故 `sl_source="rr_from_tp"`
 
     为什么先缩止盈再反推止损：若先用未缩的结构距离反推止损、再缩止盈，
-    实际盈亏比会掉到 `tp_shrink/min_rr` = 0.58/1.2 ≈ 0.70，与用户
-    "盈亏比 1.2"的要求矛盾；先缩止盈再反推才能让实际盈亏比正好等于 1.2。
+    实际盈亏比会掉到 `tp_shrink/min_rr`（首仓 0.70/1.8 ≈ 0.39），与用户
+    "盈亏比 1.8"的要求矛盾；先缩止盈再反推才能让实际盈亏比正好等于 1.8。
     """
     # ---- 1. 取"计算值"止盈目标（未缩）----
     is_long = direction == "LONG"
@@ -631,7 +543,7 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
         out.reason = "tp_at_entry"
         return out
 
-    # ---- 2. 止盈距离缩到 tp_shrink 倍（用户指定 58%）----
+    # ---- 2. 止盈距离缩到 tp_shrink 倍（首仓 70% / 加仓 58%）----
     tp_dist = raw_tp_dist * tp_shrink
     # 缩后仍要尊重 ATR 防贴脸下限，否则止盈贴脸毫无意义
     if min_d and tp_dist < min_d:
@@ -639,29 +551,28 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
             f"缩短后止盈距离 {tp_dist:.3f} < 下限 {min_d:.3f} → 外扩到下限")
         tp_dist = min_d
     out.notes.append(
-        f"加仓止盈按用户要求缩 {1 - tp_shrink:.0%}："
+        f"止盈按用户要求缩 {1 - tp_shrink:.0%}（系数 {tp_shrink}）："
         f"结构距离 {raw_tp_dist:.3f} -> {tp_dist:.3f}")
 
     # ---- 3. 由缩后的止盈距离反推止损（盈亏比 = min_rr）----
     sl_dist = tp_dist / CFG.risk.min_rr
     prev_sl = out.sl
     out.sl = round(entry - sl_dist if is_long else entry + sl_dist, digits)
-    # ⚠️ 这里**刻意**覆盖掉上面按支撑/压力位算出的 out.sl：
-    #    用户要求加仓的止损来自止盈位置，不是支撑位。
+    # ⚠️ 这里**刻意**不使用按支撑/压力位算出的止损：
+    #    用户要求止损来自止盈位置（首仓与加仓统一），不是支撑位。
     out.sl_source = "rr_from_tp"
-    out.used_sl_level = None
     out.notes.append(
-        f"加仓止损由止盈反推：止盈距离 {tp_dist:.3f} / 盈亏比 "
+        f"止损由止盈反推：止盈距离 {tp_dist:.3f} / 盈亏比 "
         f"{CFG.risk.min_rr} = 止损距离 {sl_dist:.3f}"
-        f"（原支撑位止损 {prev_sl} 已被覆盖）")
+        + (f"（原支撑位止损 {prev_sl} 已弃用）" if prev_sl else ""))
 
     out.tp = round(entry + tp_dist if is_long else entry - tp_dist, digits)
     if sl_dist <= 0:
         out.reason = "sl_at_entry"
         return out
     # ⚠️ 赔率校验用**未规整**的距离：sl_dist 恰好等于 tp_dist/min_rr，
-    #    规整到 3 位小数后会引入 ~0.0005 误差，若拿规整后的值比较，
-    #    本应恰好等于 1.2 的赔率会被误判为"低于 1.2"而拒绝。
+    #    规整到 digits 位小数后会引入误差，若拿规整后的值比较，
+    #    本应恰好等于 min_rr 的赔率会被误判为"低于 min_rr"而拒绝。
     if tp_dist < sl_dist * CFG.risk.min_rr - 1e-9:
         out.reason = f"rr_below_{CFG.risk.min_rr}"
         return out

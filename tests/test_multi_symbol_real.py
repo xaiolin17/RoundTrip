@@ -218,20 +218,22 @@ def test_levels_and_shrink_round_to_symbol_digits():
     import re as _re
     hard = _re.findall(r"round\([^)\n]*,\s*3\)", src)
     assert not hard, f"levels.py 仍有写死的 round(...,3) 定价：{hard}"
-    # 加仓止损（由止盈反推）必须按 digits
+    # 止损（由止盈反推）必须按 digits
     assert "round(entry - sl_dist if is_long else entry + sl_dist, digits)" in src, \
-        "加仓止损仍未按 digits 规整"
+        "止损（止盈反推）仍未按 digits 规整"
 
-    # levels.py 的**行为**验证：加仓路径的 SL/TP 也必须按 digits
+    # levels.py 的**行为**验证：首仓/加仓两条路径的 SL/TP 都必须按 digits
     # （源码断言只能防"写死 3"，防不了"传了 digits 但没往下传"）
     for sym, p in PROFILES.items():
-        out5 = LV.trade_levels("LONG", 1.12419555, None, atr=None,
-                               sl_from_tp=True, digits=5)
-        out3 = LV.trade_levels("LONG", 1.12419555, None, atr=None,
-                               sl_from_tp=True, digits=3)
-        if out5.ok and out3.ok and out5.sl is not None and out3.sl is not None:
+        for shrink_k in (CFG.risk.first_tp_shrink, CFG.risk.add_tp_shrink):
+            rev = {"resistance_levels": [1.13000], "support_levels": [1.12000]}
+            out5 = LV.trade_levels("LONG", 1.12419555, rev, atr=None,
+                                   tp_shrink=shrink_k, digits=5)
+            out3 = LV.trade_levels("LONG", 1.12419555, rev, atr=None,
+                                   tp_shrink=shrink_k, digits=3)
+            assert out5.ok and out3.ok, f"{sym}: {out5.reason} / {out3.reason}"
             assert out5.sl != out3.sl or out5.tp != out3.tp, \
-                f"{sym}: trade_levels 的 digits 参数没生效"
+                f"{sym}: trade_levels 的 digits 参数没生效（shrink={shrink_k}）"
 
 
 def test_levels_default_digits_keeps_gold_behaviour():

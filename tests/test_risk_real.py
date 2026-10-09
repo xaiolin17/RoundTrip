@@ -360,6 +360,19 @@ def _acc():
                        margin=0, margin_level=0, leverage=2000, currency="USD")
 
 
+def _acc_big():
+    """大账户：用于**只看定价**的用例。
+
+    新定价语义下止损距离由止盈反推（`sl_dist = 结构距离×0.7/1.8`），
+    结构距离远时止损会明显变宽，`position_lots` 在 1 万账户上会得出
+    < 0.01 手而被 `risk_budget_below_min_lot` 拒单 —— 那是**手数**问题，
+    不是定价问题。断言定价时必须用足够大的账户把两者分开。
+    """
+    return AccountInfo(login=1, balance=1000000, equity=1000000,
+                       margin_free=1000000, margin=0, margin_level=0,
+                       leverage=2000, currency="USD")
+
+
 def _ev():
     return type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
 
@@ -519,6 +532,115 @@ def test_add_layer_rr_is_always_exactly_min_rr():
         assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), \
             f"现价 {px} 盈亏比 {rr:.4f} 不等于 {CFG.risk.min_rr}"
         assert pl["sl_source"] == "rr_from_tp"
+
+
+def test_first_entry_tp_is_shrunk_to_70_percent_and_sl_derived():
+    """首仓：市价开仓的止盈 = 结构距离 × 70%，止损按 min_rr 反推。
+
+    用户原话（2026-10-09）：
+    > 我们每个品种首仓止盈点数为计算的70% 比如100买入 计算止盈110
+    > 那么实际止盈107 止损按照盈亏比1.8计算
+    """
+    gate = RiskGate(CircuitBreakers())
+    atr = 12.339
+    close = 4350.0
+    frames = {"1m": pd.DataFrame({"close": [close]})}
+    res = gate.evaluate(
+        Proposal(kind="open_market", direction="LONG", entry=close),
+        _ev(), _acc_big(), _views([]), 0.1, None, atr, None,
+        llm_review=_llm_rev([4200.0], [4500.0]), frames=frames)
+    assert res.ok, res.reason
+    pl = res.plan
+    # ⚠️ 市价单的 plan 不含 `entry`（由 executor 取当前 bid/ask），
+    #    但含 `sl_dist`/`tp_dist`，足以校验定价规则。
+    assert pl["sl"] < close < pl["tp"], "做多首仓：SL < 入场 < TP"
+    # 止盈距离 = 结构距离(4500-4350=150) × 0.70 = 105
+    want_tp_dist = (4500.0 - close) * CFG.risk.first_tp_shrink
+    assert pl["tp_dist"] == pytest.approx(want_tp_dist, abs=0.01), \
+        f"首仓止盈距离应为结构距离的 70%（{want_tp_dist}），实际 {pl['tp_dist']}"
+    assert pl["tp"] == pytest.approx(close + want_tp_dist, abs=0.01)
+    # 止损距离 = 缩后止盈距离 / min_rr
+    assert pl["sl_dist"] == pytest.approx(want_tp_dist / CFG.risk.min_rr, abs=0.01)
+    assert pl["sl"] == pytest.approx(close - want_tp_dist / CFG.risk.min_rr,
+                                     abs=0.01)
+    # 止损不再取自支撑位，而是由止盈反推
+    assert pl["sl_source"] == "rr_from_tp", pl["sl_source"]
+    assert pl["tp_source"] == "llm_resistance"
+    rr = pl["tp_dist"] / pl["sl_dist"]
+    assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), f"盈亏比 {rr:.4f}"
+    assert CFG.risk.first_tp_shrink == pytest.approx(0.7), \
+        "用户指定 70%，配置不得偏离"
+    # ⚠️ 必须**钉住 1.8 这个绝对值**：只断言 `rr == CFG.risk.min_rr` 是
+    #    相对断言，把配置改回 1.2 时两边同时变、测试照样通过（证伪实测）。
+    assert CFG.risk.min_rr == pytest.approx(1.8), \
+        "用户 2026-10-09 指定盈亏比 1.8，配置不得偏离"
+    assert rr == pytest.approx(1.8, abs=0.01), \
+        f"首仓实际盈亏比应为 1.8，得到 {rr:.4f}"
+
+
+def test_first_entry_rr_holds_across_entry_prices_and_directions():
+    """首仓盈亏比在任意入场价/方向下都恰为 min_rr（止损是反推出来的）。
+
+    覆盖三档入场价（远离/居中/贴近压力位），做多做空都验。
+    """
+    gate = RiskGate(CircuitBreakers())
+    atr = 12.339
+    for direction, sup, res_lv in (("LONG", [4000.0], [4500.0]),
+                                   ("SHORT", [4000.0], [4500.0])):
+        for px in (4200.0, 4350.0, 4440.0):
+            frames = {"1m": pd.DataFrame({"close": [px]})}
+            r = gate.evaluate(
+                Proposal(kind="open_market", direction=direction, entry=px),
+                _ev(), _acc_big(), _views([]), 0.1, None, atr, None,
+                llm_review=_llm_rev(sup, res_lv), frames=frames)
+            assert r.ok, f"{direction} 现价 {px}: {r.reason}"
+            pl = r.plan
+            if direction == "LONG":
+                assert pl["sl"] < px < pl["tp"], f"{direction} {px} 方向错"
+            else:
+                assert pl["tp"] < px < pl["sl"], f"{direction} {px} 方向错"
+            rr = pl["tp_dist"] / pl["sl_dist"]
+            assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), \
+                f"{direction} 现价 {px} 盈亏比 {rr:.4f} != {CFG.risk.min_rr}"
+            assert pl["sl_source"] == "rr_from_tp"
+            # 止盈距离必须是"入场到结构位"距离的 70%
+            struct = (max(res_lv) - px) if direction == "LONG" else (px - min(sup))
+            assert pl["tp_dist"] == pytest.approx(
+                struct * CFG.risk.first_tp_shrink, abs=0.02), \
+                f"{direction} 现价 {px} 止盈距离 {pl['tp_dist']} != {struct}×0.7"
+
+
+def test_pending_first_entry_uses_the_same_70_percent_rule():
+    """挂单（place_grid）也是首仓，必须与市价首仓**同一口径**。
+
+    用户选定：市价首仓 + 挂单首仓都按 70%/反推。
+    """
+    gate = RiskGate(CircuitBreakers())
+    atr, close = 12.339, 4350.0
+    df5 = pd.DataFrame({"high": [close] * 10, "low": [close] * 10,
+                        "close": [close] * 10})
+    ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
+    acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
+                      margin=0, margin_level=0, leverage=2000, currency="USD")
+    views = type("V", (), {"positions": [], "pending_orders": []})()
+    up = {"id": "segment:15m:1", "direction": "up",
+          "start_price": close - 30.0, "end_price": close - 5.0}
+    ev.chanlun = {"15m": type("C", (), {
+        "status": "ok", "center": None,
+        "raw": {"layers": {"segments": [up], "strokes": [], "fractals": []}}})()}
+    rev = _llm_rev([close - 25.0], [close + 40.0])
+    res = gate.evaluate(Proposal(kind="place_grid", direction="LONG", entry=close),
+                        ev, acc, views, 0.1, df5, atr, None, llm_review=rev)
+    assert res.ok, res.reason
+    order = res.plan["grid_plan"][0]
+    # 入场在回调带内（市价下方），止盈应 = 入场 + 结构距离×0.7
+    raw_tp_dist = (close + 40.0) - order["level"]
+    assert order["tp"] == pytest.approx(
+        order["level"] + raw_tp_dist * CFG.risk.first_tp_shrink, abs=0.05), \
+        "挂单首仓必须与市价首仓同用 70% 缩放"
+    assert res.plan["sl_source"] == "rr_from_tp", res.plan["sl_source"]
+    rr = (order["tp"] - order["level"]) / (order["level"] - order["sl"])
+    assert rr == pytest.approx(CFG.risk.min_rr, abs=0.02), f"挂单盈亏比 {rr:.4f}"
 
 
 def test_add_layer_tp_is_shrunk_to_58_percent_of_structure():

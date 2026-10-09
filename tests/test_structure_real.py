@@ -32,7 +32,7 @@ import pytest
 
 from gold_agent.common.config import CFG
 from gold_agent.risk.levels import (_levels, _nearest_above, _nearest_below,
-                                    _structure_levels, _target_beyond, trade_levels)
+                                    _structure_levels, trade_levels)
 from gold_agent.risk.structure import (RETRACE_FAR, RETRACE_NEAR, alternate_swings,
                                        band_of, find_swings, fractal_range,
                                        last_leg, own_candidates, pick_leg,
@@ -341,29 +341,80 @@ _REV = {"verdict": "bullish", "confidence": 0.7,
 
 
 def test_long_stop_below_support_target_at_resistance():
-    """做多：止损在下方支撑之外，止盈在上方压力位。"""
+    """做多：止盈取上方压力位并缩到 70%，**止损由止盈反推**（用户 2026-10-09）。
+
+    用户原话：
+    > 我们每个品种首仓止盈点数为计算的70% 比如100买入 计算止盈110
+    > 那么实际止盈107 止损按照盈亏比1.8计算
+
+    所以止损**不再**基于下方支撑位，而是 `止盈距离 / min_rr`。
+    """
     lv = trade_levels("LONG", 4350.0, _REV, None, atr=18.0)
     assert lv.ok, lv.reason
     assert lv.sl < 4350.0 < lv.tp
-    assert lv.used_sl_level == 4342.626, "止损应基于最近的下方支撑"
+    # 止盈 = 上方最近压力 4376.057，距离 26.057 缩到 70%
+    raw = 4376.057 - 4350.0
+    assert lv.tp == pytest.approx(4350.0 + raw * CFG.risk.first_tp_shrink, abs=0.01)
+    assert lv.used_tp_level == 4376.057, "止盈应基于上方最近压力位"
+    # 止损由缩后的止盈距离按 min_rr 反推
+    assert lv.sl_source == "rr_from_tp", lv.sl_source
+    assert lv.sl == pytest.approx(
+        4350.0 - raw * CFG.risk.first_tp_shrink / CFG.risk.min_rr, abs=0.01)
 
 
 def test_short_stop_above_resistance_target_at_support():
-    """做空：止损在上方压力之外，止盈在下方支撑。"""
+    """做空：止盈取下方支撑并缩到 70%，止损由止盈反推（用户 2026-10-09）。"""
     rev = {"support_levels": [4300.0], "resistance_levels": [4360.0]}
     lv = trade_levels("SHORT", 4350.0, rev, None, atr=18.0)
     assert lv.ok, lv.reason
     assert lv.tp < 4350.0 < lv.sl
-    assert lv.used_sl_level == 4360.0, "止损应基于最近的上方压力"
     assert lv.used_tp_level == 4300.0, "止盈应基于下方支撑"
+    raw = 4350.0 - 4300.0
+    assert lv.tp == pytest.approx(4350.0 - raw * CFG.risk.first_tp_shrink, abs=0.01)
+    assert lv.sl_source == "rr_from_tp", lv.sl_source
+    assert lv.sl == pytest.approx(
+        4350.0 + raw * CFG.risk.first_tp_shrink / CFG.risk.min_rr, abs=0.01)
 
 
-def test_stop_is_padded_beyond_level():
-    """止损要让开一点（level_pad_atr×ATR），防贴边被扫。"""
-    atr = 18.0
-    lv = trade_levels("LONG", 4350.0, _REV, None, atr=atr)
-    pad = CFG.risk.level_pad_atr * atr
-    assert lv.sl == pytest.approx(4342.626 - pad, abs=0.01)
+def test_first_entry_rr_is_exactly_min_rr():
+    """首仓实际盈亏比**恒等于** min_rr（用户要求「盈亏比 1.8」）。
+
+    ⚠️ 这是新定价语义的直接推论：止损由止盈反推
+    （`sl_dist = tp_dist / min_rr`）。注意方向：
+    **先缩止盈、再反推止损**。若顺序反了（先反推再缩），
+    实际盈亏比会变成 `first_tp_shrink/min_rr` = 0.7/1.8 ≈ 0.39。
+    """
+    cases = [
+        ("LONG", {"support_levels": [90.0], "resistance_levels": [110.0]}, 100.0),
+        ("SHORT", {"support_levels": [90.0], "resistance_levels": [110.0]}, 100.0),
+    ]
+    for direction, rev, entry in cases:
+        lv = trade_levels(direction, entry, rev, None, atr=2.0)
+        assert lv.ok, f"{direction} {lv.reason}"
+        rr = lv.tp_dist / lv.sl_dist
+        assert rr == pytest.approx(CFG.risk.min_rr, abs=0.02), \
+            f"{direction} 首仓盈亏比必须等于 min_rr，得到 {rr:.4f}"
+
+
+def test_user_example_100_entry_110_computed_tp_gives_107():
+    """用户原话里的具体例子必须逐字成立。
+
+    > 比如100买入 计算止盈110 那么实际止盈107 止损按照盈亏比1.8计算
+    """
+    lv = trade_levels("LONG", 100.0,
+                      {"resistance_levels": [110.0], "support_levels": [90.0]},
+                      None, atr=2.0, digits=3)
+    assert lv.ok, lv.reason
+    assert lv.tp == pytest.approx(107.0, abs=1e-6), \
+        f"100 买入、计算止盈 110 -> 实际止盈应为 107，得到 {lv.tp}"
+    assert lv.tp_dist == pytest.approx(7.0, abs=1e-6)
+    # 止损 = 100 - 7/1.8 = 96.1111...
+    # ⚠️ 钉住 1.8 的**绝对值**：只写 `CFG.risk.min_rr` 是相对断言，
+    #    把配置改回 1.2 时两边同时变、测试仍通过（证伪实测过）。
+    assert CFG.risk.min_rr == pytest.approx(1.8), "用户指定盈亏比 1.8"
+    assert lv.sl == pytest.approx(100.0 - 7.0 / 1.8, abs=1e-3)
+    assert lv.sl == pytest.approx(96.111, abs=0.002)
+    assert lv.sl_dist == pytest.approx(7.0 / 1.8, abs=1e-3)
 
 
 def test_no_llm_levels_falls_back_to_local_structure():
@@ -386,11 +437,14 @@ def test_no_llm_levels_falls_back_to_local_structure():
     ev = type("E", (), {"chanlun": cl, "mobius": None})()
     lv = trade_levels("LONG", 4350.0, {}, ev, atr=18.0)
     assert lv.ok, f"本地有结构位就该能开仓，得到 {lv.reason}"
-    assert lv.used_sl_level == 4342.0, "止损应取本地支撑位"
     assert lv.used_tp_level == 4376.0, "止盈应取本地压力位"
     # 来源必须如实标注为本地结构位，不能冒充 LLM
-    assert lv.sl_source == "struct_support", lv.sl_source
     assert lv.tp_source == "struct_resistance", lv.tp_source
+    # ⚠️ 止损不再取本地支撑位，而是由止盈反推（用户 2026-10-09 统一语义）
+    assert lv.sl_source == "rr_from_tp", lv.sl_source
+    assert lv.sl == pytest.approx(
+        4350.0 - (4376.0 - 4350.0) * CFG.risk.first_tp_shrink / CFG.risk.min_rr,
+        abs=0.01)
 
 
 def test_no_levels_at_all_is_rejected():
@@ -406,57 +460,79 @@ def test_none_llm_review_is_rejected_without_structure():
     assert not lv.ok and lv.reason == "llm_no_levels"
 
 
-def test_missing_support_rejected():
-    """只有压力位、没有支撑位 -> 做多无法定止损 -> 拒绝。"""
-    lv = trade_levels("LONG", 4350.0, {"resistance_levels": [4399.0]}, None, atr=18.0)
+def test_missing_resistance_rejected():
+    """只有支撑位、没有压力位 -> 做多**无法定止盈** -> 拒绝。
+
+    ⚠️ 新语义下（用户 2026-10-09）止损由止盈反推，所以缺的是**止盈来源**
+    （做多看压力位），不再是"缺支撑位"。拒绝码随之统一为
+    `no_resistance_above`。
+    """
+    lv = trade_levels("LONG", 4350.0, {"support_levels": [4300.0]}, None, atr=18.0)
+    assert not lv.ok
+    assert lv.reason == "no_resistance_above"
+
+
+def test_missing_support_rejected_for_short():
+    """只有压力位、没有支撑位 -> 做空**无法定止盈** -> 拒绝。"""
+    lv = trade_levels("SHORT", 4350.0, {"resistance_levels": [4400.0]}, None, atr=18.0)
     assert not lv.ok
     assert lv.reason == "no_support_below"
 
 
-def test_rr_filter_rejects_poor_trade():
-    """盈亏比不足 -> 拒绝（止盈太近、止损太远）。
+def test_rr_filter_never_fires_on_first_entry():
+    """首仓**永远不会**因盈亏比不足被拒 —— 止损是反推出来的，盈亏比恒等于 min_rr。
 
-    注：压力位必须离入场 > 1×ATR，否则先触发 fusion_vs_levels_conflict
-    （这是另一个新规则：紧贴压力位追多不进场）。
+    这是新语义的必然推论（也是与旧实现最大的行为差异：旧实现会因
+    "止盈不够远"而拒单，新实现改为"止盈缩到 70%"再由它反推止损）。
+    真正会拒绝的情况只有**根本没有止盈来源**。
     """
     rev = {"support_levels": [4300.0], "resistance_levels": [4370.0]}
     lv = trade_levels("LONG", 4350.0, rev, None, atr=18.0)
-    assert not lv.ok
-    assert "rr_below" in lv.reason, lv.reason
+    assert lv.ok, f"有压力位就该能定价，得到 {lv.reason}"
+    assert lv.tp_dist == pytest.approx(20.0 * CFG.risk.first_tp_shrink, abs=0.01)
+    assert lv.tp_dist / lv.sl_dist == pytest.approx(CFG.risk.min_rr, abs=0.02)
 
 
-def test_no_target_above_distinguished_from_poor_rr():
-    """「上方根本没有压力位」与「有但不够赔率」要能区分（便于排查）。"""
+def test_no_target_above_distinguished_from_missing_source():
+    """「上方根本没有压力位」必须给出可区分的拒绝码（便于排查）。"""
     lv1 = trade_levels("LONG", 4350.0, {"support_levels": [4300.0]}, None, atr=18.0)
     assert lv1.reason == "no_resistance_above"
+    # 提示价在对侧（低于入场）也救不了做多 —— 不能当止盈来源
     lv2 = trade_levels("LONG", 4350.0,
-                       {"support_levels": [4300.0], "resistance_levels": [4370.0]},
+                       {"support_levels": [4300.0], "tp_hint": 4340.0},
                        None, atr=18.0)
-    assert lv2.reason.startswith("rr_below")
+    assert lv2.reason == "no_resistance_above", lv2.reason
 
 
-def test_target_picks_nearest_that_satisfies_rr():
-    """止盈取「最近**且**够赔率」的压力位，而不是一味取最近。"""
-    assert _target_beyond([4352.0, 4380.0], 4350.0, need_dist=20.0,
-                          direction="LONG") == 4380.0
-    assert _target_beyond([4352.0], 4350.0, need_dist=20.0, direction="LONG") is None
+def test_atr_floor_applies_to_tp_then_derives_sl():
+    """结构止盈缩后贴脸时，先按 ATR 下限外扩**止盈**，再由它反推止损。
 
-
-def test_atr_floor_widens_too_tight_stop():
-    """贴脸止损必须按 ATR 下限外扩。"""
-    rev = {"support_levels": [4349.5], "resistance_levels": [4399.0]}
+    ⚠️ 新语义下 ATR 下限作用在**止盈距离**上（用户 2026-10-09），
+    不再是"外扩止损"。因为止损是止盈的函数，只有止盈有下限才有意义。
+    """
+    rev = {"support_levels": [4349.5], "resistance_levels": [4351.0]}
     lv = trade_levels("LONG", 4350.0, rev, None, atr=18.0)
     assert lv.ok, lv.reason
-    assert lv.sl_dist >= CFG.risk.structure_sl_min_atr * 18.0 - 0.01
-    assert "atr_floor" in lv.sl_source
+    floor = CFG.risk.structure_sl_min_atr * 18.0
+    # 结构距离 1.0 缩到 0.7 -> 低于下限 9.0 -> 外扩到 9.0
+    assert lv.tp_dist == pytest.approx(floor, abs=0.01), lv.tp_dist
+    # 止损 = 9.0 / 1.8 = 5.0（恰为下限/min_rr）
+    assert lv.sl_dist == pytest.approx(floor / CFG.risk.min_rr, abs=0.01)
+    assert lv.sl_source == "rr_from_tp"
 
 
-def test_hint_used_when_no_levels_listed():
-    """LLM 只给了 sl_hint/tp_hint（没给数组）-> 用建议值。"""
+def test_hint_tp_used_as_target_when_no_arrays():
+    """LLM 只给了 tp_hint（没给数组）-> 用它当止盈来源，止损仍反推。"""
     rev = {"sl_hint": 4335.0, "tp_hint": 4390.0}
     lv = trade_levels("LONG", 4350.0, rev, None, atr=18.0)
     assert lv.ok, lv.reason
-    assert lv.sl_source == "llm_hint" and lv.tp_source == "llm_hint"
+    raw = 4390.0 - 4350.0
+    assert lv.tp_source == "llm_hint", lv.tp_source
+    assert lv.tp == pytest.approx(4350.0 + raw * CFG.risk.first_tp_shrink, abs=0.01)
+    # 止损来自反推，不是 sl_hint（新语义）
+    assert lv.sl_source == "rr_from_tp", lv.sl_source
+    assert lv.sl == pytest.approx(
+        4350.0 - raw * CFG.risk.first_tp_shrink / CFG.risk.min_rr, abs=0.01)
 
 
 @pytest.mark.parametrize("direction,rev", [

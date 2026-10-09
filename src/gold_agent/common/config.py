@@ -165,9 +165,12 @@ class RiskConfig:
     # （0.6 绝对分 ÷ 旧 σ 0.4895 ≈ 1.23 z，两者等价）。
     # 用户规则：每仓固定 0.01 手，同向最多加仓次数
     max_adds_per_position: int = _TOML.get("risk", {}).get("max_adds_per_position", 5)
-    # 用户指定：市价单 TP 缩 40%、SL 缩 （与挂单一致）
-    market_tp_shrink: float = _TOML.get("risk", {}).get("market_tp_shrink", 0.6)
-    market_sl_shrink: float = _TOML.get("risk", {}).get("market_sl_shrink", 0.65)
+    # ---- 首仓定价（用户 2026-10-09 指定）----
+    # 首仓止盈 = 结构计算值距离 × first_tp_shrink（0.70 = 缩 30%），
+    # 止损由**缩后的止盈距离**按 min_rr 反推（不再取自支撑位）。
+    # ⚠️ 原先此处是 `market_tp_shrink=0.6` / `market_sl_shrink=0.65` 两个
+    #    **零引用死配置**（全仓库无任何调用点，违反"不能放没有作用的死代码"）。
+    #    本次把它们收敛成一个真正生效的键（定义在 min_rr 之后，见下）。
     # ---- 缠论结构定价（用户要求：用 0.618 回调 / 分型两倍 / 1.618 扩展）----
     # 用哪个周期的结构定 SL/TP。用户选定 15m（实测分型两倍≈33.8，
     # 1h 是 73.8、4h 是 149.0，差 4.4 倍）。
@@ -176,13 +179,17 @@ class RiskConfig:
     # 在 levels.py:397 真实生效。上限/占比区间已删除，理由见上。
     structure_sl_min_atr: float = _TOML.get("risk", {}).get("structure_sl_min_atr", 0.5)
     # ---- 压力位/支撑位定价（用户要求：止损止盈看压力位，由 LLM 判断）----
-    # 止损放在支撑/压力位之外时额外让开的距离（×ATR），防贴边被扫
-    level_pad_atr: float = _TOML.get("risk", {}).get("level_pad_atr", 0.25)
-    # 最小盈亏比：止盈距离 < 止损距离 × 该值 → 不开仓
-    min_rr: float = _TOML.get("risk", {}).get("min_rr", 1.2)
+    # ⚠️ 2026-10-09 删除 `level_pad_atr`：新定价语义下止损由止盈按盈亏比
+    #    反推，不再锚定支撑位，"止损让开距离"失去作用对象（死配置）。
+    # 最小盈亏比：**同时**是"止盈距离 → 止损距离"的反推除数与赔率校验下限。
+    # 两者必须是同一个数，否则实际盈亏比与校验尺度不一致。
+    min_rr: float = _TOML.get("risk", {}).get("min_rr", 1.8)
+    #: 首仓止盈距离 = 结构计算值距离 × 本值（0.70 = 缩 30%），
+    #: 止损距离 = 缩后止盈距离 / `min_rr`。设为 1.0 = 关闭缩放。
+    first_tp_shrink: float = _TOML.get("risk", {}).get("first_tp_shrink", 0.7)
     # ---- 加仓专用定价（用户 2026-10-08 指定）----
     # 用户原话：
-    #   > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.2
+    #   > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.8
     #   > 然后加仓的单子止盈点不能按照计算的数值来 要对应缩小42% 也就是原值的58%
     # 语义：加仓先由结构位算出止盈目标，其**距离**缩到 add_tp_shrink 倍，
     #       再由缩后的止盈距离按 min_rr 反推止损（止损不再取自支撑位）。
@@ -415,20 +422,24 @@ class DecisionConfig:
     #: -> 强信号被挂单阻塞 167 轮。
     pending_only_in_mean_revert: bool = _TOML.get("decision", {}).get(
         "pending_only_in_mean_revert", True)
-    # ---- news「独立证据」通道（用户选定：不抢方向权重，做事件风险闸）----
+    # ---- news「独立证据」通道（用户 2026-10-09 修订：做**方向冲突闸**）----
     #
     # ⚠️ 为什么不是给 news 加方向权重：`weights.py` 的硬规则是
     #    「没有实测 IR 数字的源 = 0 权重」。news 从未做过 IR 校准，
     #    给它方向权重等于用未验证信号做方向 —— 正是该规则要禁止的。
     #
-    # 但 news 现在**完全没用上**：实测 7874 轮里 news 从未进入 per_source，
+    # news 原先**完全没用上**：实测 7874 轮里 news 从未进入 per_source，
     #    因为权重 0 被 gaussian.fuse 排除；LLM 的 news_assessment 拿到后
     #    触发一次 `fuse_all` 重融合，实测融合分一字不变（news_score 从
     #    0 → +1.5 → -1.5，融合分恒为 +1.438195），纯空操作。
     #
-    # 所以把 news 做成**事件风险闸**：它不影响方向，只影响"要不要开/开多大"。
-    #    这与它「未验证」的定位一致，且立刻产生实际作用。
-    #: LLM 新闻影响度 >= 此值 → 不开新仓（等事件过去）
+    # 用户 2026-10-09 原话：
+    #    > 我觉得新闻事件可以提供做单方向 而不是停止开仓
+    # 故改为**方向冲突闸**：news 拿到方向上的否决权 —— 新闻情绪与开仓
+    # 方向**冲突**且影响度够大才拦，方向**一致就放行**。news 仍不进融合分，
+    # 也**不能**绕过 z_min 凭方向自己开仓（见 `machine.sentiment_direction`）。
+    #: LLM 新闻影响度 >= 此值 **且与开仓方向冲突** → 不开新仓（等事件过去）。
+    #: 方向一致时不拦；设为 1.01 即关闭该闸。
     news_impact_block: float = _TOML.get("decision", {}).get("news_impact_block", 0.70)
     #: LLM 新闻影响度 >= 此值 → 新仓手数 × news_impact_lot_mult
     news_impact_reduce: float = _TOML.get("decision", {}).get("news_impact_reduce", 0.40)

@@ -47,7 +47,8 @@ def _news_impact(llm_review: dict | None) -> tuple[float, str]:
     ⚠️ news **不参与方向投票**（无实测 IR → 0 权重，见 `fusion/weights.py`
     硬规则）。它只按 LLM 给出的事件影响度调整**仓位大小**：
     影响度 >= `news_impact_reduce` → 手数降级；
-    >= `news_impact_block` → 已在 `decision.machine` 直接 hold（不开新仓）。
+    >= `news_impact_block` **且与开仓方向冲突** → 已在 `decision.machine`
+    直接 hold（不开新仓；方向一致则不拦，见用户 2026-10-09 的修订）。
     """
     na = (llm_review or {}).get("news_assessment") or {}
     try:
@@ -85,7 +86,7 @@ class RiskGate:
 
     def _levels(self, direction: str, entry: float, ev, atr: float | None,
                 llm_review: dict | None = None,
-                sl_from_tp: bool = False,
+                add: bool = False,
                 digits: int = 3):
         """按 LLM 判断的压力位/支撑位算止损止盈（用户要求的正确语义）。
 
@@ -93,16 +94,21 @@ class RiskGate:
         止损止盈看**压力位/支撑位** —— 由 LLM 读 skill 输出判断，
         本地只做配套计算（方向/最小距离/盈亏比校验）。
 
-        `sl_from_tp=True` 走**加仓专用**路径：先定止盈、缩 58%、
-        再按 min_rr 反推止损（用户 2026-10-08 指定）。首仓/挂单不受影响。
+        **统一定价语义（用户 2026-10-09 合并首仓与加仓）**：
+        所有路径都是"先由结构位算出止盈目标 → 距离缩 N% →
+        按 `min_rr` 反推止损"。首仓缩到 `first_tp_shrink`（0.70），
+        加仓缩到 `add_tp_shrink`（0.58）。
+
+        `add=True`：加仓路径，用 0.58 那一档。
 
         `digits`：该品种价格小数位。⚠️ 必须传，不能沿用 `levels.py` 里
         写死的 3 —— 对 EURUSDm（digits=5）会把 `1.12419` 截成 `1.12400`
         （偏 19 个 point），且该误差会**进入手数计算**（`sl_dist` 反推手数）。
         """
         return trade_levels(direction, entry, llm_review, ev, atr,
-                            tp_shrink=CFG.risk.add_tp_shrink if sl_from_tp else 1.0,
-                            sl_from_tp=sl_from_tp, digits=digits)
+                            tp_shrink=(CFG.risk.add_tp_shrink if add
+                                       else CFG.risk.first_tp_shrink),
+                            digits=digits)
 
     def evaluate(self, prop: Proposal, ev: FusedEvidence, account: AccountInfo,
                  positions: PositionsView, point_value_per_lot: float,
@@ -338,7 +344,7 @@ class RiskGate:
             if ref is None:
                 ref = pos.price_open if pos is not None else prop.entry
             lv = self._levels(prop.direction, ref, ev, atr, llm_review,
-                              sl_from_tp=True, digits=digits)
+                              add=True, digits=digits)
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
             plan = {"kind": "add_layer", "direction": prop.direction,

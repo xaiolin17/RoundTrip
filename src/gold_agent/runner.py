@@ -146,7 +146,7 @@ def _src_suffix(plan: dict) -> str:
         elif s.startswith("llm_hint"):
             parts.append("LLM建议")
         elif s.startswith("rr_from_tp"):
-            # 加仓专用：止损由止盈按盈亏比反推（用户 2026-10-08 指定）
+            # 止损由止盈按盈亏比反推（首仓 2026-10-09 / 加仓 2026-10-08）
             parts.append("止盈反推")
         elif s.startswith("chanlun"):
             parts.append("缠论结构")
