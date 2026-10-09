@@ -956,6 +956,50 @@ def test_add_review_receives_new_levels_and_position_context():
     assert c["position"]["max_adds"] == CFG.risk.max_adds_per_position
 
 
+def test_add_review_prompt_contains_json_keyword():
+    """⚠️ 复核 system 提示词必须含 "json" 字样，否则线上 400。
+
+    事故（2026-10-08 17:03 提交后实盘，266 次加仓全部被拦）：
+    RunningHub 的 `response_format={"type":"json_object"}` 要求提示词里
+    出现 "json" 字样，否则返回
+        HTTP 400 InvalidParameter: Prompt must contain the word 'json'
+    实测 314 次 `http_error` 全是这一个原因，`add_review` 成功 0 次。
+    而 `_REVIEW_SYSTEM` / `_NEWS_SYSTEM` 都写了"严格 JSON"所以正常 ——
+    新加的 `_ADD_REVIEW_SYSTEM` 漏了，于是加仓功能整个失效。
+
+    只断言 system 不够：API 校验的是**整段 prompt**（system+user）。
+    """
+    from gold_agent.llm.orchestrator import (_ADD_REVIEW_SYSTEM,
+                                             build_add_review_user)
+    assert "json" in _ADD_REVIEW_SYSTEM.lower(), \
+        "_ADD_REVIEW_SYSTEM 缺少 'json' 字样 → 线上必然 HTTP 400"
+
+    user = build_add_review_user("LONG", 4116.0, 4110.0, 4123.0, 6.0, 7.2, 1.2,
+                                 4117.5, ev=None,
+                                 position={"adds_count": 1, "max_adds": 5,
+                                           "price_open": 4100.0})
+    # 整段 prompt（system + user）合起来必须含 json
+    whole = (_ADD_REVIEW_SYSTEM + "\n" + user).lower()
+    assert "json" in whole, "合并后的 prompt 不含 'json' → 线上必然 HTTP 400"
+
+
+def test_all_llm_prompts_satisfy_json_object_requirement():
+    """所有走 chat_json 的系统提示词都必须含 "json"。
+
+    这是通用防线：以后新增任何 LLM 任务，只要忘了写"JSON"，
+    线上就会静默 400 —— 而 400 会被当成"大模型不可用"降级，
+    表现为功能静默失效（加仓不再发生），极难从现象反推原因。
+    """
+    from gold_agent.llm import orchestrator as O
+    prompts = {n: getattr(O, n) for n in dir(O)
+               if n.endswith("_SYSTEM") and isinstance(getattr(O, n), str)}
+    assert prompts, "没有找到任何 _SYSTEM 提示词，检查命名"
+    missing = [n for n, t in prompts.items() if "json" not in t.lower()]
+    assert not missing, (
+        f"以下提示词缺少 'json' 字样，会导致 response_format=json_object "
+        f"请求被拒（HTTP 400）：{missing}")
+
+
 def test_add_review_prompt_contains_levels_and_rr():
     """复核提示词必须包含止损/止盈/盈亏比和"还剩多少空间"。"""
     from gold_agent.llm.orchestrator import build_add_review_user

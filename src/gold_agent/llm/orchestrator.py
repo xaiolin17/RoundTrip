@@ -186,7 +186,14 @@ _ADD_REVIEW_SYSTEM = """你是黄金（XAUUSD）交易的风险复核员。
   · 已到阻力/支撑密集区，继续加仓的风险收益不成比例
   · 加仓后总仓位在该方向上过度集中
 - **默认从严**：只有结构确实支持继续加，才给 approve。
-- 不要输出手数或下单指令（订单参数只出自 risk 模块）。"""
+- 不要输出手数或下单指令（订单参数只出自 risk 模块）。
+
+⚠️ 必须输出 JSON（structuredOutputs 要求提示词里出现 "json" 字样）：
+{"decision":"approve|reject",
+ "confidence":0..1,
+ "reason":"一句话说明依据的是哪个结构/哪个数字",
+ "risk_flags":["..."]}
+decision 只能是 approve 或 reject；不确定时一律 reject。"""
 
 
 ADD_REVIEW_SCHEMA = {
