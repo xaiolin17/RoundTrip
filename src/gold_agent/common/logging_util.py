@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from contextvars import ContextVar
 from pathlib import Path
 
 from gold_agent.common.config import CFG
@@ -26,13 +27,35 @@ _source: str = os.environ.get("GOLD_AGENT_LOG_SOURCE", "live")
 #: 当前品种。多品种单进程运行时，各品种的日志会**交错写入同一文件**，
 #: 没有品种标签就无法归属某条记录属于哪个品种（也无法按品种做统计）。
 #: 单品种时保持 None，日志格式与改造前**完全一致**（不新增字段）。
-_symbol: str | None = None
+#:
+#: ⚠️ 必须用 `ContextVar` 而不是模块级全局变量。
+#: 事故（2026-10-09 审计实测）：原先用 `global _symbol`，而 runner 是
+#: `asyncio.gather` **并发**跑各品种的：
+#:     set_symbol(sym) -> await g.run_round(rid)   # 内部大量 await，会让出
+#: 全局变量在 await 点被**其它品种**覆盖，于是所有品种的日志都被贴上
+#: 最后一个设置者的标签。实测复现：
+#:     [('XAUUSDm','EURUSDm'), ('BTCUSDm','EURUSDm'), ('EURUSDm','EURUSDm')]
+#: 即 XAUUSDm/BTCUSDm 的协程恢复时，`_symbol` 已经是 EURUSDm。
+#: 后果：`logs/*.jsonl` 里绝大部分记录的 `symbol` 字段是错的，
+#: 按品种归因/统计/告警全部失真 —— 而这个标签的存在意义正是做归因。
+#:
+#: `ContextVar` 在 asyncio 下**天然按任务隔离**：每个 `asyncio.create_task`
+#: 拿到创建时上下文的副本，`set()` 只影响当前任务及其子任务，
+#: 不会串到并发跑的其它品种。
+_symbol_var: ContextVar[str | None] = ContextVar("gold_agent_symbol", default=None)
 
 
 def set_symbol(sym: str | None) -> None:
-    """设置当前品种标签（多品种 runner 在每个品种的轮次前调用）。"""
-    global _symbol
-    _symbol = str(sym) if sym else None
+    """设置当前**任务**的品种标签（多品种 runner 在每个品种的轮次前调用）。
+
+    ⚠️ 不要改回 `global _symbol` —— 见 `_symbol_var` 的事故注释。
+    """
+    _symbol_var.set(str(sym) if sym else None)
+
+
+def current_symbol() -> str | None:
+    """当前任务的品种标签（None = 单品种/未设置）。"""
+    return _symbol_var.get()
 
 #: 本进程是否为**实盘 runner**。只有 `runner.main()` 会置 True。
 #:
@@ -111,8 +134,9 @@ def jlog(path: Path, record: dict) -> None:
     # 多品种：给每条记录打上品种标签（单品种时不加，保持日志格式不变）。
     # ⚠️ 必须放在**去重 key 之前**：否则两个品种的同类记录（其余字段相同）
     #    会被误判为"重复"而互相吞掉，其中一个品种的日志凭空消失。
-    if _symbol:
-        record.setdefault("symbol", _symbol)
+    _sym = _symbol_var.get()
+    if _sym:
+        record.setdefault("symbol", _sym)
     # 去重：按 (event, 业务内容) 判断（ts 除外），连续重复只写一条，段尾补汇总
     key = json.dumps({k: v for k, v in record.items() if k != "ts"},
                      ensure_ascii=False, sort_keys=True, default=str)

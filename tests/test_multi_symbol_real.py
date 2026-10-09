@@ -751,6 +751,95 @@ def test_order_request_carries_the_plan_symbol():
     assert sorted(fc.asked[-5:]) == sorted(PROFILES), "未按品种查 symbol_info"
 
 
+def test_order_request_carries_the_plan_magic():
+    """⚠️ 下单请求必须带**本品种的 magic**，不能写死全局 20260918。
+
+    这是与 MT5Client 串台**同构**的残留缺陷（2026-10-09 审计发现）：
+    `OrderPlan` 加了 `symbol` 字段却漏了 `magic`，`_build_request` 于是
+    写死 `CFG.mt5.magic`（= 20260918）。而全仓库的"我的持仓/挂单/交割单"
+    过滤**只按 magic、没有一处按 symbol**，所以：
+
+      · 下单带 20260918，过滤找 202609xx → **查不到自己的持仓**；
+      · `_used_lots()` 恒为 0 → **可以无限开仓**（总手数闸失效）；
+      · 已有持仓视为不存在 → **每轮重复市价开新仓**；
+      · 止盈止损改不动（找不到持仓）；
+      · `DealFeedback` 收不到交割单 → 胜率/熔断/贝叶斯静默失效；
+      · 更糟：4 个非黄金品种**互相看见**（实际都带 20260918），
+        止损/平仓可能发到别的品种的持仓上。
+
+    单品种黄金下 magic 恰好等于全局值，所以完全正常 —— 这正是它
+    至今没被发现的原因。**已有测试只断言了 symbol，没有断言 magic**，
+    所以这条要单独锁死。
+    """
+    from gold_agent.mt5.executor import Executor, OrderPlan
+
+    ex = Executor(_FakeClient())
+    magics = {}
+    for sym in sorted(PROFILES):
+        p = get_profile(sym)
+        req = ex._build_request(OrderPlan(
+            kind="open_market", direction="LONG", lots=0.01,
+            entry=1.0, tp=2.0, sl=0.5, symbol=sym, magic=p.magic))
+        magics[sym] = req["magic"]
+        assert req["magic"] == p.magic, (
+            f"{sym}: 请求 magic 为 {req['magic']}，应为 {p.magic} —— "
+            f"过滤只按 magic，写错就查不到自己的持仓")
+
+    # 5 个品种的 magic 必须互不相同（否则互相认领持仓）
+    assert len(set(magics.values())) == len(PROFILES), \
+        f"下单 magic 有重复：{magics}"
+    # 黄金必须仍是历史值 20260918（历史数据按它归档）
+    assert magics["XAUUSDm"] == 20260918
+
+
+def test_order_request_magic_defaults_to_cfg_when_absent():
+    """不传 magic 时必须用 `CFG.mt5.magic`（单品种兼容，行为不变）。"""
+    from gold_agent.mt5.executor import Executor, OrderPlan
+
+    ex = Executor(_FakeClient())
+    req = ex._build_request(OrderPlan(kind="open_market", direction="LONG",
+                                      lots=0.01, entry=1.0, tp=2.0, sl=0.5))
+    assert req["magic"] == CFG.mt5.magic == 20260918
+
+
+def test_every_graph_orderplan_site_passes_symbol_and_magic():
+    """⚠️ 源码级接线检查：`Graph` 里每个 `OrderPlan(...)` 都必须同时带
+    `symbol=` 与 `magic=`。
+
+    行为测试只能覆盖被调用到的那条分支（6 个下单种类里通常只跑到 1~2 个），
+    漏改的分支要等到实盘真正走那条路径才暴露。所以这里做源码级断言，
+    确保**全部 6 个**下单种类都正确带上品种与 magic。
+    """
+    import inspect
+    import re
+
+    from gold_agent.agent.graph import Graph
+
+    src = inspect.getsource(Graph._execute)
+    lines = src.splitlines()
+    blocks, i = 0, 0
+    while i < len(lines):
+        if "OrderPlan(" in lines[i]:
+            buf, depth, j = "", 0, i
+            while j < len(lines):
+                buf += lines[j] + "\n"
+                depth += lines[j].count("(") - lines[j].count(")")
+                if depth <= 0 and "OrderPlan(" in buf:
+                    break
+                j += 1
+            blocks += 1
+            kind = re.search(r'kind="(\w+)"', buf)
+            kname = kind.group(1) if kind else "?"
+            assert "symbol=" in buf, f"OrderPlan({kname}) 没带 symbol"
+            assert "magic=" in buf, \
+                f"OrderPlan({kname}) 没带 magic —— 会写死全局 20260918，" \
+                f"导致该品种查不到自己的持仓"
+            i = j + 1
+        else:
+            i += 1
+    assert blocks == 6, f"预期 6 个下单种类，实为 {blocks}（测试本身需更新）"
+
+
 def test_order_request_defaults_to_cfg_symbol_when_absent():
     """不传 symbol 时必须用 CFG.mt5.symbol（单品种兼容，行为不变）。"""
     from gold_agent.mt5.executor import Executor, OrderPlan
@@ -804,6 +893,47 @@ def test_mobius_request_body_uses_profile_venue(monkeypatch):
 # ══════════════════════════════════════════════════════════════════
 # 7. 状态隔离与日志归属
 # ══════════════════════════════════════════════════════════════════
+def test_position_adds_save_and_load_paths_match(monkeypatch, tmp_path):
+    """⚠️ `position_adds.json` 的**写路径必须与读路径一致**。
+
+    发现的真实缺陷：`_save_position_adds` 写死 `CFG.state_path.parent`
+    （共享 `data/`），而 `_load_state` 走 `state_dir()`
+    （多品种时 `data/<品种>/`）。读写不一致的后果：
+
+      · 5 个品种**都往同一个** `data/position_adds.json` 写，互相覆盖；
+      · 读的时候去 `data/<品种>/position_adds.json`，那里**从来没有文件**
+        → 每个品种都从 0 开始计数 → `max_adds_per_position` 闸失效
+        → **可以无限加仓**（这是资金安全问题，不只是统计不准）。
+
+    这类"写一个地方、读另一个地方"的错**永不报错**，只是数据静默丢失。
+    """
+    from gold_agent.agent.graph import Graph
+
+    monkeypatch.setenv("TRADE_SYMBOLS", "XAUUSDm,BTCUSDm")
+    monkeypatch.setattr(CFG, "project_root", tmp_path, raising=False)
+    monkeypatch.setattr(CFG, "state_path", tmp_path / "data" / "runner.lock",
+                        raising=False)
+
+    g = Graph.build("BTCUSDm")
+    g._position_adds = {"999001": 3}
+    g._save_position_adds()
+
+    want = g.state_dir() / "position_adds.json"
+    assert want.exists(), f"写到了别处（{want} 不存在）"
+    # 必须落在**本品种**目录下
+    assert want.parent.name == "BTCUSDm", f"写到了非品种目录：{want}"
+    # 共享目录下不得出现这个文件
+    shared = CFG.state_path.parent / "position_adds.json"
+    assert not shared.exists(), f"仍往共享目录写：{shared}"
+
+    # 重新加载必须读回同一份数据（读写一致）
+    # 读取发生在 `__post_init__`（建图时），显式再调一次验证往返
+    g._position_adds = {}
+    g.__post_init__()
+    assert g._position_adds.get("999001") == 3, \
+        f"读回来的与写入的不一致：{g._position_adds}"
+
+
 def test_state_dir_is_shared_when_single_symbol(monkeypatch):
     """⚠️ 单品种时状态目录**必须保持原路径**（data/）。
 
@@ -844,14 +974,110 @@ def test_log_symbol_tag_defaults_off_and_can_be_set():
     """⚠️ 品种日志标签必须默认**关闭**（单品种日志格式不变），可显式开启。"""
     from gold_agent.common import logging_util as LU
 
-    assert LU._symbol is None, "默认应为 None（不加 symbol 字段）"
+    assert LU.current_symbol() is None, "默认应为 None（不加 symbol 字段）"
     LU.set_symbol("BTCUSDm")
     try:
-        assert LU._symbol == "BTCUSDm"
+        assert LU.current_symbol() == "BTCUSDm"
         LU.set_symbol("")
-        assert LU._symbol is None, "空串应还原为 None"
+        assert LU.current_symbol() is None, "空串应还原为 None"
     finally:
         LU.set_symbol(None)
+
+
+def test_log_symbol_isolated_between_concurrent_tasks():
+    """⚠️ 品种标签必须**按 asyncio 任务隔离**（不能用模块级全局变量）。
+
+    事故（2026-10-09 审计实测）：原先用模块级 `global _symbol`，而 runner
+    用 `asyncio.gather` **并发**跑各品种：
+        set_symbol(sym) -> await g.run_round(rid)   # 内部大量 await
+    全局变量在 await 点被其它品种覆盖。实测复现（三个协程跑完，
+    全部观察到最后一个设置者）：
+
+        [('XAUUSDm','EURUSDm'), ('BTCUSDm','EURUSDm'), ('EURUSDm','EURUSDm')]
+
+    后果：`logs/*.jsonl` 里绝大部分记录的 `symbol` 字段是错的，
+    按品种归因/统计/告警全部失真 —— 而这个标签的意义正是做归因。
+
+    实测对照（本机跑同一脚本）：
+      · 旧实现（global）：4/5 品种被贴上最后一个品种的标签；
+      · 新实现（ContextVar）：5/5 正确。
+    所以这条必须用**真并发**测，同步顺序调用测不出来
+    （旧测试正是同步调用，所以一直是绿的）。
+    """
+    import asyncio
+    import json
+
+    from gold_agent.common import logging_util as LU
+
+    syms = ["XAUUSDm", "BTCUSDm", "USOILm", "EURUSDm", "USDJPYm"]
+
+    async def record_all():
+        """在各任务内模拟 await 点后写日志，返回 (owner, 写入的 symbol) 对。"""
+        import tempfile
+        import pathlib
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        log = tmp / "race.jsonl"
+
+        async def one(sym):
+            LU.set_symbol(sym)
+            for i in range(3):
+                await asyncio.sleep(0)      # 让出控制权 -> 旧实现必串台
+                LU.jlog(log, {"event": "probe", "owner": sym, "i": i})
+
+        await asyncio.gather(*[one(s) for s in syms])
+        out = []
+        for ln in log.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if ln.startswith("{"):
+                r = json.loads(ln)
+                out.append((r.get("owner"), r.get("symbol")))
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+        return out
+
+    # jlog 需要允许写入（测试目录不是生产目录，只需不静默）
+    old_silent, old_live = LU._silent, LU._live
+    LU._silent = False
+    LU.set_live(True)
+    try:
+        pairs = asyncio.run(record_all())
+    finally:
+        LU._silent = old_silent
+        LU._live = old_live
+        LU.set_symbol(None)
+
+    assert pairs, "没有写出任何日志（测试前提错了）"
+    wrong = [(o, s) for o, s in pairs if o != s]
+    assert not wrong, (
+        f"并发下品种标签串台：{wrong[:5]} —— "
+        f"品种标签必须用 ContextVar 按任务隔离，不能用模块级全局变量")
+
+
+def test_log_symbol_uses_contextvar_not_module_global():
+    """⚠️ 源码级检查：品种标签必须是 ContextVar，不能退回模块级全局变量。
+
+    行为测试依赖并发时序（可能偶发通过），源码检查是确定性的防线。
+    """
+    import inspect
+
+    from gold_agent.common import logging_util as LU
+
+    src = inspect.getsource(LU)
+    assert "ContextVar" in src, "品种标签必须用 ContextVar"
+    assert "_symbol_var" in src
+    # 不得再出现 `global _symbol` 这种**代码**（注释/docstring 里的告诫不算）。
+    # 用 AST 检查真正的 `global` 语句 —— 文本匹配会被 docstring 里的示例误伤。
+    import ast
+    import pathlib
+    tree = ast.parse(pathlib.Path(LU.__file__).read_text(encoding="utf-8"))
+    bad = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Global) and "_symbol" in node.names:
+            bad.append(f"L{node.lineno}: global {', '.join(node.names)}")
+    assert not bad, f"仍存在模块级 global 标签（并发下必串台）：{bad}"
+    # 不得存在模块级 `_symbol: str | None = None` 这种全局标签
+    assert not hasattr(LU, "_symbol"), \
+        "仍存在模块级 _symbol 全局变量"
 
 
 def test_log_symbol_tagged_before_dedup(tmp_path, monkeypatch):

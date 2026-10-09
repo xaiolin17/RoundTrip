@@ -583,7 +583,6 @@ class Graph:
             req = OrderPlan(kind="open_market", direction=plan["direction"],
                             lots=plan["lots"], tp=plan["tp"], sl=plan["sl"],
                             comment="goldagent-open", symbol=self.symbol,
-                            magic=self.profile.magic,
                             idempotency_key=f"open-{_rid}-{plan['direction']}")
             res = await self.executor.execute(req)
             if res.ok:
@@ -596,7 +595,6 @@ class Graph:
                             lots=float(plan["lots"]),
                             position_ticket=int(plan["position_ticket"]),
                             comment="goldagent-close", symbol=self.symbol,
-                            magic=self.profile.magic,
                             idempotency_key=f"close-{plan['position_ticket']}")
             return await self.executor.execute(req)
         if kind == "modify_sltp":
@@ -609,7 +607,6 @@ class Graph:
                             position_ticket=int(plan["position_ticket"]),
                             sl=float(plan["new_sl"]), tp=plan.get("keep_tp"),
                             comment="goldagent-lock", symbol=self.symbol,
-                            magic=self.profile.magic,
                             idempotency_key=(f"lock-{plan['position_ticket']}"
                                              f"-{plan['new_sl']}-{plan.get('keep_tp')}"))
             res = await self.executor.execute(req)
@@ -632,7 +629,7 @@ class Graph:
             req = OrderPlan(kind="open_market", direction=plan["direction"],
                             lots=float(plan["lots"]), tp=plan.get("tp"),
                             sl=plan.get("sl"), comment="goldagent-add",
-                            symbol=self.symbol, magic=self.profile.magic,
+                            symbol=self.symbol,
                             idempotency_key=f"add-{plan['position_ticket']}-{st.get('round_id', 0)}")
             res = await self.executor.execute(req)
             if res.ok:
@@ -668,7 +665,6 @@ class Graph:
             # 行情反转撤挂单（docs/06 状态机：PENDING_GRID → IDLE）
             req = OrderPlan(kind="cancel_pending", position_ticket=int(plan["order_ticket"]),
                             comment="goldagent-cancel", symbol=self.symbol,
-                            magic=self.profile.magic,
                             idempotency_key=f"cancel-{plan['order_ticket']}")
             res = await self.executor.execute(req)
             if res.ok:
@@ -698,7 +694,6 @@ class Graph:
                                 expiration_s=layer["expiration_s"],
                                 comment="goldagent-pending",
                                 symbol=self.symbol,
-                                magic=self.profile.magic,
                                 # `level` 是价格不是身份：同一价位在**后续轮次**
                                 # 重新挂单是合法意图（撤了又挂），所以键要带轮次，
                                 # 只在**同一轮内**防重复提交。

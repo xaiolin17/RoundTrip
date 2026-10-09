@@ -33,6 +33,23 @@ class OrderPlan:
     #: 下单品种。None = 用 `CFG.mt5.symbol`（单品种兼容，行为不变）。
     #: 多品种下必须显式带上 —— 否则所有品种的单都会发到默认品种上。
     symbol: str | None = None
+    #: 下单 magic。None = 用 `CFG.mt5.magic`（单品种兼容，行为不变）。
+    #:
+    #: ⚠️ 必须按品种给，且**与过滤用的 magic 同源**。
+    #: 事故（2026-10-09，与 MT5Client 串台同批发现）：本字段原先不存在，
+    #: `_build_request` 写死 `CFG.mt5.magic`（= 20260918）。而全仓库的
+    #: "我的持仓/挂单/交割单"过滤**只按 magic、没有一处按 symbol**，
+    #: 于是 BTCUSDm 下的单带 20260918、过滤却找 20260919 → 查不到自己的持仓：
+    #:   · `_used_lots()` 恒为 0 → **可以无限开仓**（总手数闸失效）；
+    #:   · 已有持仓视为不存在 → **每轮重复市价开新仓**
+    #:     （复现 2026-09-30"同一持仓重复提交 83 次"同类事故）；
+    #:   · 止盈止损改不动（`modify_sltp` 找不到持仓）；
+    #:   · `DealFeedback` 收不到自己的交割单 → 胜率/熔断/贝叶斯静默失效；
+    #:   · 更糟：4 个非黄金品种互相看见（它们实际都是 20260918），
+    #:     止损/平仓提案可能发到**别的品种**的持仓上。
+    #: 单品种黄金下 magic 恰好等于全局值，所以**完全正常** —— 这正是它
+    #: 至今没被发现的原因。
+    magic: int | None = None
 
 
 @dataclass
@@ -142,7 +159,10 @@ class Executor:
             filling = mt5.ORDER_FILLING_RETURN
         base = {
             "symbol": sym,
-            "magic": CFG.mt5.magic,
+            # ⚠️ 必须用 plan.magic（本品种的 magic），不能写死 CFG.mt5.magic。
+            #    过滤只按 magic 做，写错 magic 会让本品种看不到自己的持仓。
+            #    见 `OrderPlan.magic` 的注释（含后果清单）。
+            "magic": int(plan.magic if plan.magic is not None else CFG.mt5.magic),
             "deviation": CFG.mt5.deviation,
             "comment": plan.comment,
             "type_filling": filling,
