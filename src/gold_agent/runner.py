@@ -461,10 +461,15 @@ async def main_async(dry: bool, rounds: int | None) -> None:
     multi = len(symbols) > 1
 
     graphs: dict[str, Graph] = {}
+    # 组合级风险闸：多品种时**所有品种共用同一个实例**（它维护组合峰值回撤）。
+    # 单品种时它的判定恒为放行，行为与改造前一致。
+    from gold_agent.risk.portfolio import PortfolioRisk
+    portfolio = PortfolioRisk(tuple(symbols))
     for _s in symbols:
         try:
             set_symbol(_s if multi else None)
             graphs[_s] = Graph.build(_s)
+            graphs[_s].portfolio = portfolio
         except Exception as e:
             log_error(f"{_s}: 构建决策图失败 {type(e).__name__}: {e}")
             raise

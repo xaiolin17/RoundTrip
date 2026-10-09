@@ -281,6 +281,42 @@ class RiskConfig:
     #: MT5 挂单到期即自动撤销，该值决定"挂单能等多久行情"。
     pending_expiry_h: float = _TOML.get("risk", {}).get("pending_expiry_h", 4.0)
 
+    # ---- 组合级（多品种）风险闸 ----
+    #
+    # ⚠️ 为什么必须单独加这一层：单品种时"每品种风控"就等于"账户风控"，
+    #    所以原设计里没有任何组合级概念。多品种后会出现这些**新风险**：
+    #
+    #    1. **风险预算被倍数放大**。每品种各自按 risk_pct(0.5%) 独立算手数，
+    #       5 个品种同时开仓 = 单次总风险 2.5%，而不是 0.5%。
+    #       品种间还可能高度相关（黄金/原油/欧元都受美元驱动），
+    #       实际等于**同一个方向下了 5 倍注**。
+    #    2. **熔断口径失效**。各品种的 `CircuitBreakers` 只看自己的盈亏，
+    #       组合整体回撤 12% 时，若各品种各自都没到 12%，就**无人熔断**。
+    #    3. **保证金集中**。`margin_use_cap` 是逐品种判断的，
+    #       多品种并发下单可能一起把可用保证金吃光。
+    #
+    #: 组合单次开仓总风险上限（占净值比例）。
+    #: 这是**所有品种同时开仓**时的总风险预算。
+    #: 默认 0.01 = 每品种 0.5% × 5 品种 ≈ 2.5% 会超限 → 会被按比例缩减。
+    #: ⚠️ 默认值取 0.01 而非 0.025：品种间相关性未知且可能很高，
+    #: "看起来分散"不等于真的分散（见上面第 1 点）。先从严。
+    portfolio_risk_cap: float = _TOML.get("risk", {}).get(
+        "portfolio_risk_cap", 0.01)
+    #: 组合总回撤熔断（占净值比例）。**独立于**各品种自己的回撤熔断 ——
+    #: 它看的是账户整体，防止"各品种各自未到线、合起来已巨亏"。
+    portfolio_drawdown_halt_pct: float = _TOML.get("risk", {}).get(
+        "portfolio_drawdown_halt_pct", 0.12)
+    #: 同向品种数上限。超过则**不开新仓**（不是按比例缩减）——
+    #: 因为同向高度集中本身就是"押注单一宏观方向"，缩仓只是减损、
+    #: 并不能降低"判断错就全错"的结构性风险。
+    #: 0 = 不限制。
+    portfolio_max_same_direction: int = _TOML.get("risk", {}).get(
+        "portfolio_max_same_direction", 3)
+    #: 组合总保证金占用上限（占净值比例）。逐品种的 margin_use_cap 之外
+    #: 再加一道账户级闸，防止多品种并发下单一起吃光保证金。
+    portfolio_margin_cap: float = _TOML.get("risk", {}).get(
+        "portfolio_margin_cap", 0.60)
+
 
 @dataclass
 class DecisionConfig:
@@ -432,6 +468,31 @@ class Config:
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+
+    def per_symbol_budgets(self, n: int) -> dict:
+        """把 LLM 每小时预算按品种数**平分**（多品种时每品种一份）。
+
+        ⚠️ 为什么必须按品种分池：LLM 预算（`llm.per_hour_budget` 等）是
+        **本进程自设的滚动小时上限**，不是厂商配额 —— 用户的 API key
+        本身没有这个限制，这个数字纯粹用来防止代码疯狂调用烧钱。
+        单品种时 `per_hour_budget=60` 恰好等于"60 秒一轮 × 60 分钟 = 60 轮"，
+        已经 100% 用满（实测每小时成功 64~75 次，cap 60）。
+        若 5 个品种共用这 60，每品种只有 12 次/小时 = 每 5 轮 1 次评审。
+        LLM 是市价开仓的确认环节，它不可用时拿不到压力位而无法开仓
+        （`llm_no_levels`）→ 等于把 5 个品种都变哑。
+
+        实测依据（logs/llm_20261009.jsonl，1935 条）：news 曾与 review
+        共用池子，把 review 额度吃光使覆盖率跌到 4.3%，故各 kind 已独立成池；
+        多品种同理，每个品种也必须独立成池。
+
+        ⚠️ 每池下限 1：出现 0 会让该品种完全没有 LLM（永久哑火）。
+        """
+        n = max(1, int(n))
+        return {
+            "review": max(1, int(self.llm.per_hour_budget / n)),
+            "news": max(1, int(self.llm.news_per_hour_budget / n)),
+            "add_review": max(1, int(self.llm.add_review_per_hour_budget / n)),
+        }
 
     # ---------- 多品种 ----------
     #: 要交易的品种列表。默认**只有当前实盘品种**（`MT5_SYMBOL`），

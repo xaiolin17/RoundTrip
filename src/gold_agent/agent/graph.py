@@ -68,6 +68,9 @@ class Graph:
     #: 本实例负责的品种（多品种时每品种一个 Graph 实例）。
     #: None = 用 `CFG.mt5.symbol`（单品种兼容，行为与改造前一致）。
     symbol: str | None = None
+    #: 组合级风险闸（跨品种，多品种时由 runner 注入**同一个**实例）。
+    #: None = 不做组合检查（单品种/测试场景）。
+    portfolio: Any = None
     # {position_id / order_id: 预测符号} 成交→贝叶斯反馈桥接（落盘 pred_orders.json）
     # 键统一用 position_id：平仓 deal 的 order 是新 ticket，与开仓时记的永不相等
     _pred_orders: dict = field(default_factory=dict)
@@ -93,7 +96,10 @@ class Graph:
         orchestrator: Orchestrator | None = None
         try:
             from gold_agent.llm.client import RunningHubClient
-            orchestrator = Orchestrator(RunningHubClient(), symbol=sym)
+            # 多品种：LLM 每小时预算按品种数**平分**（每品种一个独立池）。
+            # 单品种时平分结果 == 原配置（60/24/24），行为不变。
+            _caps = CFG.per_symbol_budgets(len(CFG.trade_symbols))
+            orchestrator = Orchestrator(RunningHubClient(budgets=_caps), symbol=sym)
         except Exception as e:
             # LLM 缺 key 时禁用（本地降级路径照常决策），首次成功调用前重试初始化
             orchestrator = Orchestrator(None, symbol=sym)
@@ -435,6 +441,36 @@ class Graph:
                                "reason": f"add_review: {rev_info.get('reason')}",
                                "proposal": prop.__dict__})
                     return summary
+
+            # ---- t7c 组合级风险闸（多品种）----
+            # ⚠️ 逐品种风控**结构上无法**覆盖组合风险。最关键的一条：
+            #    各品种的 CircuitBreakers 只看自己的盈亏序列，
+            #    组合整体回撤 12% 时若各品种各自都没到线，就**无人熔断**。
+            #    另有风险预算倍数放大（5 品种 × 0.5% = 2.5%）与保证金集中。
+            # 单品种时 `PortfolioRisk.check_for` 直接放行（空操作），
+            # 所以黄金实盘行为不变。
+            if self.portfolio is not None and (approved.plan or {}).get("kind") \
+                    in ("open_market", "place_grid"):
+                _verdict = self._portfolio_check(approved.plan, st)
+                if not _verdict.ok:
+                    summary["risk"] = {"ok": False,
+                                       "reason": _verdict.reason,
+                                       "plan": approved.plan}
+                    trade_log({"event": "risk_reject", "round": round_id,
+                               "kind": prop.kind,
+                               "reason": f"portfolio: {_verdict.reason}",
+                               "proposal": prop.__dict__})
+                    return summary
+                if _verdict.lot_mult < 1.0:
+                    # 按组合预算缩手数（信号本身有效，只是总风险超额）
+                    _p = approved.plan
+                    _p["lots"] = round(float(_p.get("lots") or 0.0)
+                                       * _verdict.lot_mult, 2)
+                    summary["portfolio"] = {"lot_mult": _verdict.lot_mult,
+                                            "reason": _verdict.reason}
+                    trade_log({"event": "portfolio_scale", "round": round_id,
+                               "lot_mult": _verdict.lot_mult,
+                               "lots": _p["lots"], "reason": _verdict.reason})
 
             # t8 execute
             exec_res = await self._execute(approved.plan, st)
@@ -849,6 +885,42 @@ class Graph:
                     log_warn("跳过融合预热：无行情数据")
         except Exception as e:
             log_warn(f"融合预热失败：{e}")
+
+    def _portfolio_check(self, plan: dict, st: GraphState):
+        """构造组合快照并做组合级判定（多品种）。
+
+        ⚠️ 单品种时 `PortfolioRisk.check_for` 内部直接放行 —— 本方法
+        仍会被调用，但结果恒为 ok（不改变黄金实盘行为）。
+        """
+        from gold_agent.risk.portfolio import PortfolioState
+
+        # 各品种当前持仓方向：本实例只看得到自己的持仓，
+        # 其余品种的方向由 runner 在 `st` 里注入（`portfolio_peers`）。
+        peers = dict(st.get("portfolio_peers") or {})
+        mine = None
+        for p in st["positions"].positions:
+            if p.magic == self.profile.magic:
+                mine = "LONG" if int(getattr(p, "type", 0)) == 0 else "SHORT"
+                break
+        dirs = dict(peers)
+        dirs[self.symbol or CFG.mt5.symbol] = mine
+
+        account = st["account"]
+        equity = float(getattr(account, "equity", 0.0) or 0.0)
+        # 组合纯交易盈亏：用净值 − 净出入金（与 CircuitBreakers 同口径）
+        pnl_now = equity - float(getattr(self.breakers, "net_deposits", 0.0) or 0.0)
+        self.portfolio.update_pnl(pnl_now)
+
+        risk_now = {s: self.profile.risk_pct for s, d in dirs.items() if d}
+        pstate = PortfolioState(
+            risk_by_symbol=risk_now,
+            direction_by_symbol=dirs,
+            margin_by_symbol={},
+            equity=equity, pnl_now=pnl_now)
+        # 本笔的风险：单品种单笔预算 × 缩仓系数（近似满额，保守方向）
+        this_risk = self.profile.risk_pct
+        return self.portfolio.check_for(self.symbol or CFG.mt5.symbol,
+                                        this_risk, pstate)
 
     def _used_lots(self, positions) -> float:
         """本品种当前**已用**总手数（加仓额度判定用）。

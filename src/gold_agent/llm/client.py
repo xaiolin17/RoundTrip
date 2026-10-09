@@ -110,7 +110,7 @@ class Budget:
 
 
 class RunningHubClient:
-    def __init__(self) -> None:
+    def __init__(self, budgets: dict | None = None) -> None:
         cfg = CFG.llm
         if not cfg.api_key:
             raise LLMError("RUNNINGHUB_API_KEY missing; write it to .env")
@@ -121,11 +121,21 @@ class RunningHubClient:
         # ⚠️ add_review 必须独立池子：它是"每笔加仓一次"，若与 review 共用，
         #    加仓活跃时会把主评审额度吃光（research/20 记录过 news 挤占
         #    review 导致覆盖率跌到 4.3% 的事故）。
-        self.budgets: dict[str, Budget] = {
-            "review": Budget(cfg.per_hour_budget),
-            "news": Budget(cfg.news_per_hour_budget),
-            "add_review": Budget(cfg.add_review_per_hour_budget),
+        #
+        # ⚠️ 多品种时必须**按品种**给出更小的池子：预算是"本进程自设的
+        #    滚动小时上限"，不是厂商配额。单品种时 60/小时恰好等于
+        #    "60 秒一轮 × 60 分钟"，已 100% 用满（实测每小时成功 64~75 次）。
+        #    若 5 个品种共用这 60，每品种只有 12 次/小时 = 每 5 轮 1 次评审，
+        #    LLM 是市价开仓的确认环节，拿不到压力位就无法开仓
+        #    （llm_no_levels）→ 等于把 5 个品种都变哑。
+        #    故 runner 传入 `CFG.risk.per_symbol_budgets(n)` 平分的池子。
+        caps = budgets or {
+            "review": cfg.per_hour_budget,
+            "news": cfg.news_per_hour_budget,
+            "add_review": cfg.add_review_per_hour_budget,
         }
+        self.budgets: dict[str, Budget] = {
+            k: Budget(v) for k, v in caps.items()}
         self._session: aiohttp.ClientSession | None = None
 
     def _budget(self, kind: str) -> Budget:
