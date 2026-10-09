@@ -22,13 +22,40 @@
 ```
 fetch (每轮, 30s TTL 缓存) → 分级打标(规则) →
   LLM-B 快评(与 LLM-A 并发, 独立超时): {sentiment, impact, note, headline_directions} →
-  作为**独立贝叶斯证据项**并入融合 + 高危事件表(非农/CPI/FOMC)
+  高危事件表(非农/CPI/FOMC) + 方向冲突闸(见 §2 表格) + 落盘可测量
 ```
 
-**新闻分进入融合的方式**：`fuse_all(..., news_score=...)`，
-作为一路证据参与加权。⚠️ 它同样受 P0-1 约束 ——
-新闻分也要过 `SourceNormalizer` 去均值，否则"长期看多黄金的新闻基调"
-会变成又一个结构性偏置源。
+**新闻分不进入融合**（⚠️ 本节曾写"作为一路证据参与加权"，已过时）：
+`fuse_all` 的 `news_score` 参数是**已废弃的兼容参数** —— news 无实测 IR，
+按 `fusion/weights.py` 的硬规则权重为 0，会被 `gaussian.fuse` 标为 excluded
+并排除出加权。实测：`news_score` 取 0 / +1.5 / -1.5，融合分恒为 `+1.438195`，
+即那次重融合是**纯空操作**（`graph.py` 里的调用点已注释掉）。
+锁住该语义的测试：`test_fusion_replay.py::test_news_score_no_longer_changes_fusion`。
+
+news 的真实权力边界（**用户 2026-10-09 修订**）：
+
+| 影响度 | 行为 |
+|---|---|
+| `≥ news_impact_block`（0.7）**且与开仓方向冲突** | 不开新仓（等事件过去） |
+| `≥ news_impact_block` 且与开仓方向一致 | **放行**（不再一律拦） |
+| `≥ news_impact_reduce`（0.4） | 新仓手数 × `news_impact_lot_mult` |
+| `≥ news_impact_close`（0.8）且与持仓反向 | 平仓评估 |
+
+用户原话：
+
+> 我觉得新闻事件可以提供做单方向 而不是停止开仓
+
+即 news 拿到**方向上的否决权**（冲突才拦），但仍**不驱动开仓** ——
+信号本身 |z| 必须先过 `z_min`，否则新闻无权开仓
+（`machine.sentiment_direction` 只做情绪→方向映射，不产生分数）。
+
+⚠️ **可测量性**：新闻结论原先**从未落盘**（`news_*.jsonl` 只有
+`{"event":"fetched","count":150}`，LLM 日志只记 `parsed_keys`），
+导致"新闻方向准不准"无法回溯。现已由
+`orchestrator._log_news_verdict` 写入 `sentiment`/`impact`/`headline_directions`
+分布；`research/27_news_direction.py` 负责测量前瞻命中率与 t 值。
+⚠️ 金十 `search_flash` **只返回当前快讯、无历史窗口**，故新闻**无法回溯补测**，
+只能等实盘积累 assessment 后测量（当前样本为 0，不可结论）。
 
 ## 3. 高危事件行为
 

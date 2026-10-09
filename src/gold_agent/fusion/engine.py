@@ -500,7 +500,9 @@ class FusionEngine:
         #    实测：news_score 0 → +1.5 → -1.5，融合分恒为 +1.438195。
         #
         # 现在 news 走「独立证据」通道，权力边界明确：
-        #   · `decision.machine.news_impact` ：影响度 >= news_impact_block → 不开新仓
+        #   · `decision.machine.news_impact` ：影响度 >= news_impact_block
+        #     **且与开仓方向冲突** → 不开新仓（方向一致则放行；
+        #     用户 2026-10-09：新闻应提供做单方向，而不是停止开仓）
         #   · `risk.gate._news_impact`       ：影响度 >= news_impact_reduce → 手数降级
         # 它因此**不再出现在 per_source**（不是加权源），这是正确的：
         # 它从来没有投票权，写进逐源明细只会让人误以为它有。

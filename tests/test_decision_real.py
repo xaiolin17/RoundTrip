@@ -220,20 +220,72 @@ def test_hold_round_shows_reason_on_console():
     assert "?" not in out, out
 
 
-def test_news_event_blocks_new_position():
-    """news「独立证据」通道：重大事件 → 不开新仓。
+def test_news_event_blocks_only_when_conflicting():
+    """news「独立证据」通道：**只在与开仓方向冲突时**拦，一致就放行。
 
-    用户选定的定位：news 无实测 IR（不得投方向票），但它是有时效性的
-    外部风险信息，应当影响"要不要开"。影响度 >= news_impact_block 时 hold。
+    用户 2026-10-09 原话：
+    > 我觉得新闻事件可以提供做单方向 而不是停止开仓
+
+    选定语义：新闻拿到方向上的**否决权**（冲突才拦），但不驱动开仓。
+    旧行为是"影响度够大就一律不开"，用户明确反对。
     """
     e = DecisionEngine(RiskGate(CircuitBreakers()))
+    # 信号做多（ABOVE） + 利空新闻 → 冲突 → 拦
     llm = {"review": {"verdict": "neutral", "confidence": 0.2},
            "news_assessment": {"sentiment": "bearish", "impact": 0.95}}
     p = e.decide(_ctx(score=ABOVE, llm=llm))
-    assert p.kind == "hold", f"重大事件应拦住开仓，实际 {p.kind}"
-    assert any("新闻事件影响度" in r for r in p.reasons), p.reasons
+    assert p.kind == "hold", f"新闻与方向冲突应拦住开仓，实际 {p.kind}"
+    assert any("冲突" in r for r in p.reasons), p.reasons
     # 理由必须是中文情绪，不得漏出英文枚举
     assert any("利空" in r for r in p.reasons), p.reasons
+
+
+def test_news_aligned_with_signal_does_not_block():
+    """新闻方向与信号**一致**时必须放行（这是用户本次要求的核心）。
+
+    旧行为下利多新闻 + 做多信号一样被拦（"影响度 >= 0.7 → 等事件过去"），
+    用户认为这是把新闻当成了停牌开关，而不是方向信息。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    llm = {"review": {"verdict": "neutral", "confidence": 0.2},
+           "news_assessment": {"sentiment": "bullish", "impact": 0.95}}
+    p = e.decide(_ctx(score=ABOVE, llm=llm))
+    assert p.kind != "hold", f"新闻与信号一致不应拦截，实际 {p.kind}"
+    assert not any("冲突" in r for r in p.reasons), p.reasons
+
+
+def test_news_neutral_high_impact_does_not_block():
+    """中性新闻没有方向，不得参与冲突判定（不能因"影响度大"就拦）。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    llm = {"review": {"verdict": "neutral", "confidence": 0.2},
+           "news_assessment": {"sentiment": "neutral", "impact": 0.95}}
+    p = e.decide(_ctx(score=ABOVE, llm=llm))
+    assert p.kind != "hold", f"中性新闻不应拦截，实际 {p.kind}"
+
+
+def test_news_conflict_is_symmetric_for_shorts():
+    """做空信号 + 利多新闻 → 冲突 → 拦（方向对称，不得只判做多）。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    llm = {"review": {"verdict": "neutral", "confidence": 0.2},
+           "news_assessment": {"sentiment": "bullish", "impact": 0.95}}
+    p = e.decide(_ctx(score=-ABOVE, llm=llm))
+    assert p.kind == "hold", f"做空遇利多新闻应拦，实际 {p.kind}"
+    assert any("冲突" in r for r in p.reasons), p.reasons
+
+
+def test_news_never_opens_a_position_by_itself():
+    """新闻**不得**凭方向凭空开仓（它没有融合分，也无实测 IR）。
+
+    信号本身不够强（|z| < z_min）时，即使新闻方向明确、影响度很高，
+    也必须 hold —— 否则就是把未验证的信号当成了方向票。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    llm = {"review": {"verdict": "neutral", "confidence": 0.2},
+           "news_assessment": {"sentiment": "bullish", "impact": 1.0}}
+    p = e.decide(_ctx(score=0.0, llm=llm))
+    assert p.kind == "hold", f"信号不足时新闻不得驱动开仓，实际 {p.kind}"
+    assert not any("冲突" in r for r in p.reasons), \
+        "信号本就不够，不应报成新闻冲突"
 
 
 def test_news_low_impact_does_not_block():

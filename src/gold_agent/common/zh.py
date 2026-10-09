@@ -71,7 +71,9 @@ REGIME_LABELS: dict[str, str] = {
 }
 
 #: 新闻情绪 → 中文（LLM `news_assessment.sentiment`）。
-#: news 走「独立证据」通道：不投方向票，只作事件风险闸。
+#: news 走「独立证据」通道：不投方向票（不进融合分），但持有方向否决权 ——
+#: 用户 2026-10-09 要求「新闻提供做单方向而不是停止开仓」，
+#: 故与开仓方向**冲突**时才拦，一致则放行。
 SENTIMENT_LABELS: dict[str, str] = {
     "bullish": "利多",
     "bearish": "利空",

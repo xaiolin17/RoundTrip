@@ -163,8 +163,10 @@ def news_impact(ctx: "DecisionContext") -> tuple[float, str]:
     排除），LLM 拿到情绪后触发的那次重融合实测融合分一字不变
     （news_score 0 → +1.5 → -1.5，融合分恒为 +1.438195），是空操作。
 
-    所以：**news 不影响方向，只影响要不要开、开多大** —— 这是它作为
-    「未验证但有时效性的外部信息」应有的权力边界。
+    所以：**news 不影响融合分，但持有方向上的否决权** —— 用户 2026-10-09
+    明确要求"新闻事件可以提供做单方向 而不是停止开仓"，故 `_decide_flat`
+    只在新闻情绪与信号方向**冲突**时拦，方向一致则放行。它仍然**不能**
+    凭方向自己开仓（无实测 IR，不得投票，也不得替代融合分过 z_min）。
     """
     na = ((ctx.llm or {}).get("news_assessment") or {})
     try:
@@ -173,6 +175,23 @@ def news_impact(ctx: "DecisionContext") -> tuple[float, str]:
         impact = 0.0
     impact = max(0.0, min(1.0, impact))
     return impact, str(na.get("sentiment") or "")
+
+
+def sentiment_direction(sentiment: str | None) -> str:
+    """新闻情绪 → 交易方向；无法判断时返回空串。
+
+    用户 2026-10-09：
+    > 我觉得新闻事件可以提供做单方向 而不是停止开仓
+
+    利多 → 做多（LONG），利空 → 做空（SHORT），中性/未知 → 无方向（""）。
+    返回空串表示"这条新闻不该参与方向判断"（不得当成中性来放行或拦截）。
+    """
+    s = (sentiment or "").strip().lower()
+    if s == "bullish":
+        return "LONG"
+    if s == "bearish":
+        return "SHORT"
+    return ""
 
 
 class DecisionEngine:
@@ -319,14 +338,24 @@ class DecisionEngine:
         if ctx.news.high_risk_window:
             return Proposal(kind="hold", reasons=["新闻高危窗口"])
 
-        # ---- news「独立证据」通道：重大事件 → 不开新仓 ----
-        # 不影响方向（news 无实测 IR，不得投票），只做事件风险闸。
+        # ---- news「独立证据」通道：重大事件 → 按**方向冲突**决定是否开仓 ----
+        # 用户 2026-10-09 原话：
+        #   > 我觉得新闻事件可以提供做单方向 而不是停止开仓
+        # 选定语义（与用户确认）：**只在与开仓方向冲突时拦，一致就放行**。
+        # 即新闻拿到方向上的"否决权"，但不能反过来凭空驱动开仓 ——
+        # 它仍不参与融合分（news 无实测 IR，不得投票，见 news_impact docstring）。
         imp, senti = news_impact(ctx)
-        if imp >= CFG.decision.news_impact_block:
-            return Proposal(kind="hold",
-                            reasons=[f"新闻事件影响度 {imp:.2f} >= "
-                                     f"{CFG.decision.news_impact_block}"
-                                     f"（{sentiment_label(senti)}）→ 等事件过去"])
+        news_dir = sentiment_direction(senti)
+        if abs(z) >= z_min and news_dir and imp >= CFG.decision.news_impact_block:
+            # 只有在**信号本身就够开仓**（|z| 已过阈值）时，新闻冲突才拦。
+            # 这样"新闻一致"必然放行，不会出现"新闻说多、系统却因 z 不够而不开"
+            # 这种把新闻当方向驱动的副作用。
+            this_dir = "LONG" if z > 0 else "SHORT"
+            if news_dir != this_dir:
+                return Proposal(kind="hold", reasons=[
+                    f"新闻与开仓方向冲突：新闻{sentiment_label(senti)}"
+                    f"（影响度 {imp:.2f}）看{direction_label(news_dir)}，"
+                    f"信号看{direction_label(this_dir)} → 等事件过去"])
 
         # ---- P1-2 波动 regime 闸（唯一不依赖方向预测的杠杆）----
         vol_pct = getattr(ctx.ev.result, "vol_percentile", 0.5)

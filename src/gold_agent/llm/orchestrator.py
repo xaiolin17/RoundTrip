@@ -42,7 +42,7 @@ import asyncio
 import time
 
 from gold_agent.common.config import CFG
-from gold_agent.common.logging_util import llm_log
+from gold_agent.common.logging_util import llm_log, news_log
 from gold_agent.fusion.engine import FusedEvidence
 from gold_agent.llm.client import NEWS_SCHEMA, REVIEW_SCHEMA, RunningHubClient
 from gold_agent.news.collector import NewsView
@@ -484,11 +484,44 @@ class Orchestrator:
                 if k == "review":
                     self._last_review_at = time.time()
                     self.review_calls += 1
+                elif k == "news_assessment":
+                    # ⚠️ 必须把**结论本身**落盘，不能只记 parsed_keys。
+                    #    原先 news 日志只有 `{"event":"fetched","count":150}` 与
+                    #    LLM 的 `parsed_keys`，**结论从未被持久化** —— 于是
+                    #    "新闻方向到底准不准"无法回溯测量（用户 2026-10-09
+                    #    要求新闻提供做单方向，必须先能量化它）。
+                    self._log_news_verdict(v)
             else:
                 if k == "review":
                     self.review_failures += 1
                 llm_log({"event": f"{k}_failed", "error": str(v)})
         return out
+
+    @staticmethod
+    def _log_news_verdict(v: dict) -> None:
+        """把新闻评估的结论落到 news 日志（供事后测量方向命中率）。
+
+        只记结构化字段，**不记原始快讯全文**（避免日志膨胀；快讯可在
+        collector 侧复现）。字段名保持英文以便机器解析。
+        """
+        try:
+            impact = float(v.get("impact") or 0.0)
+        except (TypeError, ValueError):
+            impact = 0.0
+        hd = v.get("headline_directions")
+        if not isinstance(hd, list):
+            hd = []
+        # 各方向条数分布（用于判断"新闻是否其实很分歧"）
+        dist: dict[str, int] = {}
+        for x in hd:
+            key = str(x)
+            dist[key] = dist.get(key, 0) + 1
+        news_log({"event": "assessment",
+                  "sentiment": str(v.get("sentiment") or ""),
+                  "impact": round(max(0.0, min(1.0, impact)), 4),
+                  "n_headlines": len(hd),
+                  "headline_directions": dist,
+                  "note": str(v.get("note") or "")[:200]})
 
     # ---------- 加仓复核（用户 2026-10-08 指定） ----------
     async def review_add_layer(self, direction: str, entry: float, sl: float,
