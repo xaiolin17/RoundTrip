@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -44,6 +45,10 @@ TF_SECONDS = {"1m": 60, "2m": 120, "5m": 300, "10m": 600, "15m": 900, "30m": 180
               "1h": 3600, "4h": 14400, "8h": 28800, "1d": 86400}
 
 _COLUMNS = ["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
+
+#: 串行化 `mt5.initialize()` —— 它是**进程级全局**操作，多品种并发初始化
+#: 会互相打断（见 `_initialize_sync` 的注释）。
+_INIT_LOCK = threading.Lock()
 
 
 @dataclass
@@ -143,12 +148,31 @@ class AccountInfo:
 
 
 class MT5Client:
-    """线程安全包装：行情可并行，交易串行。"""
+    """线程安全包装：行情可并行，交易串行。
 
-    def __init__(self) -> None:
+    ⚠️ `symbol` 是**本实例负责的品种**。多品种时每个品种一个实例，
+    所有行情/持仓查询都必须用这个字段，**不能**退回 `CFG.mt5.symbol`。
+
+    事故记录（2026-10-09，多品种试点时发现）：本类的 `get_ohlcv`、
+    `_positions_sync`、`_validate` 都写死 `CFG.mt5.symbol`，而
+    `MT5Client` 当时**没有 symbol 字段**。于是 5 个品种的 Graph
+    虽然各有正确的品种档案，却全部去拉 **XAUUSDm** 的 K 线 ——
+    实测 5 个品种的收盘价完全相同（都是 4175.704），融合分也只差
+    0.001（+0.1729 ~ +0.1756）。这类错误的危险在于**不报错**：
+    每个品种都"正常工作"、都在产出信号，只是所有信号都是黄金的。
+    若不是我在多品种实跑后顺手核对收盘价，会一直不被发现。
+    """
+
+    def __init__(self, symbol: str | None = None) -> None:
+        #: 本实例负责的品种（None = 用 `CFG.mt5.symbol`，单品种兼容）
+        self.symbol = symbol
         self._io_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mt5-io")
         self._trade_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5-trade")
         self._connected = False
+
+    def _sym(self) -> str:
+        """本实例的品种（None 时退回配置默认值）。"""
+        return self.symbol or CFG.mt5.symbol
 
     # ---------- 连接 ----------
     async def initialize(self) -> None:
@@ -164,10 +188,18 @@ class MT5Client:
             kwargs.update(login=cfg.login, password=cfg.password, server=cfg.server)
         if mt5 is None:
             raise Mt5Error("MetaTrader5 package not installed")
-        if not mt5.initialize(**kwargs):
-            raise Mt5Error(f"initialize failed: {mt5.last_error()}")
-        if not mt5.symbol_select(cfg.symbol, True):
-            raise Mt5Error(f"symbol_select({cfg.symbol}) failed: {mt5.last_error()}")
+        # ⚠️ `mt5.initialize()` 与 `symbol_select()` 是**进程级全局**操作，
+        #    而多品种下每个品种一个 `MT5Client`、并发初始化。
+        #    用类级锁串行化，避免并发 initialize 互相打断
+        #    （实测并发下单/读取都安全，但初始化不是）。
+        with _INIT_LOCK:
+            if not mt5.initialize(**kwargs):
+                raise Mt5Error(f"initialize failed: {mt5.last_error()}")
+            # 选入本实例的品种（不是配置里的默认品种）——
+            # 不选入 Market Watch 的话 `copy_rates_from_pos` 返回 None。
+            sym = self._sym()
+            if not mt5.symbol_select(sym, True):
+                raise Mt5Error(f"symbol_select({sym}) failed: {mt5.last_error()}")
 
     async def doctor(self) -> dict:
         """启动自检（docs/01 §1），返回结构化报告。"""
@@ -190,7 +222,7 @@ class MT5Client:
             {"login": ai.login, "balance": ai.balance, "equity": ai.equity,
              "currency": ai.currency, "leverage": ai.leverage} if ai else "account_info None"
         )
-        si = mt5.symbol_info(CFG.mt5.symbol)
+        si = mt5.symbol_info(self._sym())
         report["checks"]["symbol"] = (
             {"name": si.name, "visible": si.visible, "point": si.point,
              "digits": si.digits, "volume_min": si.volume_min, "volume_step": si.volume_step,
@@ -202,16 +234,20 @@ class MT5Client:
         return report
 
     def symbol_info(self, symbol: str | None = None):
-        """symbol_info。多品种下按品种取 —— `symbol=None` 时用默认品种。"""
-        return mt5.symbol_info(symbol or CFG.mt5.symbol)
+        """symbol_info。多品种下按品种取 —— 缺省用本实例的品种。"""
+        return mt5.symbol_info(symbol or self._sym())
 
     # ---------- 行情 ----------
-    async def get_ohlcv(self, bars_per_tf: int | None = None) -> OHLCVBundle:
-        """并发拉取全部周期（线程池 IO）；未连接时自动 initialize。"""
+    async def get_ohlcv(self, bars_per_tf: int | None = None,
+                        symbol: str | None = None) -> OHLCVBundle:
+        """并发拉取全部周期（线程池 IO）；未连接时自动 initialize。
+
+        `symbol` 缺省用本实例的品种（多品种时每个 Graph 各取自己的）。
+        """
         await self.initialize()
         n = bars_per_tf or CFG.mt5.bars_per_tf
         loop = asyncio.get_running_loop()
-        sym = CFG.mt5.symbol
+        sym = symbol or self._sym()
         futures = {
             tf: loop.run_in_executor(self._io_pool, self._copy_rates_sync, sym, tf_code, n)
             for tf, tf_code in TF_MAP.items()
@@ -219,7 +255,7 @@ class MT5Client:
         results = await asyncio.gather(*futures.values())
         frames = dict(zip(futures.keys(), results))
         tick = await loop.run_in_executor(self._io_pool, self._tick_sync, sym)
-        return self._validate(frames, tick)
+        return self._validate(frames, tick, symbol=sym)
 
     def get_ohlcv_sync(self, bars_per_tf: int | None = None) -> OHLCVBundle | None:
         """同步拉取全部周期 —— 仅供**启动预热**使用（在事件循环启动前调用）。
@@ -234,11 +270,11 @@ class MT5Client:
             n = bars_per_tf or max(
                 CFG.mt5.bars_per_tf,
                 CFG.fusion.prime_steps + CFG.fusion.norm_min_periods + 50)
-            sym = CFG.mt5.symbol
+            sym = self._sym()
             frames = {tf: self._copy_rates_sync(sym, code, n)
                       for tf, code in TF_MAP.items()}
             tick = self._tick_sync(sym)
-            return self._validate(frames, tick)
+            return self._validate(frames, tick, symbol=sym)
         except Exception:
             return None
 
@@ -257,7 +293,7 @@ class MT5Client:
         spread = int(t.ask - t.bid) if t.ask and t.bid else 0
         return TickSnapshot(bid=t.bid, ask=t.ask, last=t.last, spread_points=spread, time=t.time)
 
-    def _validate(self, frames: dict, tick) -> OHLCVBundle:
+    def _validate(self, frames: dict, tick, symbol: str | None = None) -> OHLCVBundle:
         quality: dict[str, str] = {}
         cleaned: dict[str, pd.DataFrame] = {}
         for tf, df in frames.items():
@@ -277,7 +313,7 @@ class MT5Client:
             cleaned[tf] = df
         if not cleaned:
             raise Mt5Error("all timeframes failed quality gate")
-        return OHLCVBundle(symbol=CFG.mt5.symbol, fetched_at=time.time(),
+        return OHLCVBundle(symbol=symbol or self._sym(), fetched_at=time.time(),
                            frames=cleaned, tick=tick, quality=quality)
 
     # ---------- 持仓 ----------
@@ -286,7 +322,13 @@ class MT5Client:
         return await asyncio.get_running_loop().run_in_executor(self._io_pool, self._positions_sync)
 
     def _positions_sync(self) -> PositionsView:
-        sym = CFG.mt5.symbol
+        # ⚠️ 必须用本实例的品种：多品种下若写死默认品种，每个 Graph 都会
+        #    看到**黄金**的持仓，进而按自己的 magic 过滤出空列表 ——
+        #    于是各品种都以为"我没有持仓"，可以无限开仓，且看不到
+        #    总手数占用（`_used_lots` 恒为 0）、无法加仓/平仓。
+        #    `mt5.positions_get(symbol=None)` 返回**全部**品种，
+        #    而按 magic 过滤是后续逻辑，故这里按品种收窄是正确做法。
+        sym = self._sym()
         positions = []
         for p in mt5.positions_get(symbol=sym) or []:
             positions.append(PositionRow(

@@ -238,6 +238,152 @@ def test_per_lot_risk_is_symbol_independent(sym):
             f"{sym}: 单边改动的偏差应为 {expect} 倍"
 
 
+def test_mt5_client_is_symbol_bound():
+    """⚠️ 真实构建：每个 Graph 的 MT5Client 必须**绑定自己的品种**。
+
+    这是 2026-10-09 多品种试点时发现的**真实事故**：
+    `MT5Client` 当时没有任何 symbol 字段，`get_ohlcv` / `_positions_sync`
+    / `_validate` 全部写死 `CFG.mt5.symbol`。于是 5 个 Graph 各有正确的
+    品种档案，却全部去拉 **XAUUSDm** 的 K 线与持仓。
+
+    实测证据：5 个品种的收盘价**完全相同**（都是 4175.704），
+    融合分只差 0.001（+0.1729 ~ +0.1756）。
+
+    危险在于**不报错**：每个品种都"正常工作"、都在产出信号，
+    只是所有信号都是黄金的。持仓侧更严重 —— 每个品种都按自己的 magic
+    去过滤黄金的持仓，滤出空列表，于是都以为"我没有持仓"，
+    可以无限开仓、看不到已用总手数、无法加仓或平仓。
+    """
+    from gold_agent.agent.graph import Graph
+
+    seen = {}
+    for sym in ("XAUUSDm", "BTCUSDm", "USOILm", "EURUSDm", "USDJPYm"):
+        g = Graph.build(sym)
+        seen[sym] = g.client.symbol
+        # 客户端绑定的品种必须与档案一致
+        assert g.client.symbol == sym, \
+            f"{sym}: MT5Client 绑定了 {g.client.symbol!r}，会拉错品种的行情"
+        # account 是全局的，但 positions/ohlcv 必须按品种
+        assert g.client._sym() == sym
+
+    assert len(set(seen.values())) == 5, \
+        f"多个 Graph 共用了同一个品种的客户端：{seen}"
+
+
+def test_mt5_client_symbol_info_uses_own_symbol():
+    """`symbol_info()` 缺省时必须用本实例品种，不是配置默认品种。"""
+    from gold_agent.mt5.client import MT5Client
+
+    c = MT5Client(symbol="EURUSDm")
+    assert c._sym() == "EURUSDm"
+    c2 = MT5Client()                      # 不传 -> 退回配置默认
+    assert c2._sym() == CFG.mt5.symbol == "XAUUSDm"
+
+
+def test_client_has_no_hardcoded_default_symbol_in_queries():
+    """⚠️ 静态检查：行情/持仓查询里不得残留写死的默认品种。
+
+    这是防回归的**源码级**断言 —— 上述事故的根因就是三处写死
+    `CFG.mt5.symbol`，而当时没有任何测试覆盖"客户端是否绑定品种"。
+    用函数体源码检查，比只跑行为测试更能防止后人改回去。
+    """
+    import inspect
+
+    from gold_agent.mt5 import client as C
+
+    for fn in (C.MT5Client.get_ohlcv, C.MT5Client._positions_sync,
+               C.MT5Client.get_ohlcv_sync, C.MT5Client._validate,
+               C.MT5Client._doctor_sync):
+        src = inspect.getsource(fn)
+        assert "CFG.mt5.symbol" not in src, (
+            f"{fn.__name__} 里仍写死 CFG.mt5.symbol —— "
+            f"多品种下会拉错品种（见 test_mt5_client_is_symbol_bound）")
+        assert ("self._sym()" in src or "self.symbol" in src
+                or "symbol" in src), \
+            f"{fn.__name__} 看起来没有使用本实例的品种"
+
+
+def test_mt5_client_init_is_serialized():
+    """⚠️ `mt5.initialize()` 是进程级全局操作，多品种并发初始化必须串行。
+
+    不串行的话多个 Client 同时 initialize 会互相打断。
+    """
+    import threading as _th
+
+    from gold_agent.mt5 import client as C
+
+    assert isinstance(C._INIT_LOCK, type(_th.Lock())), \
+        "缺少 _INIT_LOCK，多品种并发初始化未串行化"
+
+
+def test_multi_symbol_rounds_have_distinct_prices():
+    """⚠️ 端到端：5 个品种实跑一轮，收盘价必须**互不相同**。
+
+    这条是"数据串台"的最终防线。若各品种拿到同一份行情，
+    收盘价会完全相同 —— 单看任何一个品种都察觉不到。
+    """
+    import asyncio
+    import os
+
+    os.environ["TRADE_SYMBOLS"] = "XAUUSDm,BTCUSDm,USOILm,EURUSDm,USDJPYm"
+    try:
+        from gold_agent.agent.graph import Graph
+
+        syms = ("XAUUSDm", "BTCUSDm", "USOILm", "EURUSDm", "USDJPYm")
+
+        async def run():
+            graphs = {s: Graph.build(s) for s in syms}
+            for g in graphs.values():
+                try:
+                    await g.client.initialize()
+                except Exception:
+                    pass
+            res = await asyncio.gather(
+                *[g.run_round(1) for g in graphs.values()],
+                return_exceptions=True)
+            closes = {}
+            for s, r in zip(syms, res):
+                if not isinstance(r, Exception):
+                    closes[s] = r.get("last_close")
+            for g in graphs.values():
+                try:
+                    await g.close()
+                except Exception:
+                    pass
+            return closes
+
+        closes = asyncio.run(run())
+        got = {k: v for k, v in closes.items() if v is not None}
+        if len(got) < 2:
+            pytest.skip(f"实盘数据不足，无法比对：{closes}")
+        assert len(set(got.values())) == len(got), (
+            f"有品种拿到相同收盘价（数据串台）: {got}")
+    finally:
+        os.environ.pop("TRADE_SYMBOLS", None)
+
+
+def test_used_lots_filters_by_own_magic():
+    """`_used_lots` 只统计本品种 magic 的持仓（多品种下不能跨品种求和）。"""
+    from gold_agent.agent.graph import Graph
+
+    g = Graph.build("BTCUSDm")
+    mine = g.profile.magic
+    other = get_profile("XAUUSDm").magic
+    assert mine != other
+
+    class _P:
+        def __init__(self, magic, vol):
+            self.magic = magic
+            self.volume = vol
+
+    class _Pos:
+        positions = [_P(mine, 0.10), _P(other, 9.99)]
+
+    got = g._used_lots(_Pos())
+    assert got == pytest.approx(0.10), \
+        f"_used_lots 把别的品种也算进来了：{got}"
+
+
 def test_position_lots_is_symbol_consistent_with_broker_specs(monkeypatch):
     """⚠️ 真实调用 `position_lots`：手数换算必须与品种无关。
 

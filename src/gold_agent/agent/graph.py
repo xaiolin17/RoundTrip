@@ -87,7 +87,10 @@ class Graph:
         prof = get_profile(symbol or CFG.mt5.symbol)
         sym = prof.broker_symbol
         sdir = CFG.state_path_for(sym)
-        client = MT5Client()
+        # ⚠️ 必须把品种传给 client：否则本类的 get_ohlcv/_positions_sync
+        #    会退回配置里的默认品种，5 个 Graph 全部去拉黄金的行情与持仓
+        #    （实测 5 品种收盘价完全相同、都是 4175.704）。
+        client = MT5Client(symbol=sym)
         executor = Executor(client)
         mobius = MobiusClient()
         news = Jin10Collector(symbol=sym)
@@ -234,7 +237,11 @@ class Graph:
             else:
                 mob_tfs, mob_sym = (), None
                 log_warn(f"{_prof.label} 无 SMC 数据源，本品种只融合缠论/本地指标")
-            cl_tasks = {tf: asyncio.to_thread(analyze_tf, st["bundle"].frames[tf], tf)
+            # ⚠️ 传入本品种名：`df` 来自各自的 bundle（数据本身已按品种隔离），
+            #    但 symbol 会进缠论内部记录，传错会让日志/自检里出现别的品种名。
+            cl_tasks = {tf: asyncio.to_thread(
+                            analyze_tf, st["bundle"].frames[tf], tf,
+                            _prof.mobius_symbol)
                         for tf in ("1m", "5m", "15m", "1h", "4h")}
             mob_tasks = {
                 tf: asyncio.create_task(
