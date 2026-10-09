@@ -100,7 +100,6 @@ point_value_per_lot = tick_value * (point / tick_size)
 | USOILm | `commodity:futures` | `WTIUSD` | **仅 1h 1d** |
 | EURUSDm | `forex:spot` | `EURUSD` | **仅 1h 1d** |
 | USDJPYm | `forex:spot` | `USDJPY` | **仅 1h 1d** |
-
 两个容易搞错的地方（已实测确认）：
 - 油**不在** `commodity:spot`（该 venue 只有 `XAUUSD` 一个品种，实测 404）。
   油在 `commodity:futures`，名字是 `WTIUSD`。
@@ -214,6 +213,41 @@ LLM 是市价开仓的确认环节，不可用时拿不到压力位就无法开�
 | 价格被拒绝 / 重复提交 | `digits` 是否与券商一致（§3.1） |
 | 组合回撤已很大但没停 | `portfolio_drawdown_halt_pct`；各品种状态是否隔离 |
 | 日志分不清品种 | `symbol` 字段（多品种下每条都有） |
+| **各品种信号几乎一样** | ⚠️ 数据串台 —— 见下面的事故记录 |
+
+### 事故：各品种全都在用黄金的行情（2026-10-09）
+
+开通多品种后实跑一轮，**5 个品种的收盘价完全相同**：
+
+```
+品种        收盘价      融合分
+XAUUSDm     4175.704    -0.29143
+BTCUSDm     4175.704    -0.29163     <- 比特币报价 4175？不可能
+EURUSDm     4175.704    -0.29033     <- 欧元报价 4175？不可能
+```
+
+根因：`MT5Client` **没有任何 symbol 字段**，其 4 处查询
+（`get_ohlcv` / `get_ohlcv_sync` / `_positions_sync` / `_validate`）
+全部写死 `CFG.mt5.symbol`。`Graph.build` 建的是无参 `MT5Client()`，
+于是 5 个 Graph 各有正确的档案，却共用同一个数据源。
+
+**危险在于完全不报错**：每个品种都"正常工作"、都产出信号，
+只是所有信号都是黄金的。持仓侧更糟 —— 每个品种都去读黄金的持仓
+再按自己的 magic 过滤 → 滤出空列表 → 每个品种都以为"我没有持仓"，
+可以无限开仓、总手数闸恒为 0、无法加仓或平仓。
+
+> **教训**：前面的测试覆盖了档案、点值、magic、venue、状态隔离，
+> 但**没有一条断言"客户端绑定了正确品种"** —— 它们验证的是
+> "参数是否被正确传递"，而这一环是"参数根本没被传递"。
+> 所以新增了 `test_client_has_no_hardcoded_default_symbol_in_queries`
+> （**源码级**静态断言，行为测试抓不到这类遗漏）
+> 与 `test_multi_symbol_rounds_have_distinct_prices`
+> （端到端：收盘价必须互不相同）。
+> **"跑通不报错"不等于"跑对"** —— 开多品种后请核对各品种报价是否合理。
+
+顺带修复：`mt5.initialize()` 是进程级全局操作，多品种并发初始化会互相
+打断，已加模块级 `_INIT_LOCK` 串行化；`symbol_select` 改为选入本实例
+品种（不选入 Market Watch 会让 `copy_rates_from_pos` 返回 None）。
 
 ## 8. 未做 / 已知限制
 
