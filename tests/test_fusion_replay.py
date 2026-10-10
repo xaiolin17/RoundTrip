@@ -78,7 +78,8 @@ def _mobius_stub(df_15m: pd.DataFrame, last_price: float) -> MobiusResult:
 
     research/18 §P0-3 要求补上这个桩 —— 否则测试覆盖不到实际主导决策的源。
     注意：真实 Mobius API 无历史回放，因此这里只验证**打分与去偏机制**，
-    不代表线上 mobius 的真实表现（其权重因此恒为 0，见 weights.py）。
+    不代表线上 mobius 的真实表现（其离线 skill 不可采信，weights.py 只给它
+    中庸先验（`PRIOR_ONLY_WEIGHT`）、由贝叶斯层在线调节；见 `PRIOR_ONLY_SOURCES`）。
     """
     high = df_15m["high"].to_numpy(float)
     low = df_15m["low"].to_numpy(float)
@@ -122,7 +123,9 @@ def _plumbing_engine() -> FusionEngine:
     数字，等于把伪造的先验从源码搬到测试里，故一并去掉。
 
     现在用**等权先验**（`skill=0` → `lambda=0`），与生产当前状态一致：
-    三个可测源各得 `W_SCALE`，`openmobius_smc` 结构性不可测 → 0。
+    三个已实测源各得 `W_SCALE`；`openmobius_smc` 无离线历史（桩 skill 不可信）
+    → 走 `PRIOR_ONLY_SOURCES`，只拿**中庸先验** `PRIOR_ONLY_WEIGHT`（0.1），
+    由贝叶斯层在线调节——它有权重但小到几乎不稀释融合分。
     生产权重由 `data/source_ir.json` 经 DL 收缩得到，
     由 `test_production_weight_table_can_trade` 覆盖。
     """
@@ -133,7 +136,8 @@ def _plumbing_engine() -> FusionEngine:
             basis="equal_prior",
             source_script="测试夹具（合成，非校准结果）")
     tbl.sources["openmobius_smc"] = SourceIR(
-        "openmobius_smc", ir=0.0, measurable=False,
+        "openmobius_smc", ir=0.0, measurable=True, skill=0.0,
+        basis="prior_only",
         source_script="research/21_source_ir.py（离线桩，无历史回放）")
     tbl._refresh_weights()
     return FusionEngine(weight_table=tbl)
@@ -213,8 +217,10 @@ def test_production_weight_table_can_trade():
         对生产配置的硬性要求。
 
     真正要守住的不变量（与策略无关，收缩模型下依然成立）：
-      **未验证的源（openmobius_smc）拿不到权重。**
-      且系统必须**可交易**（σ ≤ sigma_max）—— 一个不交易的交易系统是失败状态。
+      **没有离线历史的源（openmobius_smc）不得进入实测排序**
+      （`w_measured` 恒为 0），只能拿**中庸先验**（`PRIOR_ONLY_WEIGHT`）、
+      由贝叶斯层在线调节；且系统必须**可交易**（σ ≤ sigma_max）——
+      一个不交易的交易系统是失败状态。
 
     ⚠️ **第三次修正（2026-09-29 晚，用户指出前两次都留下了死代码）**：
     用户原话「要恢复交易 但是有合理的处理方式吗 不能放一个没有作用的
@@ -257,9 +263,13 @@ def test_production_weight_table_can_trade():
         assert s.w_final == pytest.approx(expect), (
             f"{name}: 最终权重必须等于收缩式 lambda*实测+(1-lambda)*先验")
 
-    # ---- (3) 不可测的源必须是 0（硬规则未被放松）----
-    assert tbl.weight("openmobius_smc") == 0.0, (
-        "openmobius_smc 无历史回放（分数来自离线桩）→ 结构性不可测 → 0 权重")
+    # ---- (3) 无离线历史的源拿中庸先验（不是 0），但不进入实测排序 ----
+    ob = tbl.get("openmobius_smc")
+    assert ob.weight > 0, (
+        "openmobius_smc 无离线历史回放（桩 skill 不可采信）→ 走 PRIOR_ONLY："
+        "拿中庸先验权重、由贝叶斯层在线调节；不应是 0 权重")
+    assert ob.w_measured == 0.0 and ob.basis == "prior_only", (
+        "openmobius_smc 不得进入实测排序：w_measured 必须为 0，basis=prior_only")
 
     # ---- (4) 每个拿到权重的可测源都必须有出处 ----
     for name in DECISION_SOURCES:
@@ -415,8 +425,10 @@ def test_unmeasurable_source_gets_zero_weight():
     用它当准入条件会让权重全 0、系统永不开仓。
 
     现在 0 权重的唯一依据是 **`measurable=False`**：
-    数据源本身没有历史数据可校准（`openmobius_smc` 的离线桩，
-    Mobius API 无历史回放）。这是事实判断，与显著性无关。
+    该源无方向加权资格（如 `news` 走独立证据通道，从不参与方向加权）。
+    注意：`openmobius_smc` **不再是**这类源 —— 它无离线历史但有实盘分数，
+    走 `PRIOR_ONLY_SOURCES`（measurable=True、只拿中庸先验）。
+    这是事实判断，与显著性无关。
     """
     tbl = WeightTable(trials=1)
     tbl.sources["measurable_src"] = SourceIR("measurable_src", ir=0.3, nw_t=3.0,
@@ -558,18 +570,20 @@ def test_mobius_aggregate_no_longer_shrinks_when_tf_missing():
     assert not (-2.0 <= old <= -0.5), "旧口径超出输入尺度 -> 量纲错误"
 
 
-def test_mobius_weight_zero_means_value_change_is_decision_neutral():
-    """安全前提：mobius 权重恒为 0，所以改它的分数不影响融合结果。
+def test_mobius_is_now_weighted_so_caliber_changes_need_ab():
+    """openmobius 已从"恒 0 权重"转为「中庸先验 + 在线调节」的活源。
 
-    这是**先改 mobius、暂不改 chanlun** 的唯一理由：mobius 未被验证
-    （`data/source_ir.json`：verified=false、tier=rejected），权重 0，
-    它的分数只被记录、不参与加权和。chanlun 权重 4.0 是活源，改它的
-    聚合口径会移动融合分分布与历史阈值标定，必须单独评估。
+    历史：mobius 的聚合口径（`MB_TF_WEIGHTS` / `_mobius_score`）曾在其权重恒为 0
+    时先改，理由是"改它的分数不影响融合结果"。**该前提已不成立**：
+    `weights.py::PRIOR_ONLY_SOURCES` 让 openmobius 拿中庸先验权重并进入贝叶斯
+    命中率池，改动它的聚合口径会移动融合分分布与历史阈值标定 —— 必须做 A/B 回放。
+
+    本测试锁住这个事实，防止再按旧前提"顺手改"它。
     """
     from gold_agent.fusion.engine import MB_TF_WEIGHTS
 
     assert MB_TF_WEIGHTS["1m"] == 0.0
-    # 记录在案：mobius 的 IR 未验证 -> 权重必须为 0，直到有真实历史校准
+    # 记录在案：openmobius 有非零权重，但权重来自**中庸先验**、不是实测 skill。
     import json
     import pathlib
     p = pathlib.Path(__file__).resolve().parents[1] / "data" / "source_ir.json"
@@ -578,8 +592,13 @@ def test_mobius_weight_zero_means_value_change_is_decision_neutral():
         m = (d.get("sources") or {}).get("openmobius_smc")
         if m is not None:
             assert m.get("verified") is False, (
-                "若 mobius 已被验证并取得非零权重，则本测试的前提失效，"
-                "改变其聚合口径前必须做 A/B 回放")
+                "openmobius 的权重必须来自中庸先验、而非实测 skill："
+                "一旦 verified=true 说明有了真实历史校准，需重新评估本测试")
+            assert m.get("measurable") is True, (
+                "openmobius 必须 measurable=true（拿中庸先验、进贝叶斯池）；"
+                "若为 false 会退回 0 权重，则「改它分数无影响」的旧前提重新成立")
+            assert float(m.get("skill", 0.0)) == 0.0, (
+                "openmobius 的离线桩 skill 不可采信，必须为 0")
 
 
 def test_all_weighted_mobius_timeframes_are_supported():
@@ -1362,21 +1381,27 @@ def test_shrinkage_endpoints_are_both_live():
     assert hi.weight("kalman_persist") < lo.weight("kalman_persist")
 
 
-def test_unmeasurable_source_never_gets_weight():
-    """结构性不可测的源（无历史回放）恒为 0 —— 与显著性判定**无关**。
+def test_prior_only_source_ignores_file_skill():
+    """无离线历史的源不采信文件里的 skill —— 只拿中庸先验。
 
     关键区分：`verified=False` 只说明"这个样本量下测不出显著技能"
-    （三个真实源都是这个状态，但它们是**可测**的）；而
-    `openmobius_smc` 的分数来自离线桩 `_mobius_synthetic_scores`
-    （Mobius API 无历史回放）→ **根本测不了**。把两者混为一谈，
-    就会让权重全 0、系统永不开仓 —— 正是被修掉的缺陷。
+    （三个真实源都是这个状态，但它们是**可测**的）；而 openmobius_smc 的
+    离线分数来自桩 `_mobius_synthetic_scores`（Mobius API 无历史回放）→
+    **没有离线历史可校准**，桩的 skill 不可采信。
+
+    所以即便文件把它写成 skill=9.99（全场最高），它也必须：
+      · `w_measured = 0`（不进入 DL 实测排序，不抢强源权重）
+      · `basis = "prior_only"`，只拿中庸先验 `(1−lambda_eff)·PRIOR_ONLY_WEIGHT`
+      · 且**不影响**其它真实源按实测 skill 排序
     """
     import json
     import tempfile
     from pathlib import Path as _P
 
+    from gold_agent.fusion.weights import PRIOR_ONLY_WEIGHT
+
     payload = {"trials": 6, "sources": {
-        # 即使文件声称它 measurable 且 skill 最高，也必须被强制 0
+        # 即使文件声称它 measurable 且 skill 最高，桩 skill 也必须被忽略
         "openmobius_smc": {"ir": 0.9, "nw_t": 5.0, "n_obs": 5000,
                            "measurable": True, "skill": 9.99,
                            "source_script": "stub.py"},
@@ -1388,9 +1413,16 @@ def test_unmeasurable_source_never_gets_weight():
         p = _P(td) / "source_ir.json"
         p.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         tbl = WeightTable.load(p)
-        assert tbl.weight("openmobius_smc") == 0.0, (
-            "无历史回放的源必须 0 权重，即使文件里 skill 最高")
+        ob = tbl.get("openmobius_smc")
+        assert ob.w_measured == 0.0, (
+            "无离线历史的源不得进入实测排序：桩 skill=9.99 必须被忽略")
+        assert ob.basis == "prior_only"
+        assert ob.weight == pytest.approx(PRIOR_ONLY_WEIGHT), (
+            "它仍拿中庸先验权重（PRIOR_ONLY_WEIGHT）并进入贝叶斯池（不是 0）；"
+            "桩 skill=9.99 不得把它抬成满额")
         assert tbl.weight("chanlun") > 0, "可测源不受影响，仍应有权重"
+        assert tbl.get("chanlun").w_measured > 0, (
+            "openmobius 不参与 DL 排序，不得把真实源的实测权重挤掉")
 
 
 def test_missing_file_gives_equal_prior_not_fabricated_ir():
@@ -1406,7 +1438,7 @@ def test_missing_file_gives_equal_prior_not_fabricated_ir():
     import tempfile
     from pathlib import Path as _P
 
-    from gold_agent.fusion.weights import W_SCALE
+    from gold_agent.fusion.weights import PRIOR_ONLY_WEIGHT, W_SCALE
 
     with tempfile.TemporaryDirectory() as td:
         tbl = WeightTable.load(_P(td) / "nope.json")
@@ -1415,7 +1447,9 @@ def test_missing_file_gives_equal_prior_not_fabricated_ir():
                 f"{n}: 无校准文件时应拿等权先验")
             assert tbl.get(n).basis == "equal_prior", (
                 "必须标成 equal_prior，与实测值区分开")
-        assert tbl.weight("openmobius_smc") == 0.0
+        assert tbl.weight("openmobius_smc") == pytest.approx(PRIOR_ONLY_WEIGHT), (
+            "无离线历史的源拿中庸先验（PRIOR_ONLY_WEIGHT，不是 0、也不是满额），"
+            "由贝叶斯层在线调节")
         # 关键：不得再有任何手填 IR 冒充实测
         for s in tbl.sources.values():
             assert s.ir == 0.0, "无实测依据时不得编造 IR 数字"
@@ -1440,7 +1474,7 @@ def test_old_format_file_falls_back_to_equal_prior():
     import tempfile
     from pathlib import Path as _P
 
-    from gold_agent.fusion.weights import W_SCALE
+    from gold_agent.fusion.weights import PRIOR_ONLY_WEIGHT, W_SCALE
 
     payload = {"trials": 6, "sources": {
         # 旧格式：没有 measurable 字段，且 verified=false（正是真实文件的样子）
@@ -1455,7 +1489,8 @@ def test_old_format_file_falls_back_to_equal_prior():
             assert tbl.weight(n) == pytest.approx(W_SCALE), (
                 f"{n}: 旧格式文件不得因 verified=false 被打成 0 权重"
                 f"（那是把「不显著」误读成「不可测」）")
-        assert tbl.weight("openmobius_smc") == 0.0
+        assert tbl.weight("openmobius_smc") == pytest.approx(PRIOR_ONLY_WEIGHT), (
+            "旧格式退化为先验时，无离线历史的源拿中庸先验（不是 0）")
 
 
 def test_weight_logs_are_gbk_encodable():
@@ -1573,5 +1608,5 @@ def test_shrinkage_replaces_the_policy_switch():
 
     # 取而代之的是收缩端点，且确实是"权重"不是"开关"
     assert hasattr(W, "LAMBDA_CALIBRATED")
-    assert hasattr(W, "NO_HISTORY_SOURCES")
-    assert "openmobius_smc" in W.NO_HISTORY_SOURCES
+    assert hasattr(W, "PRIOR_ONLY_SOURCES")
+    assert "openmobius_smc" in W.PRIOR_ONLY_SOURCES

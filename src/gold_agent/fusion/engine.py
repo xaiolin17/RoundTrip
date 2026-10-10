@@ -295,7 +295,16 @@ class FusionEngine:
         self.bayes = BayesianPool(state_path=self._state_file("bayes_state.json"))
         self.kalman = KalmanTrend()
         # P0-2：权重来自实测 IR 文件；文件缺失 → 全 0（未验证不得参与方向决策）
-        self.weights = weight_table or WeightTable.load()
+        # ⚠️ 源 IR 必须**按品种**取：各品种的源技能排序不同（黄金的趋势性
+        #    与欧元的均值回归并非一回事），共用一份会把 A 品种的排序套到 B 品种。
+        #    优先 `data/<品种>/source_ir.json`，缺失回退共享表；单品种模式下
+        #    两者等价 → 行为与历史完全一致。
+        self.weights = weight_table or WeightTable.load_for_symbol(symbol)
+        # 在线权重驱动：把 `PRIOR_ONLY` 源（openmobius_smc）的权重接上贝叶斯池
+        # 的实盘滚动命中率（用户 2026-10-10 选定）。权重层只认这个最小接口，
+        # 不 import 贝叶斯模块。绑定后立刻刷一次，让冷启动即拿到当前命中率。
+        self.weights.online_provider = self._online_hit_rate
+        self.weights.refresh_online()
         # P0-1：按源滚动去均值
         self.normalizer = normalizer or SourceNormalizer(
             win=CFG.fusion.norm_window, min_periods=CFG.fusion.norm_min_periods)
@@ -316,6 +325,16 @@ class FusionEngine:
         那就完全违背了 P0-2 的硬规则。
         """
         return float(self.weights.weight(name))
+
+    def _online_hit_rate(self, name: str) -> tuple[float, int] | None:
+        """给权重层的在线命中率接口：`(滚动命中率, 样本量)`。
+
+        命中率取贝叶斯池的 Beta(1,1) 后验均值 `(命中+1)/(样本+2)`，
+        与 `BayesianPool.hit_rate()` 同源 —— 口径一致才不会出现"权重按这个数
+        涨、证据按那个数算"的分裂。`n < 20`（冷启动门槛）时权重层会自行
+        停在 `PRIOR_ONLY_WEIGHT`，此处照常返回真实样本量供审计。
+        """
+        return float(self.bayes.hit_rate(name)), int(self.bayes.sample_count(name))
 
     def _raw_scores_at(self, frames: dict[str, pd.DataFrame],
                        chanlun_results: dict[str, ChanlunResult] | None,
@@ -407,6 +426,11 @@ class FusionEngine:
         保留签名只为不破坏既有调用方，**它不再改变任何输出**。
         news 的现有权力在 decision 层（事件闸）与 risk 层（手数降级）。
         """
+        # 每轮开仓前按最新实盘命中率刷新 `PRIOR_ONLY` 源权重（openmobius_smc）。
+        # ⚠️ 放在构造 sources 之前：`_mk` 里的 `_weight_of()` 正是本轮实际采用的
+        #    权重，刷新必须早于它。本轮的 `record_feedback` 结果下轮生效 ——
+        #    与"命中率记账"同拍，不做同一轮内的先后穿插。
+        self.weights.refresh_online()
         ev = FusedEvidence(computed_at=time.time())
         ev.chanlun = chanlun_results
         ev.mobius = mobius_result
@@ -547,7 +571,12 @@ class FusionEngine:
         ev.weight_table = self.weights.describe(
             [s.name for s in sources])
         ev.weight_lambda = float(self.weights.lam)
-        ev.uncalibrated = bool(self.weights.lam < LAMBDA_CALIBRATED)
+        # ⚠️ "未校准"的判据不只是 lam < 阈值：lam 只反映源间**离散度**，
+        #    与实测值符号无关。当各源 skill 均非正时 w_measured 全为 0，
+        #    实测排序是空的（见 WeightTable.has_measured_ranking）—— 此时权重
+        #    实际退化为 (1−lam)×等权先验，与"未校准"等价，必须同样降仓。
+        ev.uncalibrated = bool(self.weights.lam < LAMBDA_CALIBRATED
+                               or not self.weights.has_measured_ranking)
         return ev
 
     # ---------- 波动分位 ----------

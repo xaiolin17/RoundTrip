@@ -37,6 +37,13 @@ IR 用 `nw_t / sqrt(N)` 表示每观测信息比率。
     py research/21_source_ir.py                  # 全量校准（60000 根 1m）
     py research/21_source_ir.py --bars 20000     # 快速模式
     py research/21_source_ir.py --write          # 写入 data/source_ir.json
+    py research/21_source_ir.py --symbol BTCUSDm --cost 12.5 --write
+                                                 # 按品种校准 → data/BTCUSDm/source_ir.json
+
+⚠️ 源 IR 是**按品种**的实测技能（黄金的趋势性 ≠ 欧元的均值回归），
+`fusion/weights.py` 按品种优先读 `data/<品种>/source_ir.json`，
+缺失才回退共享的 `data/source_ir.json`。故新品种必须逐个跑本脚本，
+不能用一份表套所有品种。
 """
 from __future__ import annotations
 
@@ -67,7 +74,8 @@ OUT: list[str] = []
 #: 试验族规模：本脚本评估的源/参数组合数。DSR 需要它，且必须显式记录。
 TRIALS = 6
 
-#: 成本（USD/oz，round-trip）。research/10_verify.py 的实测值。
+#: 成本（**价格单位**，round-trip）。research/10_verify.py 的实测值（黄金口径）。
+#: ⚠️ 各品种点值/点差不同，成本必须按品种实测：用 `--cost` 覆盖。
 COST = 0.520
 
 #: triple_barrier 的最长持有（1m 根数）。240 = 4 小时，与 1m 短线定位一致。
@@ -364,19 +372,41 @@ def evaluate(name: str, raw: np.ndarray, close: np.ndarray, horizon: int,
 
 
 def main() -> None:
+    global COST
     ap = argparse.ArgumentParser()
     ap.add_argument("--bars", type=int, default=60000, help="1m bar 数")
     ap.add_argument("--horizon", type=int, default=60, help="前瞻根数（1m）")
     ap.add_argument("--stride", type=int, default=120, help="chanlun 重算间隔")
-    ap.add_argument("--write", action="store_true", help="写入 data/source_ir.json")
+    ap.add_argument("--write", action="store_true",
+                    help="写入 IR 文件（默认 data/source_ir.json，"
+                         "给定 --symbol 时写 data/<品种>/source_ir.json）")
     #: 换一份 1m 数据文件（默认仍是历史基线用的那份）。
     #: 为什么需要：broker 的 1m 上限是 60000 根，实测窗口会随时间**向前滚动**
     #: （旧缓存 07-21..09-18，新拉 07-29..09-29）。两次拉取的**重叠区
     #: 51129 根逐字节一致**，所以可以合并成更长的序列来提高检验功效。
     #: 不默认换文件：历史结论必须能用原数据复现。
-    ap.add_argument("--data", default="XAUUSDm_1m.parquet",
-                    help="data/cache 下的 1m parquet 文件名")
+    ap.add_argument("--data", default=None,
+                    help="data/cache 下的 1m parquet 文件名（默认按 --symbol 推导）")
+    #: 按品种校准。源 IR 是**该品种**上实测的技能，各品种排序不同：
+    #: 共用一份会把 A 品种校准出的源排序套到 B 品种身上。
+    ap.add_argument("--symbol", default=None,
+                    help="按品种校准：写入 data/<品种>/source_ir.json，"
+                         "数据默认取 data/cache/<品种>_1m.parquet")
+    ap.add_argument("--cost", type=float, default=None,
+                    help="往返成本（**价格单位**）。各品种点值/点差不同，"
+                         "必须按品种实测，不能用黄金的 0.520")
     args = ap.parse_args()
+
+    if args.data is None:
+        args.data = f"{args.symbol}_1m.parquet" if args.symbol else "XAUUSDm_1m.parquet"
+    if args.cost is not None:
+        COST = float(args.cost)
+
+    # 输出位置：按品种 → data/<品种>/source_ir.json；否则共享 data/source_ir.json
+    ir_path = (ROOT / "data" / args.symbol / "source_ir.json") if args.symbol \
+        else IR_PATH
+    # 位移的单位标签：保持黄金基线的原文不变，其它品种不误标 USD
+    _unit = "USD" if not args.symbol else "报价单位"
 
     _src = DATA / args.data
     if not _src.exists():
@@ -391,9 +421,9 @@ def main() -> None:
     p("=" * 96)
     p("研究取证 21 · 信号源实测 IR 校准（research/18 P0-2 的数据来源）")
     p("=" * 96)
-    p(f"数据文件: {args.data}")
+    p(f"数据文件: {args.data}  品种: {args.symbol or '(共享/黄金基线)'}")
     p(f"1m {len(d)} 根  {d.time.iloc[0]} .. {d.time.iloc[-1]}  "
-      f"区间位移 {close[-1] - close[0]:+.1f} USD  成本={COST}  前瞻={args.horizon} 根")
+      f"区间位移 {close[-1] - close[0]:+.1f} {_unit}  成本={COST}  前瞻={args.horizon} 根")
 
     results: list[dict] = []
     t0 = time.time()
@@ -551,7 +581,9 @@ def main() -> None:
                         #    weights.py 里 DL 收缩估计量的输入。
                         #    它**不**单独决定谁拿权重：k 个源的 skill 一起
                         #    进 DerSimonian-Laird 分解，算出 lambda 后按
-                        #    `lambda·实测 + (1−lambda)·等权` 分配。
+                        #    `lambda·实测 + (1−lambda)·w_prior` 分配
+                        #    （普通源 w_prior=等权 W_SCALE；无离线历史的源
+                        #      w_prior=中庸先验 PRIOR_ONLY_WEIGHT）。
                         #    理由：本窗口 skill 为 −0.19/−0.35/+0.17，
                         #    Q=0.142 < df=2 → tau^2=0 → 数据分辨不出高下，
                         #    硬按 skill 排序就是拟合噪声。
@@ -561,8 +593,8 @@ def main() -> None:
                         "tb_long_ratio_ind": (float(np.mean(s_ind > 0))
                                               if m_ind_n else 0.0)})
     p("")
-    p(f"  零基准（全多头，同一价格路径）= {mu0:+.4f} USD/笔")
-    p(f"  止损基准 = 1.2 × 1h ATR（中位 {np.nanmedian(atr1h):.2f} USD），"
+    p(f"  零基准（全多头，同一价格路径）= {mu0:+.4f} {_unit}/笔")
+    p(f"  止损基准 = 1.2 × 1h ATR（中位 {np.nanmedian(atr1h):.2f} {_unit}），"
       f"成本/止损 = {COST / (1.2 * np.nanmedian(atr1h)):.1%}")
     p("")
     p("  ⚠️ 「去重叠(独立)」行才是真实显著性。信号在相邻 bar 重复会让")
@@ -655,8 +687,11 @@ def main() -> None:
     p("     `weights.py` 的 DerSimonian-Laird 收缩算出：")
     p("       skill_i = t_i − 方向匹配对照均值_i")
     p("       tau^2 = max(0, (Q − df)/C),  lambda = tau^2/(tau^2 + 1)")
-    p("       w_i = lambda·(skill_i/skill_max)^2·W_SCALE + (1−lambda)·W_SCALE")
-    p("     lambda = 0 → 源间差异不显著于噪声 → 等权（不拟合噪声）")
+    p("       w_i = lambda·(skill_i/skill_max)^2·W_SCALE + (1−lambda)·w_prior")
+    p("     其中普通源 w_prior = W_SCALE（等权）；openmobius_smc 这类无离线")
+    p("     历史的源以 PRIOR_ONLY_WEIGHT（0.1）为**下限**，其权重由实盘滚动")
+    p("     命中率在线驱动（区间 0.1 ~ PRIOR_ONLY_MAX_WEIGHT=4.0，见 weights.py）")
+    p("     lambda = 0 → 源间差异不显著于噪声 → 取先验（不拟合噪声）")
     p("     lambda → 1 → 差异确凿 → 完全采用实测排序")
     p("")
     verified = [r for r in results if r["verified"]]
@@ -704,19 +739,25 @@ def main() -> None:
         p("     —— 是**分辨不出来**，不是**测不出东西**。")
         p("")
         p("     后续行为（weights.py，**没有开关**，纯估计量）：")
-        p("       · 权重要么来自实测 skill、要么来自等权先验，两者始终按")
-        p("         `lambda` 混合，没有「用哪张表」的二选一。")
+        p("       · 权重的先验取法：普通源用等权先验 W_SCALE，无离线历史的源")
+        p("         （openmobius_smc）用中庸先验 PRIOR_ONLY_WEIGHT；两者再按")
+        p("         `lambda` 与实测 skill 混合，没有「用哪张表」的二选一。")
         p(f"       · 本窗口 skill = {_sk_txt}（上方逐源实测）")
         p(f"         → Q = {q:.4f} < df = {df} → tau^2 = 0 → lambda = 0")
-        p("         → **可测源等权**。这是数据给出的答案，不是兜底常数。")
+        p("         → **可测源取先验（普通源等权）**。这是数据给出的答案，不是兜底常数。")
         p("       · 判据是 Q 与 df 的比较，**不是**某个写死的数字：")
         p("         源间差异一旦真的超过抽样噪声（Q > df），lambda 自动 > 0，")
         p("         实测排序随即接管权重（见 research/25 §11.4 的可证伪性表）。")
-        p("       · 系统照常开仓（Σw = 12 → σ = 0.289 ≤ sigma_max 0.8），")
+        p("       · 系统照常开仓（冷启动 Σw = 3×4.0 + 0.1 = 12.1 → σ ≈ 0.287 ≤ sigma_max")
+        p("         0.8；该源成绩变好后 Σw 最高 16.0 → σ ≈ 0.25，仍过闸），")
         p("         但风险层按「未校准模式」降仓：低置信度 → 小仓位，")
         p("         而不是零交易（一个不交易的交易系统不是安全，是失败）。")
-        p("       · openmobius_smc 仍为 0 权重：不是「不显著」，而是")
-        p("         Mobius API **无历史回放**，离线桩的结果无法用于校准。")
+        p("       · openmobius_smc 的权重由**实盘滚动命中率在线驱动**（用户 2026-10-10")
+        p("         选定）：它没有离线历史可校准（Mobius API 无历史回放，桩技能不可")
+        p("         采信），故 skill 置 0 且不进 DL 方差分解；权重区间")
+        p("         [PRIOR_ONLY_WEIGHT=0.1, PRIOR_ONLY_MAX_WEIGHT=4.0]（下限=入场券，")
+        p("         上限=与满额源平权），命中率高且窗口满则逼近上限。")
+        p("         分数层另有贝叶斯证据按同一命中率同步调节。")
     p("")
     p("  ⚠️ 重要：**重叠会把噪声伪装成 alpha。**")
     p("     信号在相邻 bar 上重复（如 chanlun 的 15m 结果映射到 15 根 1m）")
@@ -740,25 +781,33 @@ def main() -> None:
             "horizon_bars_1m": args.horizon,
             "cost_usd": COST,
             "bars": int(len(d)),
-            "note": ("openmobius_smc 无历史回放（Mobius API 不提供），其分数来自"
-                     "离线桩，故 measurable=false → 权重恒为 0。其余源 measurable=true，"
-                     "权重由 weights.py 用 DL 收缩（lambda）在实测 skill 与等权先验"
-                     "之间连续混合，无开关。"),
+            "note": ("openmobius_smc 无历史回放（Mobius API 不提供），离线分数来自桩，"
+                     "桩技能不可采信，故 skill 强制为 0 且不进入 DL 方差分解；其权重由"
+                     "实盘滚动命中率在线驱动（区间 [PRIOR_ONLY_WEIGHT=0.1, "
+                     "PRIOR_ONLY_MAX_WEIGHT=4.0]，n<20 时为下限 0.1，命中率高且窗口满则"
+                     "逼近上限；measurable=true）。其余源 measurable=true，权重由 "
+                     "weights.py 用 DL 收缩（lambda）在实测 skill 与等权先验之间连续混合，"
+                     "无开关。"),
             "sources": {r["name"]: r for r in results},
         }
-        # openmobius 无历史回放 → 强制 verified=False + measurable=False
-        # （不因桩的偶然表现拿到权重；这是"测不了"，不是"不显著"）
+        # openmobius 无历史回放 → 桩的 skill 不可采信。
+        # 强制 verified=False + tier=rejected + skill=0，
+        # 但 measurable=True（权重下限 PRIOR_ONLY_WEIGHT=0.1，由实盘命中率在线驱动）——
+        # 这是"没有离线历史可校准"，不是"不显著"，也不是"无权重"。
         payload["sources"]["openmobius_smc"]["verified"] = False
         payload["sources"]["openmobius_smc"]["tier"] = "rejected"
-        payload["sources"]["openmobius_smc"]["measurable"] = False
-        IR_PATH.parent.mkdir(parents=True, exist_ok=True)
-        IR_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+        payload["sources"]["openmobius_smc"]["measurable"] = True
+        payload["sources"]["openmobius_smc"]["skill"] = 0.0
+        if args.symbol:
+            payload["symbol"] = args.symbol
+        ir_path.parent.mkdir(parents=True, exist_ok=True)
+        ir_path.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
                            encoding="utf-8")
-        p(f"\n✅ 已写入 {IR_PATH}")
+        p(f"\n✅ 已写入 {ir_path}")
         n_ok = sum(1 for r in results
                    if r["verified"] and r["name"] != "openmobius_smc")
         p(f"   其中 verified=True 的源: {n_ok} 个"
-          f"（openmobius_smc 恒为 false：无历史回放）")
+          f"（openmobius_smc 恒为 verified=false：桩技能不可采信）")
 
     # ⚠️ 输出文件名带上数据来源：历史上这里固定写 `21_source_ir.txt`，
     #    换数据重跑就会**静默覆盖**已有取证（本次实测踩到：扩展数据的

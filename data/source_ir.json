@@ -5,7 +5,7 @@
  "horizon_bars_1m": 60,
  "cost_usd": 0.52,
  "bars": 68871,
- "note": "openmobius_smc 无历史回放（Mobius API 不提供），其分数来自离线桩，故 measurable=false → 权重恒为 0。其余源 measurable=true，权重由 weights.py 用 DL 收缩（lambda）在实测 skill 与等权先验之间连续混合，无开关。",
+ "note": "openmobius_smc 无历史回放（Mobius API 不提供），离线分数来自桩，桩技能不可采信，故 skill 强制为 0 且不进入 DL 方差分解；其权重由实盘滚动命中率在线驱动（区间 [PRIOR_ONLY_WEIGHT=0.1, PRIOR_ONLY_MAX_WEIGHT=4.0]，n<20 时为下限 0.1，命中率高且窗口满则逼近上限；measurable=true）。其余源 measurable=true，权重由 weights.py 用 DL 收缩（lambda）在实测 skill 与等权先验之间连续混合，无开关。",
  "sources": {
   "kalman_persist": {
    "name": "kalman_persist",
@@ -168,8 +168,8 @@
    "cost_over_gross": null,
    "verified": false,
    "tier": "rejected",
-   "skill": 1.524879414312072,
-   "measurable": false,
+   "skill": 0.0,
+   "measurable": true,
    "source_script": "research/21_source_ir.py",
    "tb_n": 68134,
    "tb_gross": -0.5220517039950672,

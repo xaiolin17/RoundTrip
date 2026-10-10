@@ -290,10 +290,11 @@ def test_old_dict_value_backward_compat(state_dir):
 def test_legacy_pred_falls_back_to_fused_per_source(state_dir):
     """旧数据无 src 快照 -> 只给**有 IR 权重**的源退回融合分记账，不丢数据。
 
-    ⚠️ 兜底不能覆盖全部 DECISION_SOURCES：`news`/`openmobius_smc` 未验证、
-    IR 表权重为 0，一旦在本池攒够样本，`bayes.evidence()`（用池内权重，
-    非 IR 表权重）就会开始给它们产生证据 —— 违背 weights.py 的硬规则
-    "没有实测 IR 的源 = 0 权重"。兜底填的还是**别的源的方向**，更要守住。
+    ⚠️ 兜底不能覆盖全部 DECISION_SOURCES：`news` 走独立证据通道、IR 表权重为 0，
+    一旦在本池攒够样本，`bayes.evidence()`（用池内权重，非 IR 表权重）就会开始
+    给它产生证据 —— 违背 weights.py 的硬规则"没有实测 IR 的源 = 0 权重"。
+    （`openmobius_smc` 无离线历史但走 PRIOR_ONLY：有权重、可记账，
+    故这里只作 `news` 的前置断言。）兜底填的还是**别的源的方向**，更要守住。
     """
     from gold_agent.fusion.engine import FusionEngine
     from gold_agent.fusion.weights import DECISION_SOURCES
@@ -307,7 +308,7 @@ def test_legacy_pred_falls_back_to_fused_per_source(state_dir):
     engine = FusionEngine()          # 真实 IR 权重表
     weighted = [s for s in DECISION_SOURCES if engine.weights.weight(s) > 0]
     unweighted = [s for s in DECISION_SOURCES if engine.weights.weight(s) <= 0]
-    assert unweighted, "本用例前提：存在未验证/0 权重源（news、openmobius_smc）"
+    assert unweighted, "本用例前提：存在 0 权重源（news 走独立证据通道）"
 
     actual = 1                       # 平掉盈利多单 -> 价格上涨
     expected = {s: d["pred_sign"] for s in weighted}   # 旧数据兜底：用融合分
@@ -360,8 +361,8 @@ def test_legacy_fallback_filters_zero_weight_sources():
     src = open(G.__file__, encoding="utf-8").read()
     assert "self.fusion.weights.weight(s) > 0" in src, \
         ("旧数据兜底必须只喂有 IR 权重的源；"
-         "否则 news/openmobius_smc 攒够样本后会产生证据，"
-         "违背 weights.py '未验证源 = 0 权重' 的硬规则")
+         "否则 news（走独立证据通道、权重为 0）攒够样本后会产生证据，"
+         "违背 weights.py '不可测源 = 0 权重' 的硬规则")
 
 
 def test_missing_key_in_nonempty_snapshot_is_skipped(state_dir):
