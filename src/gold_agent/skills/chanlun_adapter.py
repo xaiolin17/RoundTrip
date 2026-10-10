@@ -411,7 +411,17 @@ def analyze_tf(df: pd.DataFrame, timeframe: str, symbol: str | None = None,
 
     # ---- 结构分（type_gate 未过则不给结构方向）----
     score = 0.0
-    if gate.type_gate:
+    # A5 口径：4h 无有效中枢时不给结构方向（视为「无观点/中性」）。
+    # 供应商引擎 `_structure_state` 在 `centers` 为空时会退化为
+    # 「用最后一笔的方向当作趋势」——单笔不构成趋势，这属于无观点，
+    # 不应据此给出 trend_up/trend_down 偏置。实测该退化分支：
+    # 黄金 4h 命中 0 次（对黄金零影响），USOILm 4h 命中 4 个方向窗口。
+    # 仅限 4h：用户口径即「4h 无观点不应给方向」；更长周期的结构性口径
+    # 不适用于更短周期（1h 及以下由回放检验，改动会破坏既有标定）。
+    no_center_opinion = (timeframe == "4h"
+                         and result.structure in ("trend_up", "trend_down")
+                         and not centers)
+    if gate.type_gate and not no_center_opinion:
         score = _STRUCTURE_SCORE.get(result.structure or "unknown", 0.0)
         # 突破方向细化
         if result.structure == "center_breakout" and result.center:
