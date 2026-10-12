@@ -197,6 +197,12 @@ class RiskConfig:
     #: 首仓止盈距离 = 结构计算值距离 × 本值（0.70 = 缩 30%），
     #: 止损距离 = 缩后止盈距离 / `min_rr`。设为 1.0 = 关闭缩放。
     first_tp_shrink: float = _TOML.get("risk", {}).get("first_tp_shrink", 0.7)
+    # 首仓/挂单确定性赔率下限（用户 2026-10-12 指定，阈值 0.8）：
+    # 定价完成后，实际赔率 tp_dist/sl_dist 低于本值 → 直接拒单
+    # （reason=f"rr_below_{本值}"）。**仅首仓**（is_add=False）生效；加仓路径
+    # 另有赔率联动。依据 research/30_first_entry_rr_floor.py（回放 305 笔首仓）。
+    first_entry_min_rr: float = _TOML.get("risk", {}).get(
+        "first_entry_min_rr", 0.8)
     # ---- 加仓专用定价（用户 2026-10-08 指定）----
     # 用户原话：
     #   > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.8

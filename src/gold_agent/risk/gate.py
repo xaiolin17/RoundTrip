@@ -108,7 +108,7 @@ class RiskGate:
         return trade_levels(direction, entry, llm_review, ev, atr,
                             tp_shrink=(CFG.risk.add_tp_shrink if add
                                        else CFG.risk.first_tp_shrink),
-                            frames=frames)
+                            frames=frames, is_add=add)
 
     def evaluate(self, prop: Proposal, ev: FusedEvidence, account: AccountInfo,
                  positions: PositionsView, point_value_per_lot: float,

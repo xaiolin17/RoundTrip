@@ -333,7 +333,8 @@ def trade_levels(direction: str, entry: float, review: dict | None,
                  ev=None, atr: float | None = None,
                  tp_shrink: float | None = None,
                  digits: int = 3,
-                 frames: dict | None = None) -> TradeLevels:
+                 frames: dict | None = None,
+                 is_add: bool = False) -> TradeLevels:
     """按 LLM 判断的压力位/支撑位算止损止盈。
 
     `digits`：该品种的价格小数位（`SymbolProfile.digits`）。
@@ -495,7 +496,8 @@ def trade_levels(direction: str, entry: float, review: dict | None,
         tp_shrink = CFG.risk.first_tp_shrink
     return _levels_from_tp(direction, entry, out, res_all, sup_all,
                            res, sup, s_res, s_sup, hint_tp, min_d,
-                           tp_shrink, digits, atr=atr, frames=frames)
+                           tp_shrink, digits, atr=atr, frames=frames,
+                           is_add=is_add)
 
 
 def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
@@ -505,7 +507,8 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
                     hint_tp: float | None, min_d: float,
                     tp_shrink: float, digits: int = 3,
                     atr: float | None = None,
-                    frames: dict | None = None) -> TradeLevels:
+                    frames: dict | None = None,
+                    is_add: bool = False) -> TradeLevels:
     """统一定价核心：**止盈缩水 + 止损优先锚定结构失效边界**。
 
     用户原话（首仓，2026-10-09）：
@@ -606,6 +609,24 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
             f"（止盈距离 {tp_dist:.3f} / 盈亏比 "
             f"{CFG.risk.min_rr} = 止损距离 {sl_dist:.3f}）"
             + (f"（原支撑位止损 {prev_sl} 已弃用）" if prev_sl else ""))
+
+    # ---- 3b. 加仓赔率联动（**仅加仓路径** `is_add=True`）----
+    # 事故（2026-10-12）：加仓手数按剩余额度固定推导（不走风险预算），止损又
+    # 锚定"远端结构失效边界"（实测距入场 30.7 点），而止盈被「缩 0.58 + 下限
+    # 0.5×ATR」压到 6.6 点 -> 赔率只剩 0.21 -> LLM 加仓复核以"风险收益严重
+    # 不成比例"连续拒绝 8 次，加仓阶梯沦为每轮空转。
+    # ⚠️ 只对**加仓**生效，首仓保持 research/29（回放 234 笔真实首仓）已验证的
+    #    口径"止损锚结构边界、止盈照常缩"：research/29 已证首仓扩止盈转差，
+    #    且 test_structure_real 明言首仓「止盈逻辑不变」。结构止损路径本身没有
+    #    `rr_from_tp` 那道 `rr_below_*` 下限（见下），故在此为加仓补上联动。
+    if is_add and out.sl_source == "struct_invalidation":
+        need_tp = sl_dist * CFG.risk.min_rr
+        if tp_dist < need_tp - 1e-9:
+            out.notes.append(
+                f"加仓结构止损 {sl_dist:.3f} 使赔率仅 {tp_dist / sl_dist:.2f}"
+                f" < 下限 {CFG.risk.min_rr} → 按盈亏比反推，止盈距离 "
+                f"{tp_dist:.3f} 外扩到 {need_tp:.3f}")
+            tp_dist = need_tp
     out.sl = round(entry - sl_dist if is_long else entry + sl_dist, digits)
 
     out.tp = round(entry + tp_dist if is_long else entry - tp_dist, digits)
@@ -621,6 +642,18 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
     if (out.sl_source == "rr_from_tp"
             and tp_dist < sl_dist * CFG.risk.min_rr - 1e-9):
         out.reason = f"rr_below_{CFG.risk.min_rr}"
+        return out
+    # ---- 3c. 首仓/挂单确定性赔率下限（硬闸，用户 2026-10-12 选定，阈值 0.8）----
+    # 事故（2026-10-12）：首仓 LONG 止损锚 15m 结构失效边界（距入场 30.724），
+    # 止盈被「缩 70% + 0.5×ATR 下限」托到 6.574 → 赔率仅 0.21 仍被放行开仓。
+    # 上面的 `rr_from_tp` 校验只覆盖回退路径，结构止损路径没有赔率下限，
+    # 故在此为首仓（is_add=False）补一道本地确定性赔率闸：低于阈值直接拒单。
+    # 与上面的 min_rr 校验同样用**未规整**距离比较（原因见上）。
+    # 依据 research/30_first_entry_rr_floor.py（回放 305 笔真实首仓，阈值 0.8
+    # 仅剔除那笔 0.21 坏单，保留 1.2 等确定性单与 1.2~1.8 正常区间）。
+    if ((not is_add)
+            and tp_dist < sl_dist * CFG.risk.first_entry_min_rr - 1e-9):
+        out.reason = f"rr_below_{CFG.risk.first_entry_min_rr}"
         return out
     out.sl_dist = round(abs(entry - out.sl), digits)
     out.tp_dist = round(abs(out.tp - entry), digits)
