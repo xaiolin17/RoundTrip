@@ -35,8 +35,8 @@ from gold_agent.risk.levels import (_levels, _nearest_above, _nearest_below,
                                     _structure_levels, trade_levels)
 from gold_agent.risk.structure import (RETRACE_FAR, RETRACE_NEAR, alternate_swings,
                                        band_of, find_swings, fractal_range,
-                                       last_leg, own_candidates, pick_leg,
-                                       pullback_entry)
+                                       invalidation_boundary, last_leg,
+                                       own_candidates, pick_leg, pullback_entry)
 
 
 class _CL:
@@ -660,3 +660,61 @@ def test_config_flags():
     assert "1m" in CFG.risk.pullback_tfs and "2m" in CFG.risk.pullback_tfs
     assert CFG.risk.pullback_min_leg_atr > 0
     assert CFG.risk.pullback_band_near < CFG.risk.pullback_band_far
+
+
+# ══════════════════════════════════════════════════════════════════
+# 六、任务A：止损改锚「结构失效边界」（research/29，用户 2026-10-10 指定）
+# ══════════════════════════════════════════════════════════════════
+def test_invalidation_boundary_picks_same_direction_leg():
+    """结构失效边界 = 最近一段**同向**走势的起点价。
+
+    做多取最近上行段的起点低点；做空取最近下行段的起点高点。
+    （`last_leg` 只给最后一段、方向可能不符；本函数往前找最近的同向段。）
+    """
+    # _ZZ_LONG 末段上行 10 -> 25，其起点低点 = 10.0
+    assert invalidation_boundary(_df_zz(_ZZ_LONG), "LONG") == pytest.approx(10.0)
+    # 做空：最近下行段 20 -> 10（在 _ZZ_LONG 里），起点高点 = 20.0
+    assert invalidation_boundary(_df_zz(_ZZ_LONG), "SHORT") == pytest.approx(20.0)
+    # _ZZ_SHORT 末段下行 20 -> 6，起点高点 = 20.0
+    assert invalidation_boundary(_df_zz(_ZZ_SHORT), "SHORT") == pytest.approx(20.0)
+    assert invalidation_boundary(_df_zz(_ZZ_SHORT), "LONG") == pytest.approx(10.0)
+
+
+def test_invalidation_boundary_none_when_too_few_bars():
+    """K 线不足 2k+1 根时返回 None（上游回退，不阻断开仓）。"""
+    assert invalidation_boundary(_df([1, 2, 3], [0, 1, 2]), "LONG") is None
+    assert invalidation_boundary(None, "LONG") is None
+
+
+def test_stop_anchors_struct_invalidation_when_15m_available():
+    """给了 15m 结构帧且边界在正确一侧 -> 止损锚定结构失效边界。"""
+    frames = {"15m": _df_zz(_ZZ_LONG)}
+    rev = {"support_levels": [12.0], "resistance_levels": [22.0]}
+    lv = trade_levels("LONG", 15.0, rev, None, atr=1.0, frames=frames)
+    assert lv.ok, lv.reason
+    assert lv.sl_source == "struct_invalidation", lv.sl_source
+    # 止盈逻辑不变：22 - 15 = 7，缩 70% -> 4.9
+    assert lv.tp == pytest.approx(15.0 + 7.0 * CFG.risk.first_tp_shrink, abs=0.01)
+    # 止损 = 边界 10.0 + 缓冲 0.5×ATR -> 距入场 5.5
+    assert lv.sl == pytest.approx(
+        15.0 - (abs(15.0 - 10.0) + CFG.risk.structure_sl_buffer_atr * 1.0), abs=0.01)
+    assert any("结构失效边界" in n for n in lv.notes), lv.notes
+
+
+def test_stop_falls_back_when_15m_frame_absent():
+    """只给 1m 帧（无 structure_tf）-> 回退 rr_from_tp，不阻断。"""
+    frames = {"1m": _df_zz(_ZZ_LONG)}
+    rev = {"support_levels": [12.0], "resistance_levels": [22.0]}
+    lv = trade_levels("LONG", 15.0, rev, None, atr=1.0, frames=frames)
+    assert lv.ok, lv.reason
+    assert lv.sl_source == "rr_from_tp", lv.sl_source
+
+
+def test_stop_falls_back_when_boundary_on_wrong_side():
+    """边界价在入场**错误一侧**（做多时边界 >= 入场）-> 回退 rr_from_tp。"""
+    frames = {"15m": _df_zz(_ZZ_LONG)}          # 边界 = 10.0
+    rev = {"support_levels": [5.0], "resistance_levels": [22.0]}
+    lv = trade_levels("LONG", 9.0, rev, None, atr=1.0, frames=frames)
+    assert lv.ok, lv.reason
+    assert lv.sl_source == "rr_from_tp", lv.sl_source
+

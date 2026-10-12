@@ -280,26 +280,11 @@ class FusedEvidence:
 
 class FusionEngine:
     def __init__(self, weight_table: WeightTable | None = None,
-                 normalizer: SourceNormalizer | None = None,
-                 symbol: str | None = None) -> None:
-        #: 本引擎负责的品种。多品种下**必须**每品种一个实例 ——
-        #: normalizer/vol_pct/baseline 都是**该品种**的分数分布与波动统计，
-        #: 共用一份会让 A 品种的分布污染 B 品种的 z-score（量纲/尺度不同），
-        #: 双方都判错强弱。状态文件也随之按品种分目录。
-        self.symbol = symbol
-        # ⚠️ bayes 也必须按品种分文件：它的命中统计是**该品种**的信号源
-        #    有效性（黄金的趋势性 vs 欧元的均值回归并不相同）。
-        #    共用一份会让各品种互相累加命中率、跨品种凑够 20 样本门槛、
-        #    并互相覆盖保存 —— 不报错，只是安静地用错统计量。
-        #    见 `BayesianPool` 的类文档。
-        self.bayes = BayesianPool(state_path=self._state_file("bayes_state.json"))
+                 normalizer: SourceNormalizer | None = None) -> None:
+        self.bayes = BayesianPool()
         self.kalman = KalmanTrend()
         # P0-2：权重来自实测 IR 文件；文件缺失 → 全 0（未验证不得参与方向决策）
-        # ⚠️ 源 IR 必须**按品种**取：各品种的源技能排序不同（黄金的趋势性
-        #    与欧元的均值回归并非一回事），共用一份会把 A 品种的排序套到 B 品种。
-        #    优先 `data/<品种>/source_ir.json`，缺失回退共享表；单品种模式下
-        #    两者等价 → 行为与历史完全一致。
-        self.weights = weight_table or WeightTable.load_for_symbol(symbol)
+        self.weights = weight_table or WeightTable.load()
         # 在线权重驱动：把 `PRIOR_ONLY` 源（openmobius_smc）的权重接上贝叶斯池
         # 的实盘滚动命中率（用户 2026-10-10 选定）。权重层只认这个最小接口，
         # 不 import 贝叶斯模块。绑定后立刻刷一次，让冷启动即拿到当前命中率。
@@ -720,23 +705,7 @@ class FusionEngine:
         return primed
 
     # ---------- 持久化（实盘重启保留预热） ----------
-    def _state_file(self, name: str):
-        """本实例的状态文件路径（多品种时在 `data/<品种>/` 下）。
-
-        ⚠️ 与 `state_path()` 的区别：本方法在 `__init__` 期间也可用
-        （`state_path()` 同样可用，但这里把"目录是否存在"也一并处理，
-        避免 bayes 在首次保存时因目录缺失而失败）。
-        """
-        d = CFG.state_path_for(self.symbol) if self.symbol else CFG.state_path.parent
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
-        return d / name
-
     def state_path(self, name: str):
-        if self.symbol:
-            return CFG.state_path_for(self.symbol) / name
         return CFG.state_path.parent / name
 
     def save_state(self) -> None:

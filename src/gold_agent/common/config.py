@@ -166,8 +166,11 @@ class RiskConfig:
     # 用户规则：每仓固定 0.01 手，同向最多加仓次数
     max_adds_per_position: int = _TOML.get("risk", {}).get("max_adds_per_position", 5)
     # ---- 首仓定价（用户 2026-10-09 指定）----
-    # 首仓止盈 = 结构计算值距离 × first_tp_shrink（0.70 = 缩 30%），
-    # 止损由**缩后的止盈距离**按 min_rr 反推（不再取自支撑位）。
+    # 首仓止盈 = 结构计算值距离 × first_tp_shrink（0.70 = 缩 30%）。
+    # 止损：**优先锚定结构失效边界**（structure.py::invalidation_boundary
+    # 在 structure_tf 上取最近一段同向走势的起点价，+ structure_sl_buffer_atr
+    # 的 ATR 缓冲，下限 structure_sl_min_atr×ATR）；无有效边界时回退
+    # 「由缩后的止盈距离按 min_rr 反推」。
     # ⚠️ 原先此处是 `market_tp_shrink=0.6` / `market_sl_shrink=0.65` 两个
     #    **零引用死配置**（全仓库无任何调用点，违反"不能放没有作用的死代码"）。
     #    本次把它们收敛成一个真正生效的键（定义在 min_rr 之后，见下）。
@@ -178,10 +181,17 @@ class RiskConfig:
     # 结构止损的**下限**宽度（×ATR）：防贴脸止损（实测 15m 笔只给 0.243）。
     # 在 levels.py:397 真实生效。上限/占比区间已删除，理由见上。
     structure_sl_min_atr: float = _TOML.get("risk", {}).get("structure_sl_min_atr", 0.5)
+    # 结构失效边界止损的**波动缓冲**（×ATR）：边界值 + 本缓冲作止损，
+    # 避免价格恰好扫到边界即被扫损（用户要求"真实波幅修正"）。
+    # 依据 research/29（R 口径回放 234 笔真实首仓）：K_VOL=0.5 时净R +0.183、
+    # tR +3.26 为最优；纯结构 K=0 亦为正（净R +0.183），故取 0.5。
+    structure_sl_buffer_atr: float = _TOML.get("risk", {}).get(
+        "structure_sl_buffer_atr", 0.5)
     # ---- 压力位/支撑位定价（用户要求：止损止盈看压力位，由 LLM 判断）----
-    # ⚠️ 2026-10-09 删除 `level_pad_atr`：新定价语义下止损由止盈按盈亏比
-    #    反推，不再锚定支撑位，"止损让开距离"失去作用对象（死配置）。
-    # 最小盈亏比：**同时**是"止盈距离 → 止损距离"的反推除数与赔率校验下限。
+    # ⚠️ 2026-10-09 删除 `level_pad_atr`：新定价语义下止损优先锚定结构失效
+    #    边界，无有效边界时才回退「由止盈按盈亏比反推」，都不再直接以支撑位
+    #    定止损，"止损让开距离"失去作用对象（死配置）。
+    # 最小盈亏比：**同时**是回退路径"止盈距离 → 止损距离"的反推除数与赔率校验下限。
     # 两者必须是同一个数，否则实际盈亏比与校验尺度不一致。
     min_rr: float = _TOML.get("risk", {}).get("min_rr", 1.8)
     #: 首仓止盈距离 = 结构计算值距离 × 本值（0.70 = 缩 30%），
@@ -191,8 +201,9 @@ class RiskConfig:
     # 用户原话：
     #   > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.8
     #   > 然后加仓的单子止盈点不能按照计算的数值来 要对应缩小42% 也就是原值的58%
-    # 语义：加仓先由结构位算出止盈目标，其**距离**缩到 add_tp_shrink 倍，
-    #       再由缩后的止盈距离按 min_rr 反推止损（止损不再取自支撑位）。
+    # 语义：加仓先由结构位算出止盈目标，其**距离**缩到 add_tp_shrink 倍；
+    #       止损同样优先锚定结构失效边界，无有效边界时由缩后的止盈距离
+    #       按 min_rr 反推（止损不再取自支撑位）。
     # 0.58 = 缩 42%。设为 1.0 即关闭缩放（退回"止盈不缩"的行为）。
     add_tp_shrink: float = _TOML.get("risk", {}).get("add_tp_shrink", 0.58)
     # 加仓定价后是否再让 LLM 复核这一单是否值得加（用户 2026-10-08 指定）：
@@ -287,42 +298,6 @@ class RiskConfig:
     #: 限价挂单有效期（小时）。原为 gate.py 硬编码 `4 * 3600` 秒。
     #: MT5 挂单到期即自动撤销，该值决定"挂单能等多久行情"。
     pending_expiry_h: float = _TOML.get("risk", {}).get("pending_expiry_h", 4.0)
-
-    # ---- 组合级（多品种）风险闸 ----
-    #
-    # ⚠️ 为什么必须单独加这一层：单品种时"每品种风控"就等于"账户风控"，
-    #    所以原设计里没有任何组合级概念。多品种后会出现这些**新风险**：
-    #
-    #    1. **风险预算被倍数放大**。每品种各自按 risk_pct(0.5%) 独立算手数，
-    #       5 个品种同时开仓 = 单次总风险 2.5%，而不是 0.5%。
-    #       品种间还可能高度相关（黄金/原油/欧元都受美元驱动），
-    #       实际等于**同一个方向下了 5 倍注**。
-    #    2. **熔断口径失效**。各品种的 `CircuitBreakers` 只看自己的盈亏，
-    #       组合整体回撤 12% 时，若各品种各自都没到 12%，就**无人熔断**。
-    #    3. **保证金集中**。`margin_use_cap` 是逐品种判断的，
-    #       多品种并发下单可能一起把可用保证金吃光。
-    #
-    #: 组合单次开仓总风险上限（占净值比例）。
-    #: 这是**所有品种同时开仓**时的总风险预算。
-    #: 默认 0.01 = 每品种 0.5% × 5 品种 ≈ 2.5% 会超限 → 会被按比例缩减。
-    #: ⚠️ 默认值取 0.01 而非 0.025：品种间相关性未知且可能很高，
-    #: "看起来分散"不等于真的分散（见上面第 1 点）。先从严。
-    portfolio_risk_cap: float = _TOML.get("risk", {}).get(
-        "portfolio_risk_cap", 0.01)
-    #: 组合总回撤熔断（占净值比例）。**独立于**各品种自己的回撤熔断 ——
-    #: 它看的是账户整体，防止"各品种各自未到线、合起来已巨亏"。
-    portfolio_drawdown_halt_pct: float = _TOML.get("risk", {}).get(
-        "portfolio_drawdown_halt_pct", 0.12)
-    #: 同向品种数上限。超过则**不开新仓**（不是按比例缩减）——
-    #: 因为同向高度集中本身就是"押注单一宏观方向"，缩仓只是减损、
-    #: 并不能降低"判断错就全错"的结构性风险。
-    #: 0 = 不限制。
-    portfolio_max_same_direction: int = _TOML.get("risk", {}).get(
-        "portfolio_max_same_direction", 3)
-    #: 组合总保证金占用上限（占净值比例）。逐品种的 margin_use_cap 之外
-    #: 再加一道账户级闸，防止多品种并发下单一起吃光保证金。
-    portfolio_margin_cap: float = _TOML.get("risk", {}).get(
-        "portfolio_margin_cap", 0.60)
 
 
 @dataclass
@@ -458,6 +433,15 @@ class DecisionConfig:
 class Config:
     trade_mode: str = os.getenv("TRADE_MODE", "live")          # live | dry_run
     max_lot: float = float(os.getenv("MAX_LOT", "0.01"))
+    #: 仓位/熔断计算的**基准净值下限**（USD）。0 或未设 = 用账户真实净值
+    #: （默认，行为不变）。设 >0 时取 `max(真实净值, 基准)`，即只把**小账户
+    #: 抬到基准口径**，绝不把大账户压下来。
+    #: 用途：100 真实账户按自身规模算不出最小手数
+    #: （名义预算 100×0.005=0.5 USD < 0.01 手实际风险约 20.8 USD → 拒绝开仓），
+    #: 设为 10000 后，100 账户与 10000 账户**逐笔一致**（首仓 0.01、上限 0.06）。
+    #: ⚠️ 风险：真实资金将按基准规模计算仓位与阈值，单笔亏损占真实资金的
+    #:    比例会被放大 —— 只应按用户明确的"100 当 10000 用"诉求开启。
+    sizing_equity_base: float = float(os.getenv("SIZING_EQUITY_BASE", "0") or 0)
     #: 加仓单层手数。原为 gate.py 里 6 处硬编码 0.01（含上限判定），
     #: 与 `MAX_LOT=0.06` 撞车导致 add_no 的 4/5 层永不可达（153 次空转）。
     add_layer_lots: float = float(os.getenv("ADD_LAYER_LOTS", "0.01"))
@@ -479,65 +463,6 @@ class Config:
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-
-    def per_symbol_budgets(self, n: int) -> dict:
-        """把 LLM 每小时预算按品种数**平分**（多品种时每品种一份）。
-
-        ⚠️ 为什么必须按品种分池：LLM 预算（`llm.per_hour_budget` 等）是
-        **本进程自设的滚动小时上限**，不是厂商配额 —— 用户的 API key
-        本身没有这个限制，这个数字纯粹用来防止代码疯狂调用烧钱。
-        单品种时 `per_hour_budget=60` 恰好等于"60 秒一轮 × 60 分钟 = 60 轮"，
-        已经 100% 用满（实测每小时成功 64~75 次，cap 60）。
-        若 5 个品种共用这 60，每品种只有 12 次/小时 = 每 5 轮 1 次评审。
-        LLM 是市价开仓的确认环节，它不可用时拿不到压力位而无法开仓
-        （`llm_no_levels`）→ 等于把 5 个品种都变哑。
-
-        实测依据（logs/llm_20261009.jsonl，1935 条）：news 曾与 review
-        共用池子，把 review 额度吃光使覆盖率跌到 4.3%，故各 kind 已独立成池；
-        多品种同理，每个品种也必须独立成池。
-
-        ⚠️ 每池下限 1：出现 0 会让该品种完全没有 LLM（永久哑火）。
-        """
-        n = max(1, int(n))
-        return {
-            "review": max(1, int(self.llm.per_hour_budget / n)),
-            "news": max(1, int(self.llm.news_per_hour_budget / n)),
-            "add_review": max(1, int(self.llm.add_review_per_hour_budget / n)),
-        }
-
-    # ---------- 多品种 ----------
-    #: 要交易的品种列表。默认**只有当前实盘品种**（`MT5_SYMBOL`），
-    #: 所以多品种改造对现有黄金行为**零影响** —— 这是刻意的：
-    #: 参数化本身不应改变任何运行结果，新增品种是独立的一步。
-    #: 用 `.env` 的 `TRADE_SYMBOLS=XAUUSDm,BTCUSDm` 切换。
-    @property
-    def trade_symbols(self) -> tuple[str, ...]:
-        raw = os.getenv("TRADE_SYMBOLS", "").strip()
-        if not raw:
-            return (self.mt5.symbol,)
-        return tuple(s.strip() for s in raw.split(",") if s.strip())
-
-    @property
-    def multi_symbol(self) -> bool:
-        """是否处于多品种模式（用于日志/摘要分支）。"""
-        return len(self.trade_symbols) > 1
-
-    def state_path_for(self, symbol: str) -> Path:
-        """按品种隔离的状态目录。
-
-        ⚠️ 为什么必须隔离：normalizer / score_baseline / vol_percentile /
-        bayes / breakers / trade_stats / position_adds 全是**统计状态**，
-        各自依附于该品种的分数分布与盈亏序列。多品种共用一份会让
-        A 品种的分数分布污染 B 品种的 z-score 归一化（尺度不同、
-        量纲不同），表现为双方都判错强弱。
-
-        单品种时**保持原路径不变**（`data/`），以便历史状态继续可用。
-        """
-        if not self.multi_symbol:
-            return Path(self.state_path.parent)
-        d = Path(self.state_path.parent) / symbol
-        d.mkdir(parents=True, exist_ok=True)
-        return d
 
 
 CFG = Config()

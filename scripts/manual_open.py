@@ -23,7 +23,8 @@ from gold_agent.mt5.executor import Executor, OrderPlan
 from gold_agent.skills.chanlun_adapter import analyze_tf
 from gold_agent.skills.mobius_adapter import MobiusClient
 from gold_agent.fusion.engine import FusionEngine
-from gold_agent.risk.position import CircuitBreakers, position_lots, volatility_k
+from gold_agent.risk.position import (
+    CircuitBreakers, position_lots, sizing_equity, volatility_k)
 
 
 async def main() -> None:
@@ -61,15 +62,16 @@ async def main() -> None:
 
     # --- 风控：完整仓位计算（0.01 手最小）---
     breakers = CircuitBreakers.load(CFG.state_path.parent / "breakers.json")
-    reject = breakers.check(acc.equity, acc.margin / max(acc.equity, 1e-9),
-                            high_risk_window=False)
+    base_eq = sizing_equity(acc.equity)   # 基准净值（SIZING_EQUITY_BASE，默认=真实净值）
+    reject = breakers.check(acc.equity, acc.margin,
+                            high_risk_window=False, base_equity=base_eq)
     if reject:
         print(f"风控熔断拦截: {reject}")
         return
     vol_k = volatility_k(ev.indicators.realized_vol_daily if ev.indicators else None, None)
     if ev.result.disagreement:
         vol_k *= 0.5
-    lots, rej = position_lots(acc.equity, atr, 1.0, 0.5, vol_k=vol_k)
+    lots, rej = position_lots(base_eq, atr, 1.0, 0.5, vol_k=vol_k)
     lots = max(0.01, lots) if not rej else 0.01   # 手动测试强制最小手数
     lots = round(lots, 2)
 

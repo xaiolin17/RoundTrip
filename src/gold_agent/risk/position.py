@@ -82,12 +82,16 @@ class CircuitBreakers:
         """
         return float(equity) - self.net_deposits
 
-    def _dd(self, equity: float) -> float:
-        """回撤比例 = (纯交易盈亏峰值 − 当前纯交易盈亏) / 当前净值。
+    def _dd(self, equity: float, base_equity: float | None = None) -> float:
+        """回撤比例 = (纯交易盈亏峰值 − 当前纯交易盈亏) / 基准净值。
 
-        分母用**当前净值**（账户实际规模）而非历史出入金：
+        分母用**基准净值**（`sizing_equity`：默认=当前净值，设了
+        `SIZING_EQUITY_BASE` 则取 max(净值, 基准) 即一个下限）。
         否则净出入金一旦为负，比例会失去意义（本账户净出入金 +425665，
         纯盈亏 -416079，相除得到荒谬的分母）。
+
+        ⚠️ 分子（纯盈亏曲线）**始终用真实净值**，不随基准改变 ——
+        否则出入金中性与真实盈亏会被改写。
 
         峰值**可以**是负数（锚定时账户已累计亏损）——故只判 `anchored`，
         不能判 `peak_pnl > 0`，否则永远返回 0 而静默失效。
@@ -97,12 +101,18 @@ class CircuitBreakers:
         loss = self.peak_pnl - self._pnl_now(equity)
         if loss <= 0.0:
             return 0.0
-        return loss / max(float(equity), 1e-9)
+        return loss / max(sizing_equity(equity, base_equity), 1e-9)
 
     def check(self, account_equity: float, margin_used: float,
-              high_risk_window: bool) -> str | None:
-        """返回 REJECT 原因；None = 允许开仓。"""
+              high_risk_window: bool, base_equity: float | None = None) -> str | None:
+        """返回 REJECT 原因；None = 允许开仓。
+
+        `base_equity`：仓位/阈值基准净值（见 `sizing_equity`）。None = 读
+        `CFG.sizing_equity_base`（默认 0 → 真实净值，行为不变）。
+        ⚠️ 只缩放**阈值分母**（日亏/回撤/保证金），纯盈亏曲线仍按真实净值。
+        """
         now = time.time()
+        sizing_eq = sizing_equity(account_equity, base_equity)
         today = time.strftime("%Y-%m-%d")
         if self.day_key and self.day_key != today:
             self.day_key = today
@@ -127,7 +137,7 @@ class CircuitBreakers:
             return f"cooloff_until {time.strftime('%H:%M', time.localtime(self.cooloff_until))}"
         if self.consecutive_losses >= CFG.risk.consecutive_loss_n:
             return f"consecutive_losses>={CFG.risk.consecutive_loss_n}"
-        if self.day_pnl <= -CFG.risk.daily_loss_stop_pct * account_equity:
+        if self.day_pnl <= -CFG.risk.daily_loss_stop_pct * sizing_eq:
             return "daily_loss_stop"
         # ---- 回撤熔断（基于**出入金中性**的纯交易盈亏曲线）----
         # 锚点只定一次。`peak_equity` 是历史净值峰值（旧状态文件里
@@ -144,10 +154,10 @@ class CircuitBreakers:
             log_info(f"回撤基准锚定：纯交易盈亏 {pnl_now:.2f}"
                      f"（净值 {account_equity:.2f} 减去净出入金 {self.net_deposits:.2f}）")
         self.peak_pnl = max(self.peak_pnl, pnl_now)
-        dd = self._dd(account_equity)
+        dd = self._dd(account_equity, base_equity)
         if dd >= CFG.risk.max_drawdown_halt_pct:
             return f"max_drawdown {dd:.1%}"
-        if margin_used > CFG.risk.margin_use_cap * account_equity:
+        if margin_used > CFG.risk.margin_use_cap * sizing_eq:
             return "margin_cap"
         if high_risk_window:
             return "news_high_risk_window"
@@ -200,8 +210,8 @@ class CircuitBreakers:
         longs = sum(1 for d in self.recent_directions if d > 0)
         return max(longs, n - longs) / n
 
-    def deleverage_k(self, account_equity: float) -> float:
-        dd = self._dd(account_equity)
+    def deleverage_k(self, account_equity: float, base_equity: float | None = None) -> float:
+        dd = self._dd(account_equity, base_equity)
         if dd >= CFG.risk.max_drawdown_halt_pct:
             return 0.0
         if dd >= CFG.risk.max_drawdown_deleverage_pct:
@@ -297,13 +307,31 @@ def conservative_win_rate(wins: int, n: int, fallback: float = 0.5,
     return wilson_lower(wins, n)
 
 
+def sizing_equity(account_equity: float, base: float | None = None) -> float:
+    """仓位/熔断计算的**基准净值**（真实净值与配置基准取大者）。
+
+    `CFG.sizing_equity_base`（`.env` 的 `SIZING_EQUITY_BASE`）>0 时作为**下限**：
+    返回 `max(真实净值, 基准)`；否则返回真实净值（默认口径，行为不变）。
+    `base` 形参可显式覆盖（测试用）；`base=None` 表示读配置。
+
+    为什么是**下限**而不是固定值：需求是"100 账户按 10000 口径开仓"，
+    只应把**小账户抬上去**，绝不能把**大账户压下来**。
+    若写成固定值，100 万的账户也会被压到 1 万口径（实测：定价类测试用
+    100 万账户，被压后手数预算从 5000 掉到 50 USD，误报
+    `risk_budget_below_min_lot`）。
+    """
+    b = CFG.sizing_equity_base if base is None else base
+    if b and b > 0:
+        return max(float(account_equity), float(b))
+    return float(account_equity)
+
+
 def position_lots(equity: float, atr: float, point_value_per_lot: float,
                   win_rate: float, vol_k: float = 1.0,
                   volume_min: float = 0.01, volume_step: float = 0.01,
                   volume_max: float = 10.0,
                   sl_dist: float | None = None,
-                  reserve_lots: float = 0.0,
-                  point: float = 0.001) -> tuple[float, str | None]:
+                  reserve_lots: float = 0.0) -> tuple[float, str | None]:
     """风险预算 + Half-Kelly 上限 + 波动率目标系数。
 
     返回 (lots, reject_reason)。
@@ -312,21 +340,6 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     由 0.618 回调位决定，与 ATR 无关；仓位必须按同一个距离反推，
     否则单笔风险会随止损加宽等比放大（实测 4h 分型两倍 149 → 单笔
     风险 1.49% 而非预算的 0.5%）。传 None 时退回 ATR 距离（旧行为）。
-
-    `point`：该品种的最小价格变动单位（`SymbolProfile.point`）。默认 0.001
-    保持单品种（XAUUSDm）行为不变。
-
-    ⚠️ `point` 与 `point_value_per_lot` 必须**同源**（都来自同一个
-       `SymbolProfile.point`）。它们是配套的一对：
-           sl_points    = sl_dist / point
-           per_lot_risk = sl_points * point_value_per_lot
-       代入 `point_value_per_lot = tick_value * (point / tick_size)` 得
-           per_lot_risk = sl_dist * tick_value / tick_size
-       即 point **在代数上消掉**，结果与品种无关。
-       这正是原实现的真实情形：两处各自硬编码 0.001，于是"碰巧正确"。
-       实测 5 个品种（含 EURUSDm 的 0.00001）per_lot_risk 与正确公式一致。
-       但这是**脆弱的巧合** —— 只改一处会产生成百倍的手数误差
-       （EURUSDm 恰好 100 倍）。修改时必须两处一起改。
 
     最小手数兜底（用户选定）
     ------------------------
@@ -358,9 +371,7 @@ def position_lots(equity: float, atr: float, point_value_per_lot: float,
     risk_usd *= vol_k
     if sl_dist is None:
         sl_dist = CFG.risk.sl_atr_mult * atr          # 旧行为：按 ATR
-    # ⚠️ 用**该品种的** point，不是硬编码 0.001。必须与
-    #    `graph._point_value()` / `machine._point(ctx)` 同源（见 docstring）。
-    sl_points = sl_dist / (point or 0.001)
+    sl_points = sl_dist / 0.001                        # XAUUSDm point=0.001
     per_lot_risk = sl_points * point_value_per_lot
     if per_lot_risk <= 0:
         return 0.0, "bad_point_value"

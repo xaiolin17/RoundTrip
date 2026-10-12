@@ -13,7 +13,8 @@ from gold_agent.common.zh import sentiment_label
 from gold_agent.fusion.engine import FusedEvidence
 from gold_agent.mt5.client import AccountInfo, PositionsView
 from gold_agent.risk.levels import trade_levels
-from gold_agent.risk.position import CircuitBreakers, position_lots, volatility_k
+from gold_agent.risk.position import (
+    CircuitBreakers, position_lots, sizing_equity, volatility_k)
 from gold_agent.risk.structure import pullback_entry
 
 
@@ -87,7 +88,7 @@ class RiskGate:
     def _levels(self, direction: str, entry: float, ev, atr: float | None,
                 llm_review: dict | None = None,
                 add: bool = False,
-                digits: int = 3):
+                frames: dict | None = None):
         """按 LLM 判断的压力位/支撑位算止损止盈（用户要求的正确语义）。
 
         ⚠️ 概念纠正：0.618 回调位是**入场点**，不是止损。
@@ -95,20 +96,19 @@ class RiskGate:
         本地只做配套计算（方向/最小距离/盈亏比校验）。
 
         **统一定价语义（用户 2026-10-09 合并首仓与加仓）**：
-        所有路径都是"先由结构位算出止盈目标 → 距离缩 N% →
-        按 `min_rr` 反推止损"。首仓缩到 `first_tp_shrink`（0.70），
-        加仓缩到 `add_tp_shrink`（0.58）。
+        所有路径都是"先由结构位算出止盈目标 → 距离缩 N% → 定止损"。
+        首仓缩到 `first_tp_shrink`（0.70），加仓缩到 `add_tp_shrink`（0.58）。
+        止损**优先锚定结构失效边界**（`frames[structure_tf]` 上最近一段同向
+        走势的起点价 + `structure_sl_buffer_atr`×ATR 缓冲）；无有效边界时
+        回退「由缩后止盈距离按 `min_rr` 反推」。见 levels.py。
 
         `add=True`：加仓路径，用 0.58 那一档。
-
-        `digits`：该品种价格小数位。⚠️ 必须传，不能沿用 `levels.py` 里
-        写死的 3 —— 对 EURUSDm（digits=5）会把 `1.12419` 截成 `1.12400`
-        （偏 19 个 point），且该误差会**进入手数计算**（`sl_dist` 反推手数）。
+        `frames`：多周期 K 线（用于取 `structure_tf` 的结构失效边界）。
         """
         return trade_levels(direction, entry, llm_review, ev, atr,
                             tp_shrink=(CFG.risk.add_tp_shrink if add
                                        else CFG.risk.first_tp_shrink),
-                            digits=digits)
+                            frames=frames)
 
     def evaluate(self, prop: Proposal, ev: FusedEvidence, account: AccountInfo,
                  positions: PositionsView, point_value_per_lot: float,
@@ -116,34 +116,12 @@ class RiskGate:
                  win_rate: float | None = None,
                  position_adds: dict | None = None,
                  llm_review: dict | None = None,
-                 frames: dict | None = None,
-                 point: float = 0.001,
-                 magic: int | None = None,
-                 digits: int = 3,
-                 max_lot: float | None = None) -> Approved:
-        """`point`：该品种的最小价格变动单位（`SymbolProfile.point`）。
+                 frames: dict | None = None) -> Approved:
+        """从 ActionProposal 到 ApprovedOrder。
 
-        ⚠️ 必须与 `point_value_per_lot` 同源。默认 0.001 保持 XAUUSDm
-        行为不变；多品种下由调用方传入实际值（见 `position_lots` docstring
-        关于"两处必须一起改"的说明）。
-
-        `magic`：该品种的 magic。持仓/挂单过滤**必须**按它 —— 全仓库原先
-        只按 `CFG.mt5.magic` 过滤、没有任何一处按 symbol 过滤，多品种共用
-        magic 会让每个品种认领别人的持仓。默认 None = `CFG.mt5.magic`。
-
-        `digits`：该品种价格小数位（`SymbolProfile.digits`），用于
-        止损/止盈定价规整。默认 3 保持 XAUUSDm 行为不变；写死 3 会让
-        EURUSDm 的 `1.12419` 被截成 `1.12400`（偏 19 个 point）。
-
-        `max_lot`：该品种总手数上限（`SymbolProfile.max_lot`，注释写明
-        "覆盖 CFG.max_lot"）。默认 None 回退 `CFG.max_lot` —— 二者当前相等，
-        所以单品种行为不变。**必须与 `Graph._max_lots_cap` 同源**，
-        否则决策层与风控层口径不一致（这正是历史 259 次
-        "总手数上限"拒绝的成因）。
+        止损止盈由 `_levels` 按 LLM 结构位计算；仓位按实际止损距离反推，
+        锁死单笔 `risk_pct` 风险。
         """
-        magic = int(magic if magic is not None else CFG.mt5.magic)
-        if max_lot is None:
-            max_lot = float(CFG.max_lot)
         reasons = prop.reasons or []
         # ---------- 平仓/修改类直接放行（风控永不阻止离场） ----------
         if prop.kind == "modify_sltp":
@@ -189,8 +167,15 @@ class RiskGate:
                                            "lots": pos.volume})
 
         r = ev.result
+        # 仓位/熔断的**基准净值**：设了 `SIZING_EQUITY_BASE` 则用它，否则
+        # 用真实净值（默认）。使小账户与基准账户得到逐笔一致的仓位与阈值。
+        base_eq = sizing_equity(account.equity)
         # ---------- 熔断 ----------
-        margin_used = (account.margin / max(account.equity, 1e-9))
+        # ⚠️ 单位：`CircuitBreakers.check()` 内是
+        # `margin_used > margin_use_cap × 基准净值`（两边都是**绝对金额**）。
+        # 原实现传的是 `margin / equity` 比值（~0.0x），恒小于阈值 →
+        # `margin_cap` 熔断从未触发过一次（静默失效）。
+        margin_used = account.margin
         # --- 新闻高危窗口：原为硬编码 False，等于**永久禁用**这条熔断 ---
         # 实测：`high_risk_window=False` 写死后，`CircuitBreakers` 里
         # `news_high_risk_window` 分支从未触发过一次；配套的
@@ -200,7 +185,8 @@ class RiskGate:
         # 也就是说这条熔断实际上被静默摘掉了，而不是"由别处接管"。
         # 现改为按配置驱动，默认仍为 false，保持行为不变，但**可被显式打开**。
         reject = self.breakers.check(account.equity, margin_used,
-                                     high_risk_window=CFG.risk.news_high_risk_window)
+                                     high_risk_window=CFG.risk.news_high_risk_window,
+                                     base_equity=base_eq)
         if reject:
             return Approved(ok=False, reason=f"circuit: {reject}")
         # ---------- 分歧加严 ----------
@@ -236,7 +222,7 @@ class RiskGate:
             entry = prop.entry   # 市价由 executor 取当前 bid/ask
             # ---- 止损止盈看压力位/支撑位（LLM 判断 + 本地配套计算）----
             lv = self._levels(prop.direction, entry, ev, atr, llm_review,
-                              digits=digits)
+                              frames=frames)
             if not lv.ok:
                 # 用户选定：LLM 没给出可用压力位 → **不开仓**，等 LLM 可用
                 # （猜点位比不交易更危险）
@@ -263,9 +249,9 @@ class RiskGate:
             # 仓位按**实际**止损距离反推，锁死单笔 risk_pct 风险；
             # 同时为后续加仓预留额度（否则首仓吃满总上限 → 加仓永久不可达）
             reserve = CFG.add_layer_lots * CFG.risk.max_adds_per_position
-            lots, rej = position_lots(account.equity, atr, point_value_per_lot,
+            lots, rej = position_lots(base_eq, atr, point_value_per_lot,
                                       win_rate, vol_k=vol_k, sl_dist=lv.sl_dist or None,
-                                      reserve_lots=reserve, point=point)
+                                      reserve_lots=reserve)
             if rej:
                 decision_log({"event": "risk_reject", "kind": prop.kind,
                               "reason": rej, "win_rate": round(win_rate, 3)})
@@ -300,7 +286,7 @@ class RiskGate:
             if adds_count >= CFG.risk.max_adds_per_position:
                 return Approved(ok=False, reason=f"adds capped at {CFG.risk.max_adds_per_position}")
             my_lots = sum(p.volume for p in positions.positions
-                          if p.magic == magic)
+                          if p.magic == CFG.mt5.magic)
             # --- 加仓手数：原为硬编码 0.01，且上限判定也用同一个字面量 ---
             # 实测问题（153 次 `max_lot cap` 全部来自这里）：
             # `max_adds_per_position = 5` 声明允许加 5 层，但每层固定 0.01、
@@ -311,12 +297,12 @@ class RiskGate:
             # 改为按**剩余额度**推导本次可加手数：只有剩余确实不足
             # 最小手数时才算"加无可加"（真正的资金上限），而不是固定拿 0.01
             # 去比。这样 add_no 的 5 层阶梯重新可达。
-            room = max_lot - my_lots
+            room = CFG.max_lot - my_lots
             add_lots = round(min(CFG.add_layer_lots, room), 2)
             if add_lots < CFG.min_lot:
                 return Approved(
                     ok=False,
-                    reason=f"max_lot cap: 已用 {my_lots:.2f} 上限 {max_lot} "
+                    reason=f"max_lot cap: 已用 {my_lots:.2f} 上限 {CFG.max_lot} "
                            f"剩余 {room:.2f} < 最小手数 {CFG.min_lot}")
             # ⚠️ 加仓必须自带 SL/TP。
             # 原实现 plan 里没有 tp/sl，executor 用 `plan.tp or 0.0` →
@@ -344,12 +330,12 @@ class RiskGate:
             if ref is None:
                 ref = pos.price_open if pos is not None else prop.entry
             lv = self._levels(prop.direction, ref, ev, atr, llm_review,
-                              add=True, digits=digits)
+                              add=True, frames=frames)
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
             plan = {"kind": "add_layer", "direction": prop.direction,
                     "lots": add_lots, "position_ticket": prop.entry,
-                    "entry": round(ref, digits),
+                    "entry": round(ref, 3),
                     "tp": lv.tp, "sl": lv.sl, "reasons": reasons,
                     "sl_source": lv.sl_source, "tp_source": lv.tp_source,
                     "sl_dist": lv.sl_dist, "tp_dist": lv.tp_dist}
@@ -374,7 +360,7 @@ class RiskGate:
             if atr is None:
                 return Approved(ok=False, reason="no_atr")
             # 防重复：已有本策略挂单 → 不再放（决策层已拦，此处是第二道闸）
-            my_pending = [o for o in positions.pending_orders if o.magic == magic]
+            my_pending = [o for o in positions.pending_orders if o.magic == CFG.mt5.magic]
             if my_pending:
                 return Approved(ok=False, reason=f"pending x{len(my_pending)} already waiting")
 
@@ -393,7 +379,7 @@ class RiskGate:
 
             # ---- 止损止盈：LLM 判断的压力位/支撑位 ----
             lv = self._levels(prop.direction, pe.entry, ev, atr, llm_review,
-                              digits=digits)
+                              frames=frames)
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
 
@@ -415,10 +401,9 @@ class RiskGate:
             #    现统一走 cold_start_win_rate（默认 0.5，行为不变，但可调）。
             win_rate_grid = (win_rate if win_rate is not None
                              else CFG.risk.cold_start_win_rate)
-            base_lots, rej = position_lots(account.equity, atr, point_value_per_lot,
+            base_lots, rej = position_lots(base_eq, atr, point_value_per_lot,
                                            win_rate_grid,
-                                           vol_k=vol_k_grid, sl_dist=lv.sl_dist or None,
-                                           point=point)
+                                           vol_k=vol_k_grid, sl_dist=lv.sl_dist or None)
             if rej:
                 return Approved(ok=False, reason=f"grid base: {rej}")
             order = {"level": pe.entry, "lots": base_lots,

@@ -563,32 +563,6 @@ class WeightTable:
         _log_weight_state(tbl)
         return tbl
 
-    @classmethod
-    def load_for_symbol(cls, symbol: str | None) -> "WeightTable":
-        """按品种加载源 IR 权重表：优先 `data/<品种>/source_ir.json`，
-        缺失则回退共享的 `data/source_ir.json`。
-
-        ⚠️ 为什么要按品种：源 IR 是**该品种**上实测出来的技能，
-        黄金的趋势性 ≠ 欧元的均值回归。共用一份会把 A 品种校准出的
-        源排序套到 B 品种身上 —— 不报错，只是安静地用错权重。
-
-        单品种模式下 `CFG.state_path_for()` 返回 `data/`，与共享路径
-        **等价** → 直接走 `load()`，与历史行为完全一致（数值零变化）。
-        """
-        shared = CFG.project_root / "data" / IR_STATE_FILE
-        if not symbol:
-            return cls.load(shared)
-        sym_path = CFG.state_path_for(symbol) / IR_STATE_FILE
-        if sym_path == shared:
-            return cls.load(shared)          # 单品种：按品种 == 共享
-        if sym_path.exists():
-            log_info(f"{symbol} 使用按品种权重表：{sym_path}")
-            return cls.load(sym_path)
-        log_info(f"{symbol} 无按品种权重表（{sym_path} 不存在）→ 回退共享表 "
-                 f"{shared}；如需按品种校准请运行 "
-                 f"research/21_source_ir.py --symbol {symbol} --write")
-        return cls.load(shared)
-
     def _apply_equal_prior(self) -> "WeightTable":
         """无校准文件：已知源按等权先验分配（`lambda = 0`）。
 

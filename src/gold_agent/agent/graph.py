@@ -16,7 +16,6 @@ from typing import Any, TypedDict
 import pandas as pd
 
 from gold_agent.common.config import CFG
-from gold_agent.common.symbols import get_profile
 from gold_agent.common.logging_util import (decision_log, log_error, log_info,
                                             log_warn, trade_log)
 from gold_agent.decision.machine import DecisionContext, DecisionEngine, Proposal
@@ -65,60 +64,38 @@ class Graph:
     llm: Orchestrator | None
     breakers: CircuitBreakers
     deal_feedback: Any = None
-    #: 本实例负责的品种（多品种时每品种一个 Graph 实例）。
-    #: None = 用 `CFG.mt5.symbol`（单品种兼容，行为与改造前一致）。
-    symbol: str | None = None
-    #: 组合级风险闸（跨品种，多品种时由 runner 注入**同一个**实例）。
-    #: None = 不做组合检查（单品种/测试场景）。
-    portfolio: Any = None
     # {position_id / order_id: 预测符号} 成交→贝叶斯反馈桥接（落盘 pred_orders.json）
     # 键统一用 position_id：平仓 deal 的 order 是新 ticket，与开仓时记的永不相等
     _pred_orders: dict = field(default_factory=dict)
     _position_adds: dict = field(default_factory=dict)   # {position_ticket_str: 加仓次数}
     @classmethod
-    def build(cls, symbol: str | None = None) -> "Graph":
-        """构建一个品种的完整决策图。
-
-        `symbol=None` -> 用 `CFG.mt5.symbol`（单品种兼容，与改造前一致）。
-        多品种时为**每个品种**各建一个实例：各自的 Mobius 映射、新闻关键词、
-        LLM 提示词品种名、状态目录、magic 全部独立。
-        """
+    def build(cls) -> "Graph":
         CFG.ensure_dirs()
-        prof = get_profile(symbol or CFG.mt5.symbol)
-        sym = prof.broker_symbol
-        sdir = CFG.state_path_for(sym)
-        # ⚠️ 必须把品种传给 client：否则本类的 get_ohlcv/_positions_sync
-        #    会退回配置里的默认品种，5 个 Graph 全部去拉黄金的行情与持仓
-        #    （实测 5 品种收盘价完全相同、都是 4175.704）。
-        client = MT5Client(symbol=sym)
+        client = MT5Client()
         executor = Executor(client)
         mobius = MobiusClient()
-        news = Jin10Collector(symbol=sym)
-        fusion = FusionEngine(symbol=sym)
-        breakers = CircuitBreakers.load(sdir / "breakers.json")
+        news = Jin10Collector()
+        fusion = FusionEngine()
+        breakers = CircuitBreakers.load(CFG.state_path.parent / "breakers.json")
         orchestrator: Orchestrator | None = None
         try:
             from gold_agent.llm.client import RunningHubClient
-            # 多品种：LLM 每小时预算按品种数**平分**（每品种一个独立池）。
-            # 单品种时平分结果 == 原配置（60/24/24），行为不变。
-            _caps = CFG.per_symbol_budgets(len(CFG.trade_symbols))
-            orchestrator = Orchestrator(RunningHubClient(budgets=_caps), symbol=sym)
+            orchestrator = Orchestrator(RunningHubClient())
         except Exception as e:
             # LLM 缺 key 时禁用（本地降级路径照常决策），首次成功调用前重试初始化
-            orchestrator = Orchestrator(None, symbol=sym)
+            orchestrator = Orchestrator(None)
             orchestrator._init_error = str(e)
         gate = RiskGate(breakers)
         engine = DecisionEngine(gate, orchestrator)
         fb = None
         try:
             from gold_agent.fusion.deal_feedback import DealFeedback
-            fb = DealFeedback(fusion.bayes, breakers, state_dir=sdir,
-                              magic=prof.magic, symbol=sym)
+            fb = DealFeedback(fusion.bayes, breakers)
         except Exception as e:
             log_warn(f"交割单反馈初始化失败：{e}")
         return cls(client=client, executor=executor, mobius=mobius, news=news,
                    fusion=fusion, engine=engine, gate=gate, llm=orchestrator,
-                   breakers=breakers, deal_feedback=fb, symbol=sym)
+                   breakers=breakers, deal_feedback=fb)
 
     async def run_round(self, round_id: int) -> dict:
         """一轮完整决策（docs/00 §3 t0..t9）。返回本轮摘要。"""
@@ -223,31 +200,11 @@ class Graph:
             #    `4h: 0.50` 占 23.8% 权重预算 —— 声明了却永远拿不到数据，
             #    醒来就是把「1h/4h 主导方向」悄悄降级成「1h 主导」。
             #    派生后权重表与抓取列表不可能再漂移。
-            # ⚠️ 多品种：SMC 的 venue/symbol 与支持的周期都随品种变化。
-            #    get_smc 内部按 (symbol, interval) 缓存，所以这里必须传
-            #    **Mobius 侧**的符号（BTCUSDm -> BTCUSDT），不是券商符号。
-            #    且各 venue 支持的周期差别极大（forex/commodity:futures 只有
-            #    1h/1d），请求不支持的周期会返回 **400 而非降级**，
-            #    所以必须按 `profile.smc_intervals` 裁剪。
-            _prof = self.profile
-            if _prof.has_smc:
-                mob_tfs = _prof.smc_intervals(
-                    tuple(tf for tf, w in MB_TF_WEIGHTS.items() if w > 0))
-                mob_sym = _prof.mobius_symbol
-            else:
-                mob_tfs, mob_sym = (), None
-                log_warn(f"{_prof.label} 无 SMC 数据源，本品种只融合缠论/本地指标")
-            # ⚠️ 传入本品种名：`df` 来自各自的 bundle（数据本身已按品种隔离），
-            #    但 symbol 会进缠论内部记录，传错会让日志/自检里出现别的品种名。
-            cl_tasks = {tf: asyncio.to_thread(
-                            analyze_tf, st["bundle"].frames[tf], tf,
-                            _prof.mobius_symbol)
+            mob_tfs = tuple(tf for tf, w in MB_TF_WEIGHTS.items() if w > 0)
+            cl_tasks = {tf: asyncio.to_thread(analyze_tf, st["bundle"].frames[tf], tf)
                         for tf in ("1m", "5m", "15m", "1h", "4h")}
             mob_tasks = {
-                tf: asyncio.create_task(
-                    self.mobius.get_smc(mob_sym, tf, limit=200,
-                                        exchange=_prof.mobius_exchange,
-                                        market=_prof.mobius_market))
+                tf: asyncio.create_task(self.mobius.get_smc("XAUUSD", tf, limit=200))
                 for tf in mob_tfs
             }
             news_task = asyncio.create_task(self.news.fetch())
@@ -353,8 +310,7 @@ class Graph:
                                   position_adds=self._position_adds,
                                   point_value_per_lot=self._point_value(),
                                   used_lots=self._used_lots(st["positions"]),
-                                  max_lots_cap=self._max_lots_cap(st["account"]),
-                                  profile=self.profile)
+                                  max_lots_cap=self._max_lots_cap(st["account"]))
             if need_llm and self.llm is not None:
                 st["llm"] = await self.llm.review_and_news(ev, st["news"],
                                                            summary["last_close"])
@@ -416,11 +372,7 @@ class Graph:
                 position_adds=self._position_adds,
                 llm_review=_rev,
                 # 自研回调检测需要小周期 K 线（缠论代理在小周期上不准）
-                frames=st["bundle"].frames,
-                point=self.profile.point,
-                magic=self.profile.magic,
-                digits=self.profile.digits,
-                max_lot=self.profile.max_lot)
+                frames=st["bundle"].frames)
             st["approved"] = approved
             # plan 必须放进 summary：控制台要靠它显示方向/入场/止损/止盈
             # （只放 ok/reason 的话，显示层读不到价位，会打出 "None手"）
@@ -451,36 +403,6 @@ class Graph:
                                "proposal": prop.__dict__})
                     return summary
 
-            # ---- t7c 组合级风险闸（多品种）----
-            # ⚠️ 逐品种风控**结构上无法**覆盖组合风险。最关键的一条：
-            #    各品种的 CircuitBreakers 只看自己的盈亏序列，
-            #    组合整体回撤 12% 时若各品种各自都没到线，就**无人熔断**。
-            #    另有风险预算倍数放大（5 品种 × 0.5% = 2.5%）与保证金集中。
-            # 单品种时 `PortfolioRisk.check_for` 直接放行（空操作），
-            # 所以黄金实盘行为不变。
-            if self.portfolio is not None and (approved.plan or {}).get("kind") \
-                    in ("open_market", "place_grid"):
-                _verdict = self._portfolio_check(approved.plan, st, prop.direction)
-                if not _verdict.ok:
-                    summary["risk"] = {"ok": False,
-                                       "reason": _verdict.reason,
-                                       "plan": approved.plan}
-                    trade_log({"event": "risk_reject", "round": round_id,
-                               "kind": prop.kind,
-                               "reason": f"portfolio: {_verdict.reason}",
-                               "proposal": prop.__dict__})
-                    return summary
-                if _verdict.lot_mult < 1.0:
-                    # 按组合预算缩手数（信号本身有效，只是总风险超额）
-                    _p = approved.plan
-                    _p["lots"] = round(float(_p.get("lots") or 0.0)
-                                       * _verdict.lot_mult, 2)
-                    summary["portfolio"] = {"lot_mult": _verdict.lot_mult,
-                                            "reason": _verdict.reason}
-                    trade_log({"event": "portfolio_scale", "round": round_id,
-                               "lot_mult": _verdict.lot_mult,
-                               "lots": _p["lots"], "reason": _verdict.reason})
-
             # t8 execute
             exec_res = await self._execute(approved.plan, st)
             st["execution"] = exec_res
@@ -498,7 +420,7 @@ class Graph:
             decision_log({"event": "round_complete", "round": round_id,
                           "summary": {k: summary.get(k) for k in
                                       ("last_close", "proposal", "risk", "execution")}})
-            self.breakers.save(self.state_dir() / "breakers.json")
+            self.breakers.save(CFG.state_path.parent / "breakers.json")
             self._prune_position_adds(st.get("positions"))
             self._save_position_adds()
             # P0-1/P1-2/P1-3：滚动统计量跨进程持久（重启不丢预热）
@@ -577,15 +499,14 @@ class Graph:
         #    跨轮不重复是**有意**的：加仓/移损本来就需要在新价格上重新提交。
         _rid = st.get("round_id", 0)
         if kind == "open_market":
-            si = self.client.symbol_info(self.symbol)
+            si = self.client.symbol_info()
             if plan["direction"] == "LONG":
                 entry = si.ask if si else None
             else:
                 entry = si.bid if si else None
             req = OrderPlan(kind="open_market", direction=plan["direction"],
                             lots=plan["lots"], tp=plan["tp"], sl=plan["sl"],
-                            comment="goldagent-open", symbol=self.symbol,
-                            magic=self.profile.magic,
+                            comment="goldagent-open",
                             idempotency_key=f"open-{_rid}-{plan['direction']}")
             res = await self.executor.execute(req)
             if res.ok:
@@ -597,8 +518,7 @@ class Graph:
             req = OrderPlan(kind="close_position", direction=plan.get("direction"),
                             lots=float(plan["lots"]),
                             position_ticket=int(plan["position_ticket"]),
-                            comment="goldagent-close", symbol=self.symbol,
-                            magic=self.profile.magic,
+                            comment="goldagent-close",
                             idempotency_key=f"close-{plan['position_ticket']}")
             return await self.executor.execute(req)
         if kind == "modify_sltp":
@@ -610,8 +530,7 @@ class Graph:
             req = OrderPlan(kind="modify_sltp", direction=plan.get("direction"),
                             position_ticket=int(plan["position_ticket"]),
                             sl=float(plan["new_sl"]), tp=plan.get("keep_tp"),
-                            comment="goldagent-lock", symbol=self.symbol,
-                            magic=self.profile.magic,
+                            comment="goldagent-lock",
                             idempotency_key=(f"lock-{plan['position_ticket']}"
                                              f"-{plan['new_sl']}-{plan.get('keep_tp')}"))
             res = await self.executor.execute(req)
@@ -634,7 +553,6 @@ class Graph:
             req = OrderPlan(kind="open_market", direction=plan["direction"],
                             lots=float(plan["lots"]), tp=plan.get("tp"),
                             sl=plan.get("sl"), comment="goldagent-add",
-                            symbol=self.symbol, magic=self.profile.magic,
                             idempotency_key=f"add-{plan['position_ticket']}-{st.get('round_id', 0)}")
             res = await self.executor.execute(req)
             if res.ok:
@@ -669,8 +587,7 @@ class Graph:
         if kind == "cancel_pending":
             # 行情反转撤挂单（docs/06 状态机：PENDING_GRID → IDLE）
             req = OrderPlan(kind="cancel_pending", position_ticket=int(plan["order_ticket"]),
-                            comment="goldagent-cancel", symbol=self.symbol,
-                            magic=self.profile.magic,
+                            comment="goldagent-cancel",
                             idempotency_key=f"cancel-{plan['order_ticket']}")
             res = await self.executor.execute(req)
             if res.ok:
@@ -699,8 +616,6 @@ class Graph:
                                 tp=layer["tp"], sl=layer["sl"],
                                 expiration_s=layer["expiration_s"],
                                 comment="goldagent-pending",
-                                symbol=self.symbol,
-                                magic=self.profile.magic,
                                 # `level` 是价格不是身份：同一价位在**后续轮次**
                                 # 重新挂单是合法意图（撤了又挂），所以键要带轮次，
                                 # 只在**同一轮内**防重复提交。
@@ -735,18 +650,7 @@ class Graph:
                      f"保留 {len(self._position_adds)} 个在场持仓")
 
     def _save_position_adds(self) -> None:
-        # ⚠️ 必须用 `self.state_dir()`，与 `_load_state` 的读取路径**一致**。
-        #    原写死 `CFG.state_path.parent`（即共享的 `data/`），
-        #    而读取走 `state_dir()`（多品种时为 `data/<品种>/`）——
-        #    读写路径不一致的后果：
-        #      · 5 个品种**都往同一个** `data/position_adds.json` 写，
-        #        互相覆盖，加仓次数统计错乱；
-        #      · 但读的时候去 `data/<品种>/position_adds.json`，
-        #        那里从来没有文件 → 读不到 → 每个品种都从 0 开始计数
-        #        → `max_adds_per_position` 闸失效，可以无限加仓。
-        #    这类"写一个地方、读另一个地方"的错**永不报错**，
-        #    只是数据静默丢失。
-        path = self.state_dir() / "position_adds.json"
+        path = CFG.state_path.parent / "position_adds.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self._position_adds), encoding="utf-8")
 
@@ -871,7 +775,7 @@ class Graph:
         self._save_pred_orders()
 
     def _save_pred_orders(self) -> None:
-        path = self.state_dir() / "pred_orders.json"
+        path = CFG.state_path.parent / "pred_orders.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         # 只保留最近 200 条（成交反馈用完即弃）
         items = list(self._pred_orders.items())[-200:]
@@ -880,14 +784,14 @@ class Graph:
     def __post_init__(self) -> None:
         # 加仓计数跨进程持久
         try:
-            path = self.state_dir() / "position_adds.json"
+            path = CFG.state_path.parent / "position_adds.json"
             if path.exists():
                 self._position_adds = json.loads(path.read_text(encoding="utf-8"))
         except Exception as e:
             log_warn(f"加仓记录读取失败：{e}")
         # 挂单→成交预测符号桥接持久
         try:
-            path = self.state_dir() / "pred_orders.json"
+            path = CFG.state_path.parent / "pred_orders.json"
             if path.exists():
                 self._pred_orders = json.loads(path.read_text(encoding="utf-8"))
         except Exception as e:
@@ -911,123 +815,30 @@ class Graph:
         except Exception as e:
             log_warn(f"融合预热失败：{e}")
 
-    def _portfolio_check(self, plan: dict, st: GraphState,
-                         this_direction: str | None = None):
-        """构造组合快照并做组合级判定（多品种）。
-
-        `this_direction`：**本笔要开的方向**，必须显式传入。
-
-        ⚠️ 不能拿"该品种已有持仓的方向"当本笔方向 —— 正在开新仓时
-        该品种还没有持仓（方向为 None），同向集中闸会在**最需要它的
-        时刻**静默失效。初版就是犯了这个错（测试当场抓住：
-        3 个品种已做多，第 4 个再做多仍被放行）。
-
-        ⚠️ 单品种时 `PortfolioRisk.check_for` 内部直接放行 —— 本方法
-        仍会被调用，但结果恒为 ok（不改变黄金实盘行为）。
-        """
-        from gold_agent.risk.portfolio import PortfolioState
-
-        sym = self.symbol or CFG.mt5.symbol
-
-        # 本实例只按 magic 看得到**自己**的持仓；其它品种的方向由
-        # 共享的 `PortfolioRisk.directions` 登记表提供（各品种每轮上报）。
-        # 所以这里必须**先上报自己、再读全局**，否则自己永远是 None。
-        mine = None
-        for p in st["positions"].positions:
-            if p.magic == self.profile.magic:
-                mine = "LONG" if int(getattr(p, "type", 0)) == 0 else "SHORT"
-                break
-        self.portfolio.report_direction(sym, mine)
-        dirs = self.portfolio.direction_map()
-
-        account = st["account"]
-        equity = float(getattr(account, "equity", 0.0) or 0.0)
-        # 组合纯交易盈亏：用净值 − 净出入金（与 CircuitBreakers 同口径）
-        pnl_now = equity - float(getattr(self.breakers, "net_deposits", 0.0) or 0.0)
-        self.portfolio.update_pnl(pnl_now)
-
-        # 已持仓品种的风险预算（**不含本笔**，本笔由 check_for 的
-        # this_risk 单独给 —— 否则同一品种旧仓与本笔会被重复计入）。
-        risk_now = {s: self.profile.risk_pct
-                    for s, d in dirs.items() if d and s != sym}
-        pstate = PortfolioState(
-            risk_by_symbol=risk_now,
-            direction_by_symbol=dirs,
-            margin_by_symbol={},
-            equity=equity, pnl_now=pnl_now)
-        # 本笔风险：单品种单笔预算（满额近似，保守方向）
-        return self.portfolio.check_for(sym, self.profile.risk_pct, pstate,
-                                        this_direction=this_direction)
-
     def _used_lots(self, positions) -> float:
-        """本品种当前**已用**总手数（加仓额度判定用）。
-
-        ⚠️ 必须按本品种 magic 过滤。多品种共用 magic 时会把所有品种的
-        持仓手数加在一起，加仓额度判定全错（A 品种占了 B 品种的额度）。
-        """
-        _m = self.profile.magic
+        """本 magic 当前**已用**总手数（加仓额度判定用）。"""
         try:
             return sum(float(p.volume) for p in positions.positions
-                       if p.magic == _m)
+                       if p.magic == CFG.mt5.magic)
         except Exception:
             return 0.0
 
     def _max_lots_cap(self, account) -> float:
         """**总敞口**上限（加仓额度判定用）。
 
-        ⚠️ 必须与 `RiskGate.add_layer` 里的 `room = max_lot − my_lots`
+        ⚠️ 必须与 `RiskGate.add_layer` 里的 `room = CFG.max_lot − my_lots`
         用**同一个口径**。决策层若按别的口径算（例如按 broker 的单笔上限
         `volume_max=200`），就会持续提出风控必然拒掉的加仓 ——
         两处口径不一致正是实测 259 次"总手数上限"拒绝的成因。
-
-        ⚠️ 用 `self.profile.max_lot`（`SymbolProfile` 里注释写明"覆盖
-        CFG.max_lot"），而不是直接读 `CFG.max_lot`。原实现只读后者，
-        导致 `profile.max_lot` 成了**声明了却从不生效的死配置**：
-        给某品种单独设上限会完全没反应，且多品种下每个品种各自吃满
-        全局上限（合计 n×max_lot），与档案的设计意图不符。
-        当前 5 个品种的 `max_lot` 恰好都等于 `CFG.max_lot`，所以行为不变。
         """
-        try:
-            return float(self.profile.max_lot)
-        except Exception:
-            return float(CFG.max_lot)
+        return float(CFG.max_lot)
 
-    def _point_value(self, symbol: str | None = None) -> float:
-        """每手每 **point** 的美元值（与 `SymbolProfile.point` 配套）。
-
-        ⚠️ 必须与 `position_lots` 里的 `sl_points = sl_dist / point` 及
-        `machine._point(ctx)` **同源**。历史上三处各自硬编码 0.001，
-        乘起来正好自消（实测 5 品种下 per_lot_risk 与正确公式一致）——
-        那是**脆弱的巧合**：任何一处单独改成按 point 计算，
-        立刻产生成百倍的手数误差（EURUSDm 是 100 倍）。
-        """
-        sym = symbol or self.symbol or CFG.mt5.symbol
-        try:
-            point = get_profile(sym).point
-        except KeyError:
-            point = 0.001          # 未注册品种退回旧默认（单品种兼容）
-        si = self._symbol_info(sym)
+    def _point_value(self) -> float:
+        si = self.client.symbol_info()
         if si is None:
             return 1.0
-        return float(si.trade_tick_value) * (point / max(si.trade_tick_size, 1e-9))
-
-    def _symbol_info(self, symbol: str | None = None):
-        """按品种取 symbol_info（多品种下单定位用）。"""
-        sym = symbol or self.symbol or CFG.mt5.symbol
-        try:
-            return self.client.symbol_info(sym)
-        except TypeError:
-            # 旧签名（无参数）
-            return self.client.symbol_info()
-
-    @property
-    def profile(self):
-        """本实例的品种档案。"""
-        return get_profile(self.symbol or CFG.mt5.symbol)
-
-    def state_dir(self):
-        """本品种的**隔离**状态目录（多品种下每品种一份统计状态）。"""
-        return CFG.state_path_for(self.symbol or CFG.mt5.symbol)
+        # XAUUSDm: 1 lot = 100oz; point=0.001 → tick_value 已是每 tick 每 lot 美元
+        return float(si.trade_tick_value) * (0.001 / max(si.trade_tick_size, 1e-9))
 
     async def close(self) -> None:
         await self.mobius.close()

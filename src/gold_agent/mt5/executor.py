@@ -30,26 +30,6 @@ class OrderPlan:
     expiration_s: int | None = None
     comment: str = "goldagent"
     idempotency_key: str = ""
-    #: 下单品种。None = 用 `CFG.mt5.symbol`（单品种兼容，行为不变）。
-    #: 多品种下必须显式带上 —— 否则所有品种的单都会发到默认品种上。
-    symbol: str | None = None
-    #: 下单 magic。None = 用 `CFG.mt5.magic`（单品种兼容，行为不变）。
-    #:
-    #: ⚠️ 必须按品种给，且**与过滤用的 magic 同源**。
-    #: 事故（2026-10-09，与 MT5Client 串台同批发现）：本字段原先不存在，
-    #: `_build_request` 写死 `CFG.mt5.magic`（= 20260918）。而全仓库的
-    #: "我的持仓/挂单/交割单"过滤**只按 magic、没有一处按 symbol**，
-    #: 于是 BTCUSDm 下的单带 20260918、过滤却找 20260919 → 查不到自己的持仓：
-    #:   · `_used_lots()` 恒为 0 → **可以无限开仓**（总手数闸失效）；
-    #:   · 已有持仓视为不存在 → **每轮重复市价开新仓**
-    #:     （复现 2026-09-30"同一持仓重复提交 83 次"同类事故）；
-    #:   · 止盈止损改不动（`modify_sltp` 找不到持仓）；
-    #:   · `DealFeedback` 收不到自己的交割单 → 胜率/熔断/贝叶斯静默失效；
-    #:   · 更糟：4 个非黄金品种互相看见（它们实际都是 20260918），
-    #:     止损/平仓提案可能发到**别的品种**的持仓上。
-    #: 单品种黄金下 magic 恰好等于全局值，所以**完全正常** —— 这正是它
-    #: 至今没被发现的原因。
-    magic: int | None = None
 
 
 @dataclass
@@ -119,20 +99,10 @@ class Executor:
             log_error(f"执行器异常: {e}")
             return ExecutionResult(ok=False, error=str(e))
 
-    def _symbol_info(self, symbol: str | None = None):
-        """按品种取 symbol_info，兼容旧的无参签名（测试桩/研究脚本）。"""
-        try:
-            return self.client.symbol_info(symbol)
-        except TypeError:
-            return self.client.symbol_info()
-
     def _build_request(self, plan: OrderPlan) -> dict:
-        # ⚠️ 多品种：必须按 plan 的品种取 symbol_info 与填 "symbol" 字段，
-        #    否则所有品种的单都会发到默认品种（CFG.mt5.symbol）上。
-        sym = plan.symbol or CFG.mt5.symbol
-        si = self._symbol_info(sym)
+        si = self.client.symbol_info()
         if si is None:
-            raise Mt5Error(f"symbol_info None during order build（{sym}）")
+            raise Mt5Error("symbol_info None during order build")
         # ⚠️ 所有价格必须**按 symbol 的 digits 规整**后才发出去。
         # 事故（2026-09-30 实测）：`modify_sltp` 提交 `sl=4178.211333333333`，
         # MT5 存回的是 `4178.211`（digits=3）。决策层下一轮拿 `pos.sl`
@@ -158,11 +128,8 @@ class Executor:
         else:
             filling = mt5.ORDER_FILLING_RETURN
         base = {
-            "symbol": sym,
-            # ⚠️ 必须用 plan.magic（本品种的 magic），不能写死 CFG.mt5.magic。
-            #    过滤只按 magic 做，写错 magic 会让本品种看不到自己的持仓。
-            #    见 `OrderPlan.magic` 的注释（含后果清单）。
-            "magic": int(plan.magic if plan.magic is not None else CFG.mt5.magic),
+            "symbol": CFG.mt5.symbol,
+            "magic": CFG.mt5.magic,
             "deviation": CFG.mt5.deviation,
             "comment": plan.comment,
             "type_filling": filling,

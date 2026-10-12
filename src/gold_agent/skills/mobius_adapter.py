@@ -158,23 +158,13 @@ class MobiusClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def get_smc(self, symbol: str, interval: str, limit: int = 200,
-                      exchange: str | None = None,
-                      market: str | None = None) -> MobiusResult:
-        """interval 必须在 SUPPORTED_INTERVALS 内，否则返回 unavailable（不抛错）。
-
-        `exchange` / `market`：Mobius venue。多品种下**必须**由调用方按
-        `SymbolProfile` 传入 —— 同一个品种在不同 venue 下名字不同
-        （BTCUSDm 是 `binance:spot` 的 `BTCUSDT`），且各 venue 支持的
-        周期差别极大。省略时退回旧的 `commodity:spot`（黄金单品种兼容）。
-        """
+    async def get_smc(self, symbol: str, interval: str, limit: int = 200) -> MobiusResult:
+        """interval 必须在 SUPPORTED_INTERVALS 内，否则返回 unavailable（不抛错）。"""
         out = MobiusResult(computed_at=time.time())
         if interval not in self.SUPPORTED_INTERVALS:
             out.error = f"interval {interval} unsupported by mobius"
             return out
-        ex = exchange or "commodity"
-        mk = market or "spot"
-        key = (f"{ex}:{mk}:{symbol}", interval)
+        key = (symbol, interval)
         cached = self._cache.get(key)
         if cached and time.time() - cached[0] <= CFG.mobius.cache_ttl_s:
             out.status = "ok"
@@ -189,7 +179,7 @@ class MobiusClient:
                 return out
             out.error = "rate_limit_timeout_no_cache"
             return out
-        body = {"exchange": ex, "market": mk, "symbol": symbol,
+        body = {"exchange": "commodity", "market": "spot", "symbol": symbol,
                 "interval": interval, "limit": limit, "calc": [{"name": "smc"}]}
         try:
             session = await self._ensure_session()

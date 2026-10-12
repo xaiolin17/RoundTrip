@@ -147,6 +147,34 @@ def last_leg(df: pd.DataFrame, k: int = 2) -> dict | None:
             "start_i": a[0], "end_i": b[0]}
 
 
+def invalidation_boundary(df: pd.DataFrame, direction: str,
+                          k: int = 2) -> float | None:
+    """最近一段**同向**走势的起点价 = 结构失效边界。
+
+    做多：最近的上行段（低点 -> 高点）的**起点低点** —— 价格跌破它，
+          说明这波上涨的结构已失效。
+    做空：最近的下行段（高点 -> 低点）的**起点高点**。
+
+    ⚠️ `last_leg` 只给**最后一段**（方向可能不符）；本函数从交替序列
+    末尾往前找最近的、方向匹配的段，与 research/29 的 `structure_at` 一致。
+
+    依据 research/29（R 口径回放，234 笔真实首仓）：以该边界 + 波动缓冲
+    作止损，净 R 显著优于现状「止损由止盈反推」（净R -0.326 -> +0.183，
+    tR -3.81 -> +3.26，胜率 25.7% -> 69.6%）。无可用段时返回 `None`，
+    上游回退 `rr_from_tp`，不阻断开仓。
+    """
+    if df is None or len(df) < 2 * k + 1:
+        return None
+    alt = alternate_swings(find_swings(df, k))
+    if len(alt) < 2:
+        return None
+    want = "H" if direction == "LONG" else "L"
+    for j in range(len(alt) - 1, 0, -1):
+        if alt[j][1] == want:
+            return float(alt[j - 1][2])
+    return None
+
+
 def band_of(leg: dict, direction: str) -> tuple[float, float]:
     """由一段走势算出回调带两条边 (near, far)。
 

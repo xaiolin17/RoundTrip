@@ -15,13 +15,8 @@ import aiohttp
 from gold_agent.common.config import CFG
 from gold_agent.common.logging_util import news_log
 
-#: 黄金关键词（默认品种，保持历史行为不变）。
-#: 多品种改用 `SymbolProfile.news_keywords` —— 每个品种的驱动因素不同，
-#: 用黄金关键词筛比特币/原油新闻会漏掉真正相关的消息（且误纳无关的）。
 _GOLD_KEYWORDS = ("黄金", "金价", "XAU", "美元", "美联储", "非农", "CPI", "PCE",
                   "利率", "降息", "加息", "地缘", "战争", "关税", "通胀", "就业")
-#: 高影响事件关键词。这些是**跨品种**的宏观事件（利率决议/通胀数据），
-#: 对所有品种都适用，所以不随品种变化。
 _HIGH_RISK_KEYWORDS = ("非农", "CPI", "PCE", "FOMC", "议息", "利率决议", "鲍威尔", "PPI")
 
 
@@ -57,20 +52,9 @@ def _news_age_seconds(ts: str, now: float) -> float | None:
 
 
 class Jin10Collector:
-    def __init__(self, keywords: tuple[str, ...] | None = None,
-                 symbol: str | None = None) -> None:
-        """`keywords`：本品种的新闻关键词。省略时按品种档案取，
-        再退回黄金关键词（单品种兼容，行为与改造前一致）。"""
+    def __init__(self) -> None:
         self._cache: NewsView | None = None
         self._cache_at = 0.0
-        self.symbol = symbol
-        if keywords is None:
-            try:
-                from gold_agent.common.symbols import get_profile
-                keywords = get_profile(symbol).news_keywords or _GOLD_KEYWORDS
-            except Exception:
-                keywords = _GOLD_KEYWORDS
-        self.keywords = tuple(keywords) or _GOLD_KEYWORDS
 
     async def fetch(self, force: bool = False) -> NewsView:
         now = time.time()
@@ -92,7 +76,7 @@ class Jin10Collector:
             if any(k in it.title for k in _HIGH_RISK_KEYWORDS):
                 it.level = "high_risk"
                 it.gold_relevant = True
-            elif any(k in it.title for k in self.keywords):
+            elif any(k in it.title for k in _GOLD_KEYWORDS):
                 it.level = "gold"
                 it.gold_relevant = True
         recent_hr = False
@@ -121,15 +105,9 @@ class Jin10Collector:
                                "clientInfo": {"name": "goldagent", "version": "0.1"}}}
             async with s.post(CFG.jin10.base_url, json=body, headers=headers) as r:
                 await r.text()
-            # search_flash 按关键词拉快讯（实测可用；金十无快讯流式推送工具）。
-            # ⚠️ 关键词必须用**本品种的主关键词**，不能写死"黄金"。
-            #    原实现写死 "黄金"，于是多品种下只拉回与黄金相关的快讯，
-            #    再用本品种关键词在**这个子集**里筛 —— 比特币的 ETF/监管、
-            #    原油的 OPEC/EIA 新闻根本拉不回来，`news_keywords` 形同虚设，
-            #    `high_risk_window` 与新闻事件闸对这些品种基本失效。
-            kw = self.keywords[0] if self.keywords else "黄金"
+            # search_flash 关键词拉取黄金快讯（实测可用；金十无快讯流式推送工具）
             body = {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                    "params": {"name": "search_flash", "arguments": {"keyword": kw}}}
+                    "params": {"name": "search_flash", "arguments": {"keyword": "黄金"}}}
             async with s.post(CFG.jin10.base_url, json=body, headers=headers) as r:
                 return self._read_sse(await r.text())
 
