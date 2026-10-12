@@ -42,6 +42,11 @@ class CircuitBreakers:
     direction_bias_halt: bool = False
     direction_bias_reason: str = ""
     extra: dict = field(default_factory=dict)
+    #: 熔断状态所属的 MT5 账户 login（0 = 尚未绑定）。
+    #: ⚠️ 事故（2026-10-12）：状态文件原先**不区分账户**，换登录 / 重开模拟盘 /
+    #: 状态残留后，陈旧的 `net_deposits` / `peak_pnl` 会与新账户净值错配，
+    #: 凭空造出巨额回撤（实测 `dd=100.1%` 并永久熔断）。启动时必须与当前账户比对。
+    account_login: int = 0
 
     def on_cash_flow(self, profit: float, ts: float | None = None) -> None:
         """记一笔出入金（正=入金，负=出金）。
@@ -82,14 +87,14 @@ class CircuitBreakers:
         """
         return float(equity) - self.net_deposits
 
-    def _dd(self, equity: float, base_equity: float | None = None) -> float:
-        """回撤比例 = (纯交易盈亏峰值 − 当前纯交易盈亏) / 基准净值。
+    def _dd(self, equity: float) -> float:
+        """回撤比例 = (纯交易盈亏峰值 − 当前纯交易盈亏) / **基准净值**。
 
-        分母用**基准净值**（`sizing_equity`：默认=当前净值，设了
-        `SIZING_EQUITY_BASE` 则取 max(净值, 基准) 即一个下限）。
-        否则净出入金一旦为负，比例会失去意义（本账户净出入金 +425665，
-        纯盈亏 -416079，相除得到荒谬的分母）。
-
+        分母与仓位定价**同一个口径**（`sizing_equity`：默认=当前净值，
+        设了 `SIZING_EQUITY_BASE` 则取 max(净值, 基准) 即一个下限，见
+        `.env`）。用户 2026-10-12 选定：熔断阈值与仓价一样按基准口径算 ——
+        $100 账户按 $10000 口径交易时，阈值（$300/$1200/$6000）与 $10000
+        账户逐笔一致，不会一笔正常亏损就把交易冻死。
         ⚠️ 分子（纯盈亏曲线）**始终用真实净值**，不随基准改变 ——
         否则出入金中性与真实盈亏会被改写。
 
@@ -101,18 +106,22 @@ class CircuitBreakers:
         loss = self.peak_pnl - self._pnl_now(equity)
         if loss <= 0.0:
             return 0.0
-        return loss / max(sizing_equity(equity, base_equity), 1e-9)
+        return loss / max(sizing_equity(equity), 1e-9)
 
     def check(self, account_equity: float, margin_used: float,
-              high_risk_window: bool, base_equity: float | None = None) -> str | None:
+              high_risk_window: bool) -> str | None:
         """返回 REJECT 原因；None = 允许开仓。
 
-        `base_equity`：仓位/阈值基准净值（见 `sizing_equity`）。None = 读
-        `CFG.sizing_equity_base`（默认 0 → 真实净值，行为不变）。
-        ⚠️ 只缩放**阈值分母**（日亏/回撤/保证金），纯盈亏曲线仍按真实净值。
+        ⚠️ 阈值分母与**仓位定价同一口径**（`sizing_equity`，用户 2026-10-12
+        选定）：设了 `SIZING_EQUITY_BASE` 则按 `max(净值, 基准)` 算，否则按
+        真实净值。这样小账户（净值 $100 而基准 $10000）的阈值（$300/$1200/
+        $6000）与 $10000 账户逐笔一致，一笔正常亏损不会立刻把交易冻死。
+        这是对上一轮"熔断改用真实净值"的**撤回**——那版阈值缩到 −$3/−$12/$60，
+        $100 账户一笔 0.01 手黄金的正常亏损（约 $20）即同时打穿日亏与回撤，
+        且回撤越过峰值后需新盈利才能恢复，而新开仓被拦 → **永久停摆**。
         """
         now = time.time()
-        sizing_eq = sizing_equity(account_equity, base_equity)
+        sizing_eq = sizing_equity(account_equity)
         today = time.strftime("%Y-%m-%d")
         if self.day_key and self.day_key != today:
             self.day_key = today
@@ -137,7 +146,12 @@ class CircuitBreakers:
             return f"cooloff_until {time.strftime('%H:%M', time.localtime(self.cooloff_until))}"
         if self.consecutive_losses >= CFG.risk.consecutive_loss_n:
             return f"consecutive_losses>={CFG.risk.consecutive_loss_n}"
-        if self.day_pnl <= -CFG.risk.daily_loss_stop_pct * sizing_eq:
+        # 当日亏损停机：默认**关闭**（`daily_loss_stop_pct=0`，用户 2026-10-12
+        # 指定"不做当日亏损停机"，改由上面的连亏冷却兜底）。
+        # ⚠️ 必须判 `>0`：若直接 `day_pnl <= -0×净值`，会在**任何**浮亏时触发，
+        #    与"关闭"恰好相反。当日累计亏损仍照常记录在 `day_pnl`。
+        if (CFG.risk.daily_loss_stop_pct > 0
+                and self.day_pnl <= -CFG.risk.daily_loss_stop_pct * sizing_eq):
             return "daily_loss_stop"
         # ---- 回撤熔断（基于**出入金中性**的纯交易盈亏曲线）----
         # 锚点只定一次。`peak_equity` 是历史净值峰值（旧状态文件里
@@ -154,7 +168,7 @@ class CircuitBreakers:
             log_info(f"回撤基准锚定：纯交易盈亏 {pnl_now:.2f}"
                      f"（净值 {account_equity:.2f} 减去净出入金 {self.net_deposits:.2f}）")
         self.peak_pnl = max(self.peak_pnl, pnl_now)
-        dd = self._dd(account_equity, base_equity)
+        dd = self._dd(account_equity)
         if dd >= CFG.risk.max_drawdown_halt_pct:
             return f"max_drawdown {dd:.1%}"
         if margin_used > CFG.risk.margin_use_cap * sizing_eq:
@@ -210,8 +224,8 @@ class CircuitBreakers:
         longs = sum(1 for d in self.recent_directions if d > 0)
         return max(longs, n - longs) / n
 
-    def deleverage_k(self, account_equity: float, base_equity: float | None = None) -> float:
-        dd = self._dd(account_equity, base_equity)
+    def deleverage_k(self, account_equity: float) -> float:
+        dd = self._dd(account_equity)
         if dd >= CFG.risk.max_drawdown_halt_pct:
             return 0.0
         if dd >= CFG.risk.max_drawdown_deleverage_pct:
@@ -234,6 +248,12 @@ class CircuitBreakers:
                 self.cooloff_until = time.time() + CFG.risk.consecutive_loss_cooloff_h * 3600
         else:
             self.consecutive_losses = 0
+            # 一盈利即提前解除冷却（用户 2026-10-12）：冷却只拦开仓/加仓，
+            # 冷却期内出现盈利平仓说明市场已给出正向反馈，立即恢复，
+            # 不必等满 `consecutive_loss_cooloff_h`。
+            if pnl > 0 and self.cooloff_until and time.time() < self.cooloff_until:
+                log_info(f"连亏冷却提前解除：盈利平仓 ${pnl:.2f}，恢复开仓/加仓")
+                self.cooloff_until = 0.0
         # 峰值按**纯交易盈亏**（出入金中性）更新；`peak_equity` 保留为
         # 历史净值峰值的记录，不再参与回撤计算（旧状态里的自引用 bug 见
         # `deal_feedback.poll`）。
@@ -266,6 +286,32 @@ class CircuitBreakers:
             except Exception as e:
                 log_warn(f"熔断器状态读取失败: {e}")
         return cls()
+
+    def bind_account(self, login: int | None) -> bool:
+        """把熔断状态绑定到 MT5 账户；账户变了则整体重新锚定（返回 True）。
+
+        ⚠️ 为什么必须做（2026-10-12 事故）：熔断状态里的 `net_deposits` /
+        `peak_pnl` / `day_pnl` 全部以"某个账户的资金口径"为前提。一旦实际账户
+        不是当初那个（换登录、重开模拟盘、状态文件残留），这些值就失去参照 ——
+        实测陈旧 `net_deposits` 426079.10 与新账户净值 92.89 错配，
+        算出 `loss=10010`、`dd=100.1%`，从此**永久熔断**、交易完全停摆。
+        账户不一致时重新锚定是唯一安全的做法：宁可丢掉历史峰值，
+        也不能用一个错误的分母把交易冻死。
+
+        返回 True 表示状态被重置，调用方应立即落盘。
+        """
+        if login is None:
+            return False
+        login = int(login)
+        if not login or login == self.account_login:
+            return False
+        old = self.account_login
+        fresh = CircuitBreakers(account_login=login)
+        for k, v in fresh.__dict__.items():
+            setattr(self, k, v)
+        log_warn(f"熔断状态账户不一致（旧登录 {old or '未绑定'} -> 新登录 {login}），"
+                 f"已重新锚定：历史峰值与净出入金清零")
+        return True
 
 
 def half_kelly(p: float, b: float) -> float:
@@ -308,7 +354,14 @@ def conservative_win_rate(wins: int, n: int, fallback: float = 0.5,
 
 
 def sizing_equity(account_equity: float, base: float | None = None) -> float:
-    """仓位/熔断计算的**基准净值**（真实净值与配置基准取大者）。
+    """**仓位与熔断**的基准净值（真实净值与配置基准取大者）。
+
+    ⚠️ 用途分两层，但**口径统一**（用户 2026-10-12 选定）：
+      1. **仓位大小**：`position_lots` 的 `equity` 入参（见 `gate.py`）。
+      2. **熔断阈值**：回撤/日亏/保证金三条的分母，见
+         `CircuitBreakers._dd` / `check`。
+    两者用同一个基准，$100 账户按 $10000 口径交易时，手数与阈值
+    （$300/$1200/$6000）都与 $10000 账户逐笔一致。
 
     `CFG.sizing_equity_base`（`.env` 的 `SIZING_EQUITY_BASE`）>0 时作为**下限**：
     返回 `max(真实净值, 基准)`；否则返回真实净值（默认口径，行为不变）。

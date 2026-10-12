@@ -42,11 +42,39 @@ def test_breaker_still_blocks_within_cooloff():
 
 def test_breaker_resets_on_win():
     b = CircuitBreakers()
-    for _ in range(3):
+    # 亏损笔数**低于**连亏阈值（3），尚未进入冷却；随后的盈利单应把计数清零。
+    for _ in range(2):
         b.on_trade_closed(-10, 10000)
     b.on_trade_closed(20, 10000)
     assert b.consecutive_losses == 0
     assert b.check(10000, 0.0, False) is None
+
+
+def test_breaker_cooloff_cleared_on_profit():
+    """用户 2026-10-12 选定：冷却期内**一盈利即提前解除冷却**。
+
+    冷却只拦开仓/加仓（并非停机）；冷却期内出现盈利平仓说明市场已给出
+    正向反馈，应立即恢复开仓/加仓，不必停满 `consecutive_loss_cooloff_h`。
+    """
+    b = CircuitBreakers()
+    for _ in range(CFG.risk.consecutive_loss_n):
+        b.on_trade_closed(-10, 10000)
+    assert b.cooloff_until > time.time(), "连亏达阈值应进入冷却"
+    assert b.check(10000, 0.0, False) is not None, "冷却期内应拦开仓"
+    b.on_trade_closed(5, 10000)
+    assert b.cooloff_until == 0.0, "盈利平仓必须提前解除冷却"
+    assert b.consecutive_losses == 0, "盈利应清零连亏计数"
+    assert b.check(10000, 0.0, False) is None, "冷却解除后应立即放行"
+
+
+def test_breaker_cooloff_not_cleared_on_breakeven():
+    """边界：盈亏恰好为 0（平手）不算盈利，**不**解除冷却。"""
+    b = CircuitBreakers()
+    for _ in range(CFG.risk.consecutive_loss_n):
+        b.on_trade_closed(-10, 10000)
+    cooloff = b.cooloff_until
+    b.on_trade_closed(0, 10000)
+    assert b.cooloff_until == cooloff, "平手不应解除冷却"
 
 
 # ========== 二、融合分与压力位矛盾 ==========

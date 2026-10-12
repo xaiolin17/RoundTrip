@@ -97,11 +97,11 @@ def test_circuit_breakers_paths():
         b.on_trade_closed(-50, 10000)
     r = b.check(10000, 0.0, False)
     assert r and ("consecutive_losses" in r or "cooloff" in r)
-    # 日亏熔断
+    # 当日亏损停机：用户 2026-10-12 指定**关闭**（daily_loss_stop_pct=0），
+    # 故大额日亏（-350 / 3.5%）也不再拦截，只保留连亏冷却。
     b2 = CircuitBreakers()
-    b2.on_trade_closed(-350, 10000)   # > 3% of 10000
-    r = b2.check(10000, 0.0, False)
-    assert r == "daily_loss_stop"
+    b2.on_trade_closed(-350, 10000)
+    assert b2.check(10000, 0.0, False) is None
     # 高危新闻窗口
     b3 = CircuitBreakers()
     r = b3.check(10000, 0.0, True)
@@ -135,9 +135,12 @@ def test_risk_gate_reject_paths():
     ev = type("E", (), {"result": FusionResult(score=2.0, sigma=0.3)})()
     acc = AccountInfo(login=1, balance=10000, equity=10000, margin_free=10000,
                       margin=0, margin_level=0, leverage=2000, currency="USD")
-    # 熔断拒绝
+    # 熔断拒绝：连亏达阈值（3 笔）触发冷却。
+    # ⚠️ 原来用「日亏 -350」触发，但用户 2026-10-12 关闭了当日亏损停机，
+    #    故改用连亏冷却验证 gate 的熔断分支。
     b = CircuitBreakers()
-    b.on_trade_closed(-350, 10000)
+    for _ in range(CFG.risk.consecutive_loss_n):
+        b.on_trade_closed(-100, 10000)
     gate2 = RiskGate(b)
     res = gate2.evaluate(Proposal(kind="open_market", direction="LONG"),
                          ev, acc, type("V", (), {"positions": []})(), 1.0, None, 5.0, None)

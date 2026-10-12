@@ -107,6 +107,12 @@ class Graph:
                 await self.client.initialize()
             st["bundle"] = await self.client.get_ohlcv()
             st["account"] = await self.client.get_account()
+            # 熔断状态按账户隔离（2026-10-12 事故）：状态文件原先不区分账户，
+            # 换登录 / 重开模拟盘 / 状态残留时，陈旧 net_deposits 会与新账户净值
+            # 错配，凭空造出巨额假回撤（实测 dd=100.1% 永久熔断）。账户变了就
+            # 重新锚定并立即落盘。
+            if self.breakers.bind_account(getattr(st["account"], "login", None)):
+                self.breakers.save(CFG.state_path.parent / "breakers.json")
             st["positions"] = await self.client.get_positions()
             summary["last_close"] = float(st["bundle"].frames["1m"]["close"].iloc[-1])
 

@@ -367,6 +367,19 @@ class DecisionConfig:
     #    让利润奔跑；仅当浮盈从峰值回落到保本线以下才离场。
     lock_profit_min_usd: float = _TOML.get("decision", {}).get("lock_profit_min_usd", 8.0)
     lock_profit_gap_usd: float = _TOML.get("decision", {}).get("lock_profit_gap_usd", 2.0)
+    # ---- 渐进式锁盈移动止损（用户 2026-10-12 要求）----
+    # 用户原话：「利润获取到止盈的 75% 时启动保护盈利（保本/保护低盈利）的
+    #   止损点位，类似移动止损：止盈点不动，止损位置随盈利逐渐上移」。
+    # 参数（用户 2026-10-12 选定）：0.77 / 0.68 / $2.2
+    #: 触发比例：浮盈达到止盈距离的该比例时启动锁盈。
+    trail_trigger_tp_frac: float = _TOML.get("decision", {}).get(
+        "trail_trigger_tp_frac", 0.77)
+    #: 允许回撤的止盈距离比例：锁定额 = 浮盈 − 本值 × 止盈距离，决定跟多紧。
+    trail_giveback_tp_frac: float = _TOML.get("decision", {}).get(
+        "trail_giveback_tp_frac", 0.68)
+    #: 触发后至少锁定的低额盈利（美元）——满足"保本/保护低盈利"。
+    trail_min_lock_usd: float = _TOML.get("decision", {}).get(
+        "trail_min_lock_usd", 2.2)
     reserve_min_profit: float = _TOML.get("decision", {}).get("reserve_min_profit", 5.0)
     #: 信号回吐平仓的**z 落差**（峰值 z − 当前 z）。
     #: 原 `reserve_drop_score=0.6` 是绝对分落差；在旧尺度（σ=0.4895）上

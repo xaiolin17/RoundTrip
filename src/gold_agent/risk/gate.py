@@ -167,8 +167,11 @@ class RiskGate:
                                            "lots": pos.volume})
 
         r = ev.result
-        # 仓位/熔断的**基准净值**：设了 `SIZING_EQUITY_BASE` 则用它，否则
-        # 用真实净值（默认）。使小账户与基准账户得到逐笔一致的仓位与阈值。
+        # **仓位与熔断的基准净值**：设了 `SIZING_EQUITY_BASE` 则用它，否则用
+        # 真实净值（默认）。「100 账户按 10000 口径」在这个基准上同时决定
+        # **手数**（`position_lots`）与**熔断阈值**（`breakers.check` 内自算
+        # 同一基准，用户 2026-10-12 选定）——两者口径统一，小账户与大账户
+        # 逐笔一致；账面仍只占真实资金，风险不放大。
         base_eq = sizing_equity(account.equity)
         # ---------- 熔断 ----------
         # ⚠️ 单位：`CircuitBreakers.check()` 内是
@@ -185,8 +188,7 @@ class RiskGate:
         # 也就是说这条熔断实际上被静默摘掉了，而不是"由别处接管"。
         # 现改为按配置驱动，默认仍为 false，保持行为不变，但**可被显式打开**。
         reject = self.breakers.check(account.equity, margin_used,
-                                     high_risk_window=CFG.risk.news_high_risk_window,
-                                     base_equity=base_eq)
+                                     high_risk_window=CFG.risk.news_high_risk_window)
         if reject:
             return Approved(ok=False, reason=f"circuit: {reject}")
         # ---------- 分歧加严 ----------

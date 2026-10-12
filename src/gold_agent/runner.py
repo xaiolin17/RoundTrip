@@ -53,9 +53,13 @@ def _zh_reason(reason: str | None) -> str:
         ("grid_layers_empty", "网格层数为空"),
         ("grid_exposure_cap", "网格总敞口超上限"),
         ("direction_bias_halt", "方向偏置停机"),
-        ("cooloff_until", "冷却至"),
+        # ⚠️ 连亏冷却**只停开仓/加仓**（挂单也算开仓），不暂停程序：
+        #    持仓的止损止盈/移损/平仓/撤单调仓照常运行（见 gate.evaluate 的
+        #    早返回分支，离场动作永不经 `breakers.check`）。用户 2026-10-12 澄清
+        #    「是开仓和加仓冷却 并不是说直接暂停程序」，故文案去掉"停机"字样。
+        ("cooloff_until", "连亏冷却（仅停开仓/加仓）至"),
         ("daily_loss_stop", "当日亏损停机"),
-        ("consecutive_losses", "连续亏损停机"),
+        ("consecutive_losses", "连亏冷却（仅停开仓/加仓）"),
         ("friday_late", "周五尾盘不开仓"),
         ("drawdown_halt", "回撤停机"),
     ):

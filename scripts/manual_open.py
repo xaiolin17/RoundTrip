@@ -62,9 +62,9 @@ async def main() -> None:
 
     # --- 风控：完整仓位计算（0.01 手最小）---
     breakers = CircuitBreakers.load(CFG.state_path.parent / "breakers.json")
-    base_eq = sizing_equity(acc.equity)   # 基准净值（SIZING_EQUITY_BASE，默认=真实净值）
-    reject = breakers.check(acc.equity, acc.margin,
-                            high_risk_window=False, base_equity=base_eq)
+    base_eq = sizing_equity(acc.equity)   # 仓位与熔断的基准净值（SIZING_EQUITY_BASE，默认=真实净值）
+    # 熔断阈值由 check 内部按同一基准（sizing_equity）自算，与主流程 gate 一致。
+    reject = breakers.check(acc.equity, acc.margin, high_risk_window=False)
     if reject:
         print(f"风控熔断拦截: {reject}")
         return

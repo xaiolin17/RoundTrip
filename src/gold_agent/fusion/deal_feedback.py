@@ -90,6 +90,9 @@ class DealFeedback:
         self.stats_path = d / "trade_stats.json"
         self.cursor_path = d / "deals_cursor.json"
         self.cash_cursor_path = d / "cash_cursor.json"
+        #: 熔断状态文件。⚠️ 出入金补偿（on_cash_flow）会**立即**改写熔断器，
+        #: 必须就地落盘 —— 见 poll() 里的即时持久化说明。
+        self.breakers_path = d / "breakers.json"
         self.stats = TradeStats()
         self.history: list[dict] = []
         self.cursor = 0.0
@@ -150,6 +153,14 @@ class DealFeedback:
             return []
         # 出入金流水（DEAL_TYPE_BALANCE）—— 从回撤里剔除，避免把出金当亏损。
         # 实测 10-01 一笔 -100150.57 出金曾造成 23 轮 "max_drawdown 99.0%" 误熔断。
+        #
+        # ⚠️ 事故（2026-10-12）：`on_cash_flow` 只在**内存**里改熔断器，而
+        #    `breakers.save` 原先全项目只有 `graph.py` 成功执行路径一处调用 ——
+        #    reject / 出错 / 进程重启都会让这次修正**丢失**。实测 09:37 读到一笔
+        #    -10010 出入金把 net_deposits 调低、dd 归零；09:40 进程重启后从磁盘
+        #    读回陈旧的 net_deposits=426079.10，与新净值 92.89 错配 -> dd=100.1%
+        #    -> 永久熔断。故此处**改动完立即落盘**。
+        breakers_dirty = False
         try:
             n_cash = 0
             for op in await client.get_balance_ops(self._cash_cursor):
@@ -164,8 +175,12 @@ class DealFeedback:
                 n_cash += 1
             if n_cash:
                 self._save_cash_cursor()
+                breakers_dirty = True
         except Exception as e:
             log_warn(f"交割单反馈: 出入金流水读取失败 {type(e).__name__}: {e}")
+        # 出入金补偿已改写熔断器 -> 立即落盘（不能等到下一轮成功开仓才写）
+        if breakers_dirty:
+            self.breakers.save(self.breakers_path)
         new = [d for d in deals if d["time"] > self.cursor and d.get("magic") == CFG.mt5.magic]
         if not new:
             if deals:
@@ -238,6 +253,8 @@ class DealFeedback:
             enriched.append(rec)
         self.cursor = max(d["time"] for d in new)
         self._save()
+        # 平仓反馈改写了熔断器（连亏计数/日亏/峰值）-> 立即落盘，重启不丢
+        self.breakers.save(self.breakers_path)
         log_info(f"交割单反馈: 新增 {len(new)} 笔已平仓交易，统计={self.stats.to_dict()}")
         # ⚠️ 返回**增强后的 rec**（含 pnl / direction / pred_sign），不是原始 deal：
         #    调用方要读 rec["pred_sign"] 做贝叶斯回填，返回原始 deal 会 KeyError/None。

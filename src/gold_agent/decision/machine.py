@@ -558,6 +558,53 @@ class DecisionEngine:
         locked_sl = (pos.price_open + lock_gap
                      if direction == "LONG"
                      else pos.price_open - lock_gap)
+        # ---- 渐进式锁盈移动止损（用户 2026-10-12）----
+        # 需求原话：「利润获取到止盈的 75% 时启动保护盈利（保本/保护低盈利）的
+        #   止损点位，类似移动止损：**止盈点不动**，止损位置随盈利逐渐上移」。
+        #
+        # 设计（商业级三段式）：
+        #   1) 触发：浮盈 >= 止盈距离 × trail_trigger_tp_frac(0.77)。
+        #      止盈距离按**美元**计：tp_usd = |止盈价 − 开仓价| × 每价格单位美元值，
+        #      于是该比例与止损止盈在同一风险口径下比较，不随手数漂移。
+        #   2) 锁定：lock_usd = 浮盈 − trail_giveback_tp_frac × tp_usd，夹到
+        #      [trail_min_lock_usd, 浮盈]。触发瞬间浮盈 = 0.77×tp_usd，
+        #      回撤比例 0.68 时锁 9% 止盈额（保护低盈利）；若低于最低锁定则保底
+        #      （保本＋小额盈利）。浮盈越大锁得越多 —— 即"止损随盈利逐渐上移"。
+        #   3) 棘轮：只上移、不回撤（`sl_is_old` 判定）。
+        #
+        # 两条硬约束（否则 MT5 报 'Invalid stops'）：
+        #   · 新止损必须落在**盈利侧**（LONG: > 开仓价；SHORT: < 开仓价）；
+        #   · 与现价留出 pad 安全间隔（与 `_tighten_levels` 同口径）。
+        # 止盈不动：`new_tp=None`，gate 沿用原止盈（keep_tp=pos.tp）。
+        tp_usd = 0.0
+        if getattr(pos, "tp", None):
+            tp_usd = abs(float(pos.tp) - pos.price_open) * max(usd_per_price_unit, 1e-9)
+        if (CFG.decision.trail_trigger_tp_frac > 0 and tp_usd > 0
+                and cur_profit >= CFG.decision.trail_trigger_tp_frac * tp_usd):
+            lock_usd = cur_profit - CFG.decision.trail_giveback_tp_frac * tp_usd
+            lock_usd = min(max(lock_usd, CFG.decision.trail_min_lock_usd), cur_profit)
+            sign = 1.0 if direction == "LONG" else -1.0
+            lock_price = round(pos.price_open
+                               + sign * lock_usd / max(usd_per_price_unit, 1e-9),
+                               _PX_DIGITS)
+            cur_px = float(getattr(ctx, "last_close", 0.0) or 0.0)
+            pad = max(0.25, (getattr(ctx, "atr", None) or 0.0) * 0.05)
+            if direction == "LONG":
+                valid = (lock_price > pos.price_open
+                         and (cur_px <= 0 or lock_price < cur_px - pad))
+                sl_is_old = pos.sl is None or pos.sl < lock_price
+            else:
+                valid = (lock_price < pos.price_open
+                         and (cur_px <= 0 or lock_price > cur_px + pad))
+                sl_is_old = pos.sl is None or pos.sl > lock_price
+            if valid and sl_is_old:
+                return Proposal(kind="modify_sltp", direction=direction, entry=pos.ticket,
+                                tp_struct=lock_price, reasons=[
+                                    f"渐进锁盈：浮盈 ${cur_profit:.2f} 达止盈 "
+                                    f"{cur_profit / tp_usd:.0%}"
+                                    f"（≥{CFG.decision.trail_trigger_tp_frac:.0%}），"
+                                    f"止损上移至 {lock_price:.3f}"
+                                    f"（锁 ${lock_usd:.2f}，止盈不动）"])
         # 浮盈已达门槛 -> 推 SL 到保本上方（锁盈）
         if cur_profit >= CFG.decision.lock_profit_min_usd and pos.profit > 0:
             # ⚠️ 必须先规整到 symbol digits（XAUUSDm=3），否则幂等判定永不收敛。
@@ -575,8 +622,12 @@ class DecisionEngine:
                                     f"移动止损锁盈：浮盈 ${cur_profit:.2f}，"
                                     f"止损推至 {locked_sl:.3f}（锁 ${CFG.decision.lock_profit_gap_usd:.0f}）"])
         # 浮盈曾达门槛但已回吐到保本下方 -> 离场（防止盈利单变亏损单）
-        if (self._profit_peak[key_pos] >= CFG.decision.lock_profit_min_usd
-                and cur_profit < 0):
+        # 武装门槛取「固定锁盈门槛 $8」与新「渐进锁盈触发额(0.77×tp_usd)」的较小者：
+        # 触发过渐进锁盈的仓位，即便止损因故未能挂上，也必须在回吐到亏损时离场。
+        arm_usd = CFG.decision.lock_profit_min_usd
+        if tp_usd > 0 and CFG.decision.trail_trigger_tp_frac > 0:
+            arm_usd = min(arm_usd, CFG.decision.trail_trigger_tp_frac * tp_usd)
+        if (self._profit_peak[key_pos] >= arm_usd and cur_profit < 0):
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
                             reasons=[f"锁盈回吐：峰值 ${self._profit_peak[key_pos]:.2f} "
                                      f"-> 现 ${cur_profit:.2f}，保本离场"])

@@ -651,6 +651,94 @@ def test_signal_giveback_tightens_instead_of_closing():
     assert sl == p.tp_struct
 
 
+# ========== 渐进式锁盈移动止损（用户 2026-10-12）==========
+def _trail_ctx(px: float, pos: PositionRow, atr: float = 5.0) -> DecisionContext:
+    """锁盈测试上下文：固定每价格单位美元值。
+
+    XAUUSDm：point_value_per_lot=0.1（每手每 point=0.001 的美元值），
+    0.01 手 -> 每 1.0 价格单位 = 0.1/0.001×0.01 = $1。
+    """
+    c = _ctx(score=0.0, holding=[pos])
+    c.last_close = px
+    c.atr = atr
+    c.point_value_per_lot = 0.1
+    return c
+
+
+def _reasons(p) -> str:
+    return " ".join(p.reasons or [])
+
+
+def test_trail_lock_triggers_at_77pct_and_keeps_tp():
+    """浮盈达止盈 77% -> 启动渐进锁盈：止损上移、**止盈不动**。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    # 开仓 4300 / 止盈 4360 -> 止盈距离 $60；77% = $46.2；现浮盈 $48。
+    pos = PositionRow(ticket=801, symbol="XAUUSDm", type="LONG", volume=0.01,
+                      price_open=4300.0, sl=4280.0, tp=4360.0, profit=48.0,
+                      swap=0, time=time.time(), comment="", magic=CFG.mt5.magic)
+    p = e.decide(_trail_ctx(4348.0, pos))
+    assert p.kind == "modify_sltp", f"应在 77% 触发锁盈，得到 {p.kind}"
+    assert p.new_tp is None, "止盈必须不动（new_tp=None）"
+    # lock = 48 − 0.68×60 = 7.2 -> 止损 4300 + 7.2 = 4307.2
+    assert p.tp_struct == pytest.approx(4307.2, abs=1e-6), p.tp_struct
+    assert "渐进锁盈" in _reasons(p)
+
+    class _P:
+        positions = [pos]
+        pending_orders = []
+    ap = e.gate.evaluate(p, _trail_ctx(4348.0, pos).ev,
+                         type("A", (), {"equity": 1e5, "margin": 0.0})(),
+                         _P(), 0.1, None, 5.0, 0.008)
+    assert ap.ok, f"锁盈改单必须放行（收窄不受 min_rr 限制），得到 {ap.reason}"
+    assert ap.plan["keep_tp"] == 4360.0, "gate 应沿用原止盈（止盈不动）"
+
+
+def test_trail_lock_not_triggered_below_77pct():
+    """未达 77% 不启动渐进锁盈（止损停在固定 $8 锁盈位，不是渐进位）。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    pos = PositionRow(ticket=802, symbol="XAUUSDm", type="LONG", volume=0.01,
+                      price_open=4300.0, sl=4302.0, tp=4360.0, profit=44.0,
+                      swap=0, time=time.time(), comment="", magic=CFG.mt5.magic)
+    p = e.decide(_trail_ctx(4344.0, pos))
+    assert "渐进锁盈" not in _reasons(p), f"44 < 46.2 不应触发，得到 {p.reasons}"
+
+
+def test_trail_lock_ratchets_up_only():
+    """棘轮：浮盈增长止损上移；浮盈回撤止损**不下移**。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    pos = PositionRow(ticket=803, symbol="XAUUSDm", type="LONG", volume=0.01,
+                      price_open=4300.0, sl=4280.0, tp=4360.0, profit=48.0,
+                      swap=0, time=time.time(), comment="", magic=CFG.mt5.magic)
+    p1 = e.decide(_trail_ctx(4348.0, pos))
+    assert p1.kind == "modify_sltp", p1.kind
+    assert p1.tp_struct == pytest.approx(4307.2, abs=1e-6), p1.tp_struct
+    pos.sl = p1.tp_struct                      # 模拟 MT5 已落单
+    # 浮盈升到 $50 -> 锁定额 9.2 -> 止损 4309.2（上移）
+    pos.profit = 50.0
+    p2 = e.decide(_trail_ctx(4350.0, pos))
+    assert p2.kind == "modify_sltp", p2.kind
+    assert p2.tp_struct == pytest.approx(4309.2, abs=1e-6), p2.tp_struct
+    pos.sl = p2.tp_struct
+    # 浮盈回撤到 $47 -> 锁定额 6.2 -> 止损 4306.2（低于现 4309.2，**不得下移**）
+    pos.profit = 47.0
+    p3 = e.decide(_trail_ctx(4347.0, pos))
+    assert "渐进锁盈" not in _reasons(p3), f"回撤不应下移止损，得到 {p3.reasons}"
+    assert pos.sl == pytest.approx(4309.2, abs=1e-6)
+
+
+def test_trail_lock_short_symmetric():
+    """做空对称：止损随盈利**向盈利侧（向下）**上移，止盈不动。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    pos = PositionRow(ticket=804, symbol="XAUUSDm", type="SHORT", volume=0.01,
+                      price_open=4300.0, sl=4320.0, tp=4240.0, profit=48.0,
+                      swap=0, time=time.time(), comment="", magic=CFG.mt5.magic)
+    p = e.decide(_trail_ctx(4252.0, pos))
+    assert p.kind == "modify_sltp", f"做空应在 77% 触发锁盈，得到 {p.kind}"
+    assert p.new_tp is None, "止盈必须不动"
+    # lock = 48 − 0.68×60 = 7.2 -> 止损 4300 − 7.2 = 4292.8
+    assert p.tp_struct == pytest.approx(4292.8, abs=1e-6), p.tp_struct
+
+
 def test_tighten_never_returns_inverted_stops():
     """收窄后的 SL/TP 必须仍在正确一侧（否则 MT5 报 Invalid stops）。"""
     e = DecisionEngine(RiskGate(CircuitBreakers()))
