@@ -526,6 +526,9 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
          的起点价 + `structure_sl_buffer_atr`×ATR 波动缓冲，下限
          `structure_sl_min_atr`×ATR），`sl_source="struct_invalidation"`；
          无有效边界时**回退**「由止盈反推」，`sl_source="rr_from_tp"`
+      4. 赔率联动：止损锚定结构边界后若赔率（止盈/止损）低于阈值，按阈值
+         反推**外扩止盈**——加仓用 `min_rr`，首仓用 `first_entry_min_rr`
+         （2026-10-13 起首仓由此前的"硬拒"改为"外扩"，见步骤 3c 注释）
 
     为什么先缩止盈再定止损：若用未缩的结构距离反推止损、再缩止盈，实际盈亏比
     会掉到 `tp_shrink/min_rr`（首仓 0.70/1.8 ≈ 0.39）；先缩止盈再反推才能
@@ -627,6 +630,24 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
                 f" < 下限 {CFG.risk.min_rr} → 按盈亏比反推，止盈距离 "
                 f"{tp_dist:.3f} 外扩到 {need_tp:.3f}")
             tp_dist = need_tp
+
+    # ---- 3c. 首仓止盈「过闸」外扩（**仅首仓** `is_add=False`，与 3b 同形）----
+    # 事故（2026-10-13）：首仓止损锚 15m 结构失效边界（实测距入场约 28 点），
+    # 止盈被「缩 70% + 下限 0.5×ATR」压到约 5 点 → 赔率恒约 0.19，被原先的
+    # `first_entry_min_rr` 硬闸 21/21 全拒，一小时突破也开不出首仓。
+    # 依据 research/32_first_entry_positioning.py（历史 237 笔真实首仓、同一批
+    # 信号的反事实回放）：在现状口径（A′ 净R +0.128）基础上**只把止盈外扩到刚好
+    # 过闸**（B′），净R +0.174、赔率中位 0.54→0.84、tR +2.79，是「既过闸又
+    # 不为负」的唯一改法；扩到满赔率 `min_rr`（C′ −0.273）或反向收止损
+    # （D′ −0.214）都明显转差，故**不采用**。故把原「硬拒」改为「外扩」。
+    if (not is_add) and out.sl_source == "struct_invalidation":
+        need_tp = sl_dist * CFG.risk.first_entry_min_rr
+        if tp_dist < need_tp - 1e-9:
+            out.notes.append(
+                f"首仓结构止损 {sl_dist:.3f} 使赔率仅 {tp_dist / sl_dist:.2f}"
+                f" < 下限 {CFG.risk.first_entry_min_rr} → 按赔率反推，止盈距离 "
+                f"{tp_dist:.3f} 外扩到 {need_tp:.3f}")
+            tp_dist = need_tp
     out.sl = round(entry - sl_dist if is_long else entry + sl_dist, digits)
 
     out.tp = round(entry + tp_dist if is_long else entry - tp_dist, digits)
@@ -643,18 +664,9 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
             and tp_dist < sl_dist * CFG.risk.min_rr - 1e-9):
         out.reason = f"rr_below_{CFG.risk.min_rr}"
         return out
-    # ---- 3c. 首仓/挂单确定性赔率下限（硬闸，用户 2026-10-12 选定，阈值 0.8）----
-    # 事故（2026-10-12）：首仓 LONG 止损锚 15m 结构失效边界（距入场 30.724），
-    # 止盈被「缩 70% + 0.5×ATR 下限」托到 6.574 → 赔率仅 0.21 仍被放行开仓。
-    # 上面的 `rr_from_tp` 校验只覆盖回退路径，结构止损路径没有赔率下限，
-    # 故在此为首仓（is_add=False）补一道本地确定性赔率闸：低于阈值直接拒单。
-    # 与上面的 min_rr 校验同样用**未规整**距离比较（原因见上）。
-    # 依据 research/30_first_entry_rr_floor.py（回放 305 笔真实首仓，阈值 0.8
-    # 仅剔除那笔 0.21 坏单，保留 1.2 等确定性单与 1.2~1.8 正常区间）。
-    if ((not is_add)
-            and tp_dist < sl_dist * CFG.risk.first_entry_min_rr - 1e-9):
-        out.reason = f"rr_below_{CFG.risk.first_entry_min_rr}"
-        return out
+    # ⚠️ 2026-10-13 移除首仓确定性赔率「硬拒」（原 reason=rr_below_0.8）：
+    #    上面步骤 3c 已把首仓结构止损路径的止盈**外扩到** first_entry_min_rr×止损，
+    #    回退路径赔率恒为 min_rr（>first_entry_min_rr），故该硬拒已不可达。
     out.sl_dist = round(abs(entry - out.sl), digits)
     out.tp_dist = round(abs(out.tp - entry), digits)
 
