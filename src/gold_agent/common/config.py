@@ -267,6 +267,11 @@ class RiskConfig:
     daily_loss_stop_pct: float = _TOML.get("risk", {}).get("daily_loss_stop_pct", 0.03)
     consecutive_loss_cooloff_h: float = _TOML.get("risk", {}).get("consecutive_loss_cooloff_h", 4.0)
     consecutive_loss_n: int = _TOML.get("risk", {}).get("consecutive_loss_n", 4)
+    #: 检测到**手动平仓**（用户在 MT5 终端/手机/网页主动平仓）后，
+    #: 暂停**全部开仓类动作**（新开仓/加仓/挂单）的时长（分钟）。
+    #: ⚠️ 仅拦截开仓；平仓/移损/撤单等离场动作照常（gate.evaluate 早返回，
+    #:    离场动作永不经 `breakers.check`）。SL/TP/强平等**非人工**平仓不触发。
+    manual_close_pause_min: float = _TOML.get("risk", {}).get("manual_close_pause_min", 15.0)
     max_drawdown_halt_pct: float = _TOML.get("risk", {}).get("max_drawdown_halt_pct", 0.12)
     max_drawdown_deleverage_pct: float = _TOML.get("risk", {}).get("max_drawdown_deleverage_pct", 0.08)
     margin_use_cap: float = _TOML.get("risk", {}).get("margin_use_cap", 0.60)

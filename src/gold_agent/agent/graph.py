@@ -533,7 +533,12 @@ class Graph:
                             position_ticket=int(plan["position_ticket"]),
                             comment="goldagent-close",
                             idempotency_key=f"close-{plan['position_ticket']}")
-            return await self.executor.execute(req)
+            res = await self.executor.execute(req)
+            if res.ok and CFG.trade_mode != "dry_run":
+                # 记入**系统平仓台账**：交割单不带来源标记，靠这张台账把系统平仓
+                # 与用户手动平仓区分开（详见 CircuitBreakers.note_system_close）。
+                self.breakers.note_system_close(int(plan["position_ticket"]))
+            return res
         if kind == "modify_sltp":
             # 保护性移损 / 信号转弱收窄：SL 与 TP 一起改（tp_struct 携带新 SL，
             # new_tp 携带新 TP；TP 未给则由风控从原持仓带出）

@@ -58,6 +58,8 @@ def _zh_reason(reason: str | None) -> str:
         #    早返回分支，离场动作永不经 `breakers.check`）。用户 2026-10-12 澄清
         #    「是开仓和加仓冷却 并不是说直接暂停程序」，故文案去掉"停机"字样。
         ("cooloff_until", "连亏冷却（仅停开仓/加仓）至"),
+        # 用户 2026-10-13：检测到手动平仓（主动管理）→ 暂停开仓类动作 15 分钟。
+        ("manual_close_pause_until", "手动平仓后暂停开仓（仅停开仓/加仓）至"),
         ("daily_loss_stop", "当日亏损停机"),
         ("consecutive_losses", "连亏冷却（仅停开仓/加仓）"),
         ("friday_late", "周五尾盘不开仓"),

@@ -360,6 +360,9 @@ class MT5Client:
                     "time": d.time, "type": int(d.type), "volume": d.volume,
                     "price": d.price, "profit": d.profit, "swap": d.swap,
                     "commission": d.commission, "fee": d.fee,
+                    # reason：MT5 平仓来源码（0=客户端手动/1=手机/2=网页/
+                    # 3=程序化/4=SL/5=TP/6=强平）。用于区分手动平仓与自动平仓。
+                    "reason": int(d.reason),
                     "symbol": d.symbol, "comment": d.comment or "", "magic": d.magic})
         return out
 

@@ -47,6 +47,15 @@ class CircuitBreakers:
     #: 状态残留后，陈旧的 `net_deposits` / `peak_pnl` 会与新账户净值错配，
     #: 凭空造出巨额回撤（实测 `dd=100.1%` 并永久熔断）。启动时必须与当前账户比对。
     account_login: int = 0
+    #: 手动平仓后**暂停开仓**的截止时间戳（0 = 未暂停）。用户 2026-10-13：
+    #: 「如果有非系统的平仓单子产生 那么将暂停开仓动作15分钟 … 说明我手动在
+    #:  mt5 进行平仓了 进行了主动管理」。与 `cooloff_until` 同构，纯时间型，
+    #: 到期自愈。⚠️ 只拦开仓类（新开仓/加仓/挂单），离场动作不经此闸。
+    manual_close_pause_until: float = 0.0
+    #: **系统发起**的平仓台账（position ticket 列表）。交割单本身不带
+    #: 「谁平的」标记，靠这张台账 + deal.reason 把系统平仓与手动平仓区分开：
+    #: 平仓 deal 的 position_id 命中即视为系统平仓（自动消费），否则按 reason 判。
+    system_closed_tickets: list = field(default_factory=list)
 
     def on_cash_flow(self, profit: float, ts: float | None = None) -> None:
         """记一笔出入金（正=入金，负=出金）。
@@ -144,6 +153,12 @@ class CircuitBreakers:
             self.consecutive_losses = 0
         if now < self.cooloff_until:
             return f"cooloff_until {time.strftime('%H:%M', time.localtime(self.cooloff_until))}"
+        # ---- 手动平仓后暂停开仓（用户 2026-10-13）----
+        # 检测到用户手动平仓 → 暂停全部开仓类动作 `manual_close_pause_min` 分钟，
+        # 视为「用户在进行主动管理」，此时不该由策略再加码。纯时间型，到期自愈。
+        if now < self.manual_close_pause_until:
+            return (f"manual_close_pause_until "
+                    f"{time.strftime('%H:%M', time.localtime(self.manual_close_pause_until))}")
         if self.consecutive_losses >= CFG.risk.consecutive_loss_n:
             return f"consecutive_losses>={CFG.risk.consecutive_loss_n}"
         # 当日亏损停机：默认**关闭**（`daily_loss_stop_pct=0`，用户 2026-10-12
@@ -261,6 +276,41 @@ class CircuitBreakers:
         if self.anchored:
             self.peak_pnl = max(self.peak_pnl, self._pnl_now(equity))
         self.record_direction(direction)
+
+    # ---------- 手动平仓识别与「暂停开仓」（用户 2026-10-13）----------
+    def note_system_close(self, position_ticket: int | str | None) -> None:
+        """登记一笔**系统发起**的平仓（position ticket），供交割单比对时区分来源。"""
+        try:
+            t = int(position_ticket)
+        except (TypeError, ValueError):
+            return
+        if t not in self.system_closed_tickets:
+            self.system_closed_tickets.append(t)
+        # 只保留最近 200 条，避免状态文件无限增长
+        if len(self.system_closed_tickets) > 200:
+            del self.system_closed_tickets[:-200]
+
+    def consume_system_close(self, position_ticket: int | str | None) -> bool:
+        """该 position ticket 若是**系统平仓**则消费并返回 True，否则 False。"""
+        try:
+            t = int(position_ticket)
+        except (TypeError, ValueError):
+            return False
+        if t in self.system_closed_tickets:
+            self.system_closed_tickets.remove(t)
+            return True
+        return False
+
+    def note_manual_close(self, close_ts: float | None = None) -> None:
+        """记录一次**手动平仓**：暂停开仓至平仓时刻 + `manual_close_pause_min` 分钟。
+
+        以**平仓成交时刻**为基准（而非"检测到的此刻"）：若进程曾离线、下一轮才
+        补读到这笔成交，暂停会在正确的时刻自然到期，不会凭空顺延。
+        """
+        base = time.time() if close_ts is None else float(close_ts)
+        until = base + float(CFG.risk.manual_close_pause_min) * 60.0
+        if until > self.manual_close_pause_until:
+            self.manual_close_pause_until = until
 
     # ---------- 持久化 ----------
     def to_dict(self) -> dict:

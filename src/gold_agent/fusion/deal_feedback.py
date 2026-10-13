@@ -23,6 +23,19 @@ from gold_agent.fusion.bayes import BayesianPool
 from gold_agent.risk.position import CircuitBreakers, wilson_lower
 
 
+#: MT5 deal.reason 中属于**人工**平仓的来源码（客户端/手机/网页）。
+#: 其余（3=程序化 / 4=SL / 5=TP / 6=强平）均非人工主动平仓。
+_MANUAL_CLOSE_REASONS = {0, 1, 2}
+
+
+def _is_manual_close(d: dict) -> bool:
+    """该平仓 deal 是否为**人工**主动平仓（用户在终端/手机/网页点的平仓）。"""
+    try:
+        return int(d.get("reason", -1)) in _MANUAL_CLOSE_REASONS
+    except (TypeError, ValueError):
+        return False
+
+
 def _deal_direction(d: dict) -> int | None:
     """从交割单推断方向（1=LONG, -1=SHORT）。用于 P2-2 方向偏置监控。
 
@@ -218,6 +231,17 @@ class DealFeedback:
                 eq = float(account_equity)
             self.breakers.on_trade_closed(pnl, eq, direction=direction)
             rec["direction"] = direction
+            # ---- 手动平仓识别（用户 2026-10-13）----
+            # 用户在 MT5 主动平仓 == 主动管理，此时暂停开仓类动作 15 分钟。
+            # 交割单不带「谁平的」标记，故先查**系统平仓台账**（position_id 命中
+            # 即系统平仓，消费并跳过），再看 deal.reason 是否为人工来源，避免
+            # 每次 SL/TP 命中都误触发暂停。
+            pid = d.get("position_id")
+            if not self.breakers.consume_system_close(pid) and _is_manual_close(d):
+                self.breakers.note_manual_close(float(d.get("time") or 0.0))
+                log_warn(f"检测到手动平仓：暂停开仓 "
+                         f"{CFG.risk.manual_close_pause_min:.0f} 分钟"
+                         f"（持仓 #{pid}，来源 reason={d.get('reason')}）")
             # 预测符号：优先 order 桥接（挂单成交），其次 position 桥（市价/加仓）
             #
             # ⚠️ 事故修复：原实现只查 `pred_orders.pop(str(d["order"]))`，
