@@ -207,6 +207,12 @@ class RiskConfig:
     # 刚好过闸净R +0.174 最优，扩到满赔率或反向收止损均转差）。
     first_entry_min_rr: float = _TOML.get("risk", {}).get(
         "first_entry_min_rr", 0.8)
+    #: 时段收紧窗口内（见 config.in_tight_window）的首仓赔率下限，替代
+    #: `first_entry_min_rr`（默认 1.8；用户在收紧窗口选定的盈亏比）。
+    #: 仅首仓（is_add=False）生效，语义与 first_entry_min_rr 完全一致
+    #: （仍为「止盈外扩」，非硬拒）。
+    first_entry_min_rr_tight: float = _TOML.get("risk", {}).get(
+        "first_entry_min_rr_tight", 1.8)
     # ---- 加仓专用定价（用户 2026-10-08 指定）----
     # 用户原话：
     #   > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.8
@@ -340,6 +346,25 @@ class DecisionConfig:
     #: 平仓的 z 门槛。原 `exit_threshold` 的等效 z ≈ 1.2/0.4895 = 2.45。
     z_exit: float = _TOML.get("decision", {}).get("z_exit", 2.45)
     exit_threshold: float = _TOML.get("decision", {}).get("exit_threshold", 1.2)
+    # ---- 时段收紧闸（用户 2026-10-13 指定）----
+    # 用户原话：
+    #   > 我想调整的是凌晨1：00到10：00的开仓信号强度要提高 盈亏比也要提高
+    # 语义：在 `tight_window_tz_offset`（默认北京时间 UTC+8）的
+    #   [start_hour, end_hour) 整点区间内，开仓/加仓的信号强度阈值抬高到
+    #   `z_min_tight`，并把首仓赔率下限抬高到 `risk.first_entry_min_rr_tight`。
+    # 判定时间戳由 graph 注入（`summary["ts"]`，epoch 秒，UTC）；缺失
+    # （None：单测/回放未传）时**一律不收紧**，保证基线确定性、不随运行时刻漂移。
+    tight_window_enabled: bool = _TOML.get("decision", {}).get(
+        "tight_window_enabled", True)
+    tight_window_start_hour: int = _TOML.get("decision", {}).get(
+        "tight_window_start_hour", 1)
+    tight_window_end_hour: int = _TOML.get("decision", {}).get(
+        "tight_window_end_hour", 10)
+    tight_window_tz_offset: int = _TOML.get("decision", {}).get(
+        "tight_window_tz_offset", 8)
+    #: 收紧窗口内的信号强度 z 阈值（默认 4.0，替代 z_min）。
+    #: 用户选定值 = 4.0（日常 z_min=2.66）。
+    z_min_tight: float = _TOML.get("decision", {}).get("z_min_tight", 4.0)
     # ⚠️ `exit_persist_rounds` 已于 2026-09-30 **删除**：平仓判据改成
     #    「窗口不一致率」后（见下方 `exit_adverse_window`），代码里已无人读它。
     #    留着就是一个"改了没反应"的死配置 —— 用户明确反对
@@ -489,3 +514,21 @@ class Config:
 
 
 CFG = Config()
+
+
+def in_tight_window(ts: float | None) -> bool:
+    """当前是否处于「时段收紧窗口」（用户 2026-10-13 指定）。
+
+    窗口按 `tight_window_tz_offset`（默认 UTC+8 = 北京时间）换算出的**整点
+    小时**判定，半开区间 [start_hour, end_hour)；start > end 表示跨零点。
+
+    `ts`：epoch 秒（UTC）。为 None、或 `tight_window_enabled=False` 时返回
+    False —— 单测/回放未注入时间戳即维持基线松紧，不随运行时刻漂移。
+    """
+    if ts is None or not CFG.decision.tight_window_enabled:
+        return False
+    offset = CFG.decision.tight_window_tz_offset * 3600
+    hour = int(((float(ts) + offset) % 86400) // 3600)
+    start = int(CFG.decision.tight_window_start_hour)
+    end = int(CFG.decision.tight_window_end_hour)
+    return (start <= hour < end) if start <= end else (hour >= start or hour < end)

@@ -334,7 +334,8 @@ def trade_levels(direction: str, entry: float, review: dict | None,
                  tp_shrink: float | None = None,
                  digits: int = 3,
                  frames: dict | None = None,
-                 is_add: bool = False) -> TradeLevels:
+                 is_add: bool = False,
+                 rr_floor: float | None = None) -> TradeLevels:
     """按 LLM 判断的压力位/支撑位算止损止盈。
 
     `digits`：该品种的价格小数位（`SymbolProfile.digits`）。
@@ -346,6 +347,10 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     `tp_shrink`：止盈**距离**的缩放比例；`None` = 用配置的
     `CFG.risk.first_tp_shrink`（首仓，0.70）。加仓路径显式传
     `CFG.risk.add_tp_shrink`（0.58）。
+
+    `rr_floor`：**首仓**赔率下限（步骤 3c 止盈外扩的目标）；`None` = 用
+    `CFG.risk.first_entry_min_rr`（0.8）。时段收紧窗口内由 gate 显式传
+    `CFG.risk.first_entry_min_rr_tight`（1.8）。加仓不受它影响（走 min_rr）。
 
     ---- 统一定价语义（用户 2026-10-09 合并首仓与加仓）----
 
@@ -497,7 +502,7 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     return _levels_from_tp(direction, entry, out, res_all, sup_all,
                            res, sup, s_res, s_sup, hint_tp, min_d,
                            tp_shrink, digits, atr=atr, frames=frames,
-                           is_add=is_add)
+                           is_add=is_add, rr_floor=rr_floor)
 
 
 def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
@@ -508,7 +513,8 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
                     tp_shrink: float, digits: int = 3,
                     atr: float | None = None,
                     frames: dict | None = None,
-                    is_add: bool = False) -> TradeLevels:
+                    is_add: bool = False,
+                    rr_floor: float | None = None) -> TradeLevels:
     """统一定价核心：**止盈缩水 + 止损优先锚定结构失效边界**。
 
     用户原话（首仓，2026-10-09）：
@@ -641,11 +647,13 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
     # 不为负」的唯一改法；扩到满赔率 `min_rr`（C′ −0.273）或反向收止损
     # （D′ −0.214）都明显转差，故**不采用**。故把原「硬拒」改为「外扩」。
     if (not is_add) and out.sl_source == "struct_invalidation":
-        need_tp = sl_dist * CFG.risk.first_entry_min_rr
+        floor = (CFG.risk.first_entry_min_rr if rr_floor is None
+                 else rr_floor)
+        need_tp = sl_dist * floor
         if tp_dist < need_tp - 1e-9:
             out.notes.append(
                 f"首仓结构止损 {sl_dist:.3f} 使赔率仅 {tp_dist / sl_dist:.2f}"
-                f" < 下限 {CFG.risk.first_entry_min_rr} → 按赔率反推，止盈距离 "
+                f" < 下限 {floor} → 按赔率反推，止盈距离 "
                 f"{tp_dist:.3f} 外扩到 {need_tp:.3f}")
             tp_dist = need_tp
     out.sl = round(entry - sl_dist if is_long else entry + sl_dist, digits)

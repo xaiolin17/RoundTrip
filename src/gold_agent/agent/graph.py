@@ -15,7 +15,7 @@ from typing import Any, TypedDict
 
 import pandas as pd
 
-from gold_agent.common.config import CFG
+from gold_agent.common.config import CFG, in_tight_window
 from gold_agent.common.logging_util import (decision_log, log_error, log_info,
                                             log_warn, trade_log)
 from gold_agent.decision.machine import DecisionContext, DecisionEngine, Proposal
@@ -303,7 +303,12 @@ class Graph:
             _sig_l = float(ev.result.sigma)
             _z_l = (abs(ev.result.score - ev.result.score_baseline) / _sig_l
                     if _sig_l > 1e-9 else 0.0)
-            need_llm = (_z_l >= CFG.decision.z_min - 0.6
+            # 「要不要叫 LLM」的门槛与决策层同口径：时段收紧窗口内一并抬高，
+            # 否则窗口内会在 |z|∈[2.06,4.0) 反复白叫 LLM 而决策层必然 hold。
+            _z_min_now = (CFG.decision.z_min_tight
+                          if in_tight_window(summary["ts"])
+                          else CFG.decision.z_min)
+            need_llm = (_z_l >= _z_min_now - 0.6
                         or bool(st["positions"].positions)
                         or bool(st["positions"].pending_orders)
                         or abs(ev.result.score_baseline) > 0.3)
@@ -315,7 +320,8 @@ class Graph:
                                   position_adds=self._position_adds,
                                   point_value_per_lot=self._point_value(),
                                   used_lots=self._used_lots(st["positions"]),
-                                  max_lots_cap=self._max_lots_cap(st["account"]))
+                                  max_lots_cap=self._max_lots_cap(st["account"]),
+                                  now_ts=summary["ts"])
             if need_llm and self.llm is not None:
                 st["llm"] = await self.llm.review_and_news(ev, st["news"],
                                                            summary["last_close"])
@@ -377,7 +383,9 @@ class Graph:
                 position_adds=self._position_adds,
                 llm_review=_rev,
                 # 自研回调检测需要小周期 K 线（缠论代理在小周期上不准）
-                frames=st["bundle"].frames)
+                frames=st["bundle"].frames,
+                # 时段收紧窗口判定用本轮时间戳（epoch 秒，UTC）
+                now_ts=summary["ts"])
             st["approved"] = approved
             # plan 必须放进 summary：控制台要靠它显示方向/入场/止损/止盈
             # （只放 ok/reason 的话，显示层读不到价位，会打出 "None手"）

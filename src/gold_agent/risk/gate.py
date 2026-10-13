@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from gold_agent.common.config import CFG
+from gold_agent.common.config import CFG, in_tight_window
 from gold_agent.common.logging_util import decision_log, trade_log
 from gold_agent.common.zh import sentiment_label
 from gold_agent.fusion.engine import FusedEvidence
@@ -88,7 +88,8 @@ class RiskGate:
     def _levels(self, direction: str, entry: float, ev, atr: float | None,
                 llm_review: dict | None = None,
                 add: bool = False,
-                frames: dict | None = None):
+                frames: dict | None = None,
+                rr_floor: float | None = None):
         """按 LLM 判断的压力位/支撑位算止损止盈（用户要求的正确语义）。
 
         ⚠️ 概念纠正：0.618 回调位是**入场点**，不是止损。
@@ -108,7 +109,7 @@ class RiskGate:
         return trade_levels(direction, entry, llm_review, ev, atr,
                             tp_shrink=(CFG.risk.add_tp_shrink if add
                                        else CFG.risk.first_tp_shrink),
-                            frames=frames, is_add=add)
+                            frames=frames, is_add=add, rr_floor=rr_floor)
 
     def evaluate(self, prop: Proposal, ev: FusedEvidence, account: AccountInfo,
                  positions: PositionsView, point_value_per_lot: float,
@@ -116,12 +117,20 @@ class RiskGate:
                  win_rate: float | None = None,
                  position_adds: dict | None = None,
                  llm_review: dict | None = None,
-                 frames: dict | None = None) -> Approved:
+                 frames: dict | None = None,
+                 now_ts: float | None = None) -> Approved:
         """从 ActionProposal 到 ApprovedOrder。
 
         止损止盈由 `_levels` 按 LLM 结构位计算；仓位按实际止损距离反推，
         锁死单笔 `risk_pct` 风险。
+
+        `now_ts`：本轮时间戳（epoch 秒，UTC），用于判定是否处于「时段收紧
+        窗口」（见 `config.in_tight_window`）。`None` = 不收紧（基线）。
         """
+        # 首仓赔率下限：时段收紧窗口内抬高（用户 2026-10-13 指定）。
+        rr_floor = (CFG.risk.first_entry_min_rr_tight
+                    if in_tight_window(now_ts)
+                    else CFG.risk.first_entry_min_rr)
         reasons = prop.reasons or []
         # ---------- 平仓/修改类直接放行（风控永不阻止离场） ----------
         if prop.kind == "modify_sltp":
@@ -224,7 +233,7 @@ class RiskGate:
             entry = prop.entry   # 市价由 executor 取当前 bid/ask
             # ---- 止损止盈看压力位/支撑位（LLM 判断 + 本地配套计算）----
             lv = self._levels(prop.direction, entry, ev, atr, llm_review,
-                              frames=frames)
+                              frames=frames, rr_floor=rr_floor)
             if not lv.ok:
                 # 用户选定：LLM 没给出可用压力位 → **不开仓**，等 LLM 可用
                 # （猜点位比不交易更危险）
@@ -381,7 +390,7 @@ class RiskGate:
 
             # ---- 止损止盈：LLM 判断的压力位/支撑位 ----
             lv = self._levels(prop.direction, pe.entry, ev, atr, llm_review,
-                              frames=frames)
+                              frames=frames, rr_floor=rr_floor)
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
 

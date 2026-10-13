@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 
-from gold_agent.common.config import CFG
+from gold_agent.common.config import CFG, in_tight_window
 from gold_agent.common.logging_util import decision_log
 from gold_agent.common.zh import direction_label, sentiment_label, verdict_label
 from gold_agent.fusion.engine import FusedEvidence
@@ -81,6 +81,9 @@ class DecisionContext:
     max_lots_cap: float = 0.0
     #: LLM 是否真的被调用并返回了 review（用于区分"LLM 说中性"与"LLM 没参与"）
     llm_available: bool = False
+    #: 本轮时间戳（epoch 秒，UTC），用于「时段收紧窗口」判定（见
+    #: `config.in_tight_window`）。None = 不收紧（单测/回放默认）。
+    now_ts: float | None = None
 
 
 def effective_score(s: float, baseline: float) -> float:
@@ -288,7 +291,10 @@ class DecisionEngine:
         （权重↑→σ↓→z↑→更易开），而不是旧的单向收紧。见 `z_score`。
         """
         z = z_score(s, sigma)
-        z_min = CFG.decision.z_min
+        # 时段收紧窗口（北京时间 01:00–10:00）内抬高开仓信号强度阈值（用户
+        # 2026-10-13 指定）：z_min → z_min_tight。now_ts 缺失时不收紧。
+        tight = in_tight_window(ctx.now_ts)
+        z_min = CFG.decision.z_min_tight if tight else CFG.decision.z_min
         if sigma > CFG.fusion.sigma_max:
             return Proposal(kind="hold",
                             reasons=[f"标准差 {sigma:.2f} > 上限 {CFG.fusion.sigma_max}"])
@@ -323,7 +329,8 @@ class DecisionEngine:
         if abs(z) < z_min:
             return Proposal(kind="hold", reasons=[
                 f"|z| {abs(z):.2f} < 阈值 {z_min} "
-                f"(S_eff={s:+.3f} 标准差={sigma:.3f})"])
+                f"(S_eff={s:+.3f} 标准差={sigma:.3f})"
+                + ("（时段收紧）" if tight else "")])
         direction = "LONG" if z > 0 else "SHORT"
 
         # ---- LLM 一致性（主路径确认环节）----
@@ -531,14 +538,19 @@ class DecisionEngine:
         room = (float(getattr(ctx, "max_lots_cap", 0.0) or 0.0)
                 - float(getattr(ctx, "used_lots", 0.0) or 0.0))
         room_ok = room >= CFG.min_lot if getattr(ctx, "max_lots_cap", 0.0) else True
-        if (same_side and abs(z) >= CFG.decision.z_min
+        # 加仓信号闸同样受时段收紧（用户 2026-10-13：开仓和加仓都作用）。
+        tight_add = in_tight_window(ctx.now_ts)
+        z_add_min = (CFG.decision.z_min_tight if tight_add
+                     else CFG.decision.z_min)
+        if (same_side and abs(z) >= z_add_min
                 and sigma <= CFG.fusion.sigma_max
                 and adds_count < CFG.risk.max_adds_per_position
                 and room_ok and score_ok and conf_ok):
             return Proposal(kind="add_layer", direction=direction, entry=pos.ticket,
                             reasons=[f"加仓 第{adds_count + 1}/{CFG.risk.max_adds_per_position}次 "
                                      f"z={z:+.2f} (需>={required:.2f} 上次={last_score}) "
-                                     f"置信={conf_cur:.2f} (上次={last_conf})"])
+                                     f"置信={conf_cur:.2f} (上次={last_conf})"
+                                     + ("（时段收紧）" if tight_add else "")])
         # ---- 超短期利润回吐检测（用户选定：改用移动止损锁盈，不再砍掉浮盈）----
         # ⚠️ 事故复盘：原实现是「浮盈从峰值回吐 50% 就**主动平仓**」，
         #    实测把 30%~75% 的浮盈砍掉：
