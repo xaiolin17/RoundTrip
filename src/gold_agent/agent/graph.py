@@ -102,9 +102,8 @@ class Graph:
         st: GraphState = {"round_id": round_id}
         summary: dict = {"round": round_id, "ts": time.time()}
         try:
-            # t0 collect
-            if not self.client._connected:
-                await self.client.initialize()
+            # t0 collect：每轮先做连接健康检查，终端掉线/重启后自动重连
+            await self.client.ensure_connected()
             st["bundle"] = await self.client.get_ohlcv()
             st["account"] = await self.client.get_account()
             # 熔断状态按账户隔离（2026-10-12 事故）：状态文件原先不区分账户，

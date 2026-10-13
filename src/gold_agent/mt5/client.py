@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -157,6 +158,39 @@ class MT5Client:
         await asyncio.get_running_loop().run_in_executor(self._io_pool, self._initialize_sync)
         self._connected = True
 
+    async def ensure_connected(self) -> None:
+        """每轮开头调用：连接健康才复用，否则强制重连。
+
+        历史事故（2026-10-13）：MT5 终端在实盘进程运行期间被关闭并重启，
+        而旧实现用 `_connected` 一次性闩锁 —— 连上后永不重连，于是此后每一轮
+        `copy_rates_from_pos` 对全周期返回空 → 质量门抛
+        "all timeframes failed quality gate" → `skip_round`，整晚零开单且无告警。
+        这里改为每轮先做健康检查（终端 IPC 存活且已连上经纪商），失效即
+        `shutdown()` + 重新 `initialize()`，使掉线/终端重启后能自愈。
+        """
+        loop = asyncio.get_running_loop()
+        if self._connected:
+            healthy = await loop.run_in_executor(self._io_pool, self._health_sync)
+            if healthy:
+                return
+            log_warn("MT5 连接已失效（终端掉线或重启），正在重连…")
+        await loop.run_in_executor(self._io_pool, self._reconnect_sync)
+        self._connected = True
+
+    def _health_sync(self) -> bool:
+        """终端 IPC 是否存活、是否已连上经纪商。"""
+        if mt5 is None:
+            return False
+        ti = mt5.terminal_info()
+        return bool(ti and ti.connected)
+
+    def _reconnect_sync(self) -> None:
+        """丢弃陈旧连接后重新初始化。"""
+        if mt5 is not None:
+            with contextlib.suppress(Exception):
+                mt5.shutdown()
+        self._initialize_sync()
+
     def _initialize_sync(self) -> None:
         cfg = CFG.mt5
         kwargs: dict = {"path": cfg.terminal_path}
@@ -275,6 +309,9 @@ class MT5Client:
             quality[tf] = "ok"
             cleaned[tf] = df
         if not cleaned:
+            # 全周期无数据 = 连接/行情源已失效：立刻标记为未就绪，
+            # 让下一轮 `ensure_connected` 走强制重连（2026-10-13 事故兜底）。
+            self._connected = False
             raise Mt5Error("all timeframes failed quality gate")
         return OHLCVBundle(symbol=CFG.mt5.symbol, fetched_at=time.time(),
                            frames=cleaned, tick=tick, quality=quality)
