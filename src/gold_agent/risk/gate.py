@@ -31,6 +31,16 @@ class Proposal:
     new_tp: float | None = None
     reasons: list[str] | None = None
     evidence_ids: list[str] | None = None
+    #: 平仓类提案的**机器可读规则代号**（英文稳定标识；中文说明在 `reasons`）。
+    #: 归因用：平仓腿在 MT5 交割单里只有 `reason=3`（机器人主动平），
+    #: **不区分触发来源**（见 research/36_active_close_gate.py 的归因说明）。
+    #: 决策日志（`proposal`）与执行日志（`round_exec` 的 `plan`）都带上它，
+    #: 事后即可按 `position_ticket` 回答"这笔真实平仓是哪条规则开的枪"。
+    #: 当前取值：`exit_adverse_rate`（窗口不一致率闸）/ `llm_adverse`（LLM 反向）/
+    #: `lock_giveback`（锁盈回吐）/ `signal_giveback`（信号回吐，收窄不可行）/
+    #: `news_adverse`（新闻不利）/ `max_holding`（持仓超时且亏损）。
+    #: ⚠️ 与 risk 拒绝码同属"机器可读标识"：只在显示层翻译，源码里保持英文。
+    reason_codes: list[str] | None = None
 
 
 @dataclass
@@ -173,7 +183,10 @@ class RiskGate:
             return Approved(ok=True, plan={"kind": prop.kind,
                                            "direction": prop.direction,
                                            "position_ticket": prop.entry,
-                                           "lots": pos.volume})
+                                           "lots": pos.volume,
+                                           # 规则代号随 plan 落进 `round_exec` 日志，
+                                           # 使"真实平仓 <-> 触发规则"可事后对齐
+                                           "reason_codes": prop.reason_codes})
 
         r = ev.result
         # **仓位与熔断的基准净值**：设了 `SIZING_EQUITY_BASE` 则用它，否则用

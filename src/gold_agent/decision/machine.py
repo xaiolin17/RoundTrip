@@ -493,10 +493,12 @@ class DecisionEngine:
             return Proposal(kind="close_position", direction=direction,
                             entry=pos.ticket,
                             reasons=[f"近 {n_hist} 轮方向不一致率 {rate:.0%} "
-                                     f">= {CFG.decision.exit_adverse_rate:.0%}"])
+                                     f">= {CFG.decision.exit_adverse_rate:.0%}"],
+                            reason_codes=["exit_adverse_rate"])
         if adverse_llm:
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
-                            reasons=[f"LLM 反向 {verdict_label(verdict)}/{conf:.2f}"])
+                            reasons=[f"LLM 反向 {verdict_label(verdict)}/{conf:.2f}"],
+                            reason_codes=["llm_adverse"])
         # 顺势加仓（用户规则：每仓固定 0.01 手，同向最多加 5 次）
         # 阶梯式：分数与置信均须高于上一次；第 3 次起门槛指数递增
         same_side = (direction == "LONG" and s > 0) or (direction == "SHORT" and s < 0)
@@ -642,7 +644,8 @@ class DecisionEngine:
         if (self._profit_peak[key_pos] >= arm_usd and cur_profit < 0):
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
                             reasons=[f"锁盈回吐：峰值 ${self._profit_peak[key_pos]:.2f} "
-                                     f"-> 现 ${cur_profit:.2f}，保本离场"])
+                                     f"-> 现 ${cur_profit:.2f}，保本离场"],
+                            reason_codes=["lock_giveback"])
         # 信号回吐检测保留（信号本身转弱时平仓，与移动止损互补）
         # ⚠️ 同样用 z 尺度：峰值与当前值必须同尺度比较，否则权重变化会让
         #    "回吐"判定随 Σw 漂移（旧版混用绝对分，与开仓门不一致）。
@@ -675,19 +678,22 @@ class DecisionEngine:
             # 收窄不可行（缺 ATR / 价位异常 / 会越过现价）才退回平仓：
             # 有信号转弱却既不收窄也不离场，是把风险敞口无条件留在场上。
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
-                            reasons=[why])
+                            reasons=[why],
+                            reason_codes=["signal_giveback"])
         # 新闻反向减仓（阈值走配置：原为硬编码 0.8，见 CFG.decision.news_impact_close）
         na = (ctx.llm or {}).get("news_assessment") or {}
         if na.get("impact", 0) >= CFG.decision.news_impact_close:
             na_dir = {"bullish": "LONG", "bearish": "SHORT", "neutral": None}.get(na.get("sentiment"))
             if na_dir and na_dir != direction:
                 return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
-                                reasons=[f"新闻不利 影响={na['impact']}"])
+                                reasons=[f"新闻不利 影响={na['impact']}"],
+                                reason_codes=["news_adverse"])
         # 持有期检查
         age_h = (time.time() - pos.time) / 3600
         if age_h > CFG.risk.max_holding_h and pos.profit < 0:
             return Proposal(kind="close_position", direction=direction, entry=pos.ticket,
-                            reasons=[f"持仓 {age_h:.1f} 小时且亏损"])
+                            reasons=[f"持仓 {age_h:.1f} 小时且亏损"],
+                            reason_codes=["max_holding"])
         # ---- 保护性移损（用户规则：利润 > $10 时，把 SL 推到盈利 $2 处，锁底搏上限）----
         # `point_value_per_lot` 的单位是「每 **point**(0.001) / 每手」的美元数
         # （XAUUSDm = 0.1，见 position_lots 里 `sl_points * point_value_per_lot`）。
