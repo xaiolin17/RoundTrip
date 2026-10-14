@@ -99,27 +99,33 @@ class RiskGate:
                 llm_review: dict | None = None,
                 add: bool = False,
                 frames: dict | None = None,
-                rr_floor: float | None = None):
+                rr_floor: float | None = None,
+                atr_entry: float | None = None):
         """按 LLM 判断的压力位/支撑位算止损止盈（用户要求的正确语义）。
 
         ⚠️ 概念纠正：0.618 回调位是**入场点**，不是止损。
         止损止盈看**压力位/支撑位** —— 由 LLM 读 skill 输出判断，
         本地只做配套计算（方向/最小距离/盈亏比校验）。
 
-        **统一定价语义（用户 2026-10-09 合并首仓与加仓）**：
-        所有路径都是"先由结构位算出止盈目标 → 距离缩 N% → 定止损"。
+        **统一定价语义（用户 2026-10-14 重新设计）**：
+        所有路径都是"先由结构位算出止盈目标 → 距离缩 N% → 止损取
+        min(结构失效边界, 波动率封顶) → 盈亏比下限硬闸"。
         首仓缩到 `first_tp_shrink`（0.70），加仓缩到 `add_tp_shrink`（0.58）。
-        止损**优先锚定结构失效边界**（`frames[structure_tf]` 上最近一段同向
-        走势的起点价 + `structure_sl_buffer_atr`×ATR 缓冲）；无有效边界时
-        回退「由缩后止盈距离按 `min_rr` 反推」。见 levels.py。
+        见 levels.py 的 `trade_levels` / `_levels_from_tp`。
+
+        `atr_entry`：**开仓周期**（`CFG.risk.entry_tf`）的实时 ATR —— 它是
+        止损止盈的**波动率尺度**（止损封顶 `sl_vol_cap_mult`、止盈封顶
+        `tp_vol_cap_mult`、缓冲与下限）。`atr`（高级别）只用于「紧贴反向位」
+        判定，两者尺度不同，**不可混用**。
 
         `add=True`：加仓路径，用 0.58 那一档。
         `frames`：多周期 K 线（用于取 `structure_tf` 的结构失效边界）。
         """
         return trade_levels(direction, entry, llm_review, ev, atr,
+                            atr_entry=atr_entry,
                             tp_shrink=(CFG.risk.add_tp_shrink if add
                                        else CFG.risk.first_tp_shrink),
-                            frames=frames, is_add=add, rr_floor=rr_floor)
+                            frames=frames, rr_floor=rr_floor)
 
     def evaluate(self, prop: Proposal, ev: FusedEvidence, account: AccountInfo,
                  positions: PositionsView, point_value_per_lot: float,
@@ -128,19 +134,26 @@ class RiskGate:
                  position_adds: dict | None = None,
                  llm_review: dict | None = None,
                  frames: dict | None = None,
-                 now_ts: float | None = None) -> Approved:
+                 now_ts: float | None = None,
+                 atr_entry: float | None = None) -> Approved:
         """从 ActionProposal 到 ApprovedOrder。
 
         止损止盈由 `_levels` 按 LLM 结构位计算；仓位按实际止损距离反推，
         锁死单笔 `risk_pct` 风险。
 
         `now_ts`：本轮时间戳（epoch 秒，UTC），用于判定是否处于「时段收紧
-        窗口」（见 `config.in_tight_window`）。`None` = 不收紧（基线）。
+        窗口」（见 `config.in_tight_window`）以及盈亏比下限的档位。`None` =
+        不收紧（基线）。
+
+        `atr_entry`：**开仓周期**（`CFG.risk.entry_tf`）的实时 ATR，即止损止盈
+        的波动率尺度。缺失时 `levels` 内部退回 `atr`（旧行为）。
         """
-        # 首仓赔率下限：时段收紧窗口内抬高（用户 2026-10-13 指定）。
-        rr_floor = (CFG.risk.first_entry_min_rr_tight
-                    if in_tight_window(now_ts)
-                    else CFG.risk.first_entry_min_rr)
+        # 盈亏比下限：**全局硬闸**（用户 2026-10-14 指定 1.5）；
+        # 时段收紧窗口内抬高到 `min_rr_tight`（用户 2026-10-13 指定）。
+        # 首仓与加仓**同一口径** —— 旧版首仓走 `first_entry_min_rr`(0.8) 的
+        # "外扩凑赔率"路径，已随 2026-10-14 重新设计删除。
+        rr_floor = (CFG.risk.min_rr_tight if in_tight_window(now_ts)
+                    else CFG.risk.min_rr)
         reasons = prop.reasons or []
         # ---------- 平仓/修改类直接放行（风控永不阻止离场） ----------
         if prop.kind == "modify_sltp":
@@ -244,9 +257,34 @@ class RiskGate:
             win_rate = (win_rate if win_rate is not None
                         else CFG.risk.cold_start_win_rate)   # 冷启动先验胜率（可配）
             entry = prop.entry   # 市价由 executor 取当前 bid/ask
+            # ---- 多次开仓（用户 2026-10-14 需求 1）----
+            # 语义：同一交易标的在**符合条件时**可以多次开仓，MT5 对冲账户下
+            # 每笔独立持仓自带止损止盈 —— 所以"多开仓"不是加仓的重复，而是
+            # **另起一笔**：它有自己的入场价、自己（更紧的）止损止盈。
+            # 两道硬闸：① 持仓笔数上限（`max_entries_per_symbol`，可配置）
+            #          ② 总手数上限（`CFG.max_lot`）的剩余额度。
+            my_pos = [p for p in positions.positions if p.magic == CFG.mt5.magic]
+            my_lots_now = sum(float(p.volume) for p in my_pos)
+            n_cap = max(int(CFG.risk.max_entries_per_symbol), 1)
+            if my_pos:
+                if len(my_pos) >= n_cap:
+                    decision_log({"event": "risk_reject", "kind": prop.kind,
+                                  "reason": "entries_capped",
+                                  "entries": len(my_pos), "cap": n_cap})
+                    return Approved(ok=False,
+                                    reason=f"多仓上限：已有 {len(my_pos)} 笔"
+                                           f" >= 上限 {n_cap} 笔")
+                room = CFG.max_lot - my_lots_now
+                if room < CFG.min_lot:
+                    return Approved(
+                        ok=False,
+                        reason=f"max_lot cap: 已用 {my_lots_now:.2f} 上限 "
+                               f"{CFG.max_lot} 剩余 {room:.2f} < 最小手数 "
+                               f"{CFG.min_lot}")
             # ---- 止损止盈看压力位/支撑位（LLM 判断 + 本地配套计算）----
             lv = self._levels(prop.direction, entry, ev, atr, llm_review,
-                              frames=frames, rr_floor=rr_floor)
+                              frames=frames, rr_floor=rr_floor,
+                              atr_entry=atr_entry)
             if not lv.ok:
                 # 用户选定：LLM 没给出可用压力位 → **不开仓**，等 LLM 可用
                 # （猜点位比不交易更危险）
@@ -280,6 +318,20 @@ class RiskGate:
                 decision_log({"event": "risk_reject", "kind": prop.kind,
                               "reason": rej, "win_rate": round(win_rate, 3)})
                 return Approved(ok=False, reason=rej)
+            # 多次开仓：手数不得超过**总手数上限**的剩余额度（上面的 room 只保证
+            # 还剩至少一个最小手，这里按实际算出的手数再截断一次）。
+            if my_pos:
+                room = round(CFG.max_lot - my_lots_now, 2)
+                lots = round(min(lots, room), 2)
+                if lots < CFG.min_lot:
+                    return Approved(
+                        ok=False,
+                        reason=f"多仓额度不足：总上限 {CFG.max_lot}，已用 "
+                               f"{my_lots_now:.2f}，剩余 {room:.2f} < 最小手数 "
+                               f"{CFG.min_lot}")
+                reasons.append(
+                    f"多仓第 {len(my_pos) + 1}/{n_cap} 笔"
+                    f"（已用 {my_lots_now:.2f}/{CFG.max_lot} 手）")
             plan = {"kind": "open_market", "direction": prop.direction, "lots": lots,
                     "tp": lv.tp, "sl": lv.sl, "reasons": reasons,
                     "sl_source": lv.sl_source, "tp_source": lv.tp_source,
@@ -290,7 +342,17 @@ class RiskGate:
                 "direction": prop.direction, "lots": lots,
                 "entry_ref": round(entry, 3), "tp": plan["tp"], "sl": plan["sl"],
                 "sl_source": lv.sl_source, "tp_source": lv.tp_source,
-                "sl_dist": lv.sl_dist, "vol_k": round(vol_k, 3),
+                "sl_dist": lv.sl_dist, "tp_dist": lv.tp_dist,
+                # 实际盈亏比 + 波动率尺度（用户要求"能看出方向/入场/止损/止盈"，
+                # 并便于事后核对"盈亏比下限 1.5"是否真的生效）
+                "rr": (round(lv.tp_dist / lv.sl_dist, 4)
+                       if lv.sl_dist else None),
+                "entry_tf": CFG.risk.entry_tf,
+                "atr_entry": (round(atr_entry, 4) if atr_entry else None),
+                "entries": len(my_pos) + 1,
+                "sl_vol_cap": (round(CFG.risk.sl_vol_cap_mult * atr_entry, 4)
+                               if atr_entry else None),
+                "vol_k": round(vol_k, 3),
                 "win_rate": round(win_rate, 3),
                 "disagreement": r.disagreement, "score": round(r.score, 3),
                 "reasons": reasons,
@@ -354,7 +416,8 @@ class RiskGate:
             if ref is None:
                 ref = pos.price_open if pos is not None else prop.entry
             lv = self._levels(prop.direction, ref, ev, atr, llm_review,
-                              add=True, frames=frames)
+                              add=True, frames=frames, rr_floor=rr_floor,
+                              atr_entry=atr_entry)
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
             plan = {"kind": "add_layer", "direction": prop.direction,
@@ -403,7 +466,8 @@ class RiskGate:
 
             # ---- 止损止盈：LLM 判断的压力位/支撑位 ----
             lv = self._levels(prop.direction, pe.entry, ev, atr, llm_review,
-                              frames=frames, rr_floor=rr_floor)
+                              frames=frames, rr_floor=rr_floor,
+                              atr_entry=atr_entry)
             if not lv.ok and not CFG.risk.allow_trade_without_llm_levels:
                 return Approved(ok=False, reason=f"levels: {lv.reason}")
 

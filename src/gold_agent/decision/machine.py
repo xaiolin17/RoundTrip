@@ -84,6 +84,11 @@ class DecisionContext:
     #: 本轮时间戳（epoch 秒，UTC），用于「时段收紧窗口」判定（见
     #: `config.in_tight_window`）。None = 不收紧（单测/回放默认）。
     now_ts: float | None = None
+    #: **ATR(1h) 的滚动分位**（近 240 根**已收盘** 1h bar 内的分位，
+    #: 由 `graph._atr_pct` 算出）。供 `decision.atr_pct_max` 使用 ——
+    #: 那是 5m 档的波动率上限闸（用户 2026-10-14 落地，见 config.toml）。
+    #: None = 未提供（单测/回放）→ 该闸**不生效**（等价于分位中性）。
+    atr_pct: float | None = None
 
 
 def effective_score(s: float, baseline: float) -> float:
@@ -282,6 +287,84 @@ class DecisionEngine:
                             reasons=[f"挂单 {direction_label(pdir)} 转不利：{why}"])
         return None
 
+    # ---------- 开仓闸（空仓与多仓**共用**）----------
+    def _entry_block(self, ctx: DecisionContext, direction: str) -> str | None:
+        """开仓闸：返回**拦住的原因**（中文，进日志）；放行返回 None。
+
+        覆盖：新闻高危窗口 / 低波动区间 / 新闻方向冲突 / LLM 明确反对。
+
+        ⚠️ 为什么抽出来共用：空仓开仓（`_decide_flat`）与「持仓时再开一笔
+        独立仓」（多开仓次数，用户 2026-10-14）**必须是同一套松紧**，否则
+        同一批信号在两条入口上结论不同 —— 历史上 open_market 与 place_grid
+        两个入口口径不一致（同一个 20 点止损，挂单开 0.03 手而市价被拦）
+        已被记为事故。
+
+        `|z|` 阈值与 `标准差` 闸**不在本函数内**：两者的阈值随时段收紧变化，
+        由调用方各自判定并记录（空仓用 `z_min_tight`/`z_min`，多仓同理）。
+        """
+        if ctx.news.high_risk_window:
+            return "新闻高危窗口"
+        # ---- P1-2 波动 regime 闸（唯一不依赖方向预测的杠杆）----
+        vol_pct = getattr(ctx.ev.result, "vol_percentile", 0.5)
+        if vol_pct < CFG.decision.vol_pct_min:
+            return f"低波动区间 {vol_pct:.2f} < {CFG.decision.vol_pct_min}"
+        # ---- 波动率分位**上限**闸（5m 档的验证机制，用户 2026-10-14）----
+        # 依据 research/38：5m 档止损 = 1.5×ATR(5m) ≈ 5.8 美元，在高波动行情下
+        # **必然被扫** —— 不加闸时 5m 全档为负且亏损几乎全在高波动档
+        # （低 +32.7 / 中 −3.0 / 高 −54.4）；加闸（分位 ≤ 0.5）后高波动档不再下单，
+        # 族A（历史首仓）净R +35.04 tR +2.15、族B（真实成交）净R +67.98 tR +2.70。
+        # ⚠️ 只拦**新开仓**（本函数被空仓与多仓两条入口共用）；加仓有自己的分数
+        #    阶梯、离场动作更不受限。
+        # ⚠️ `ctx.atr_pct = None`（单测/回放未提供）→ 不拦。
+        if (ctx.atr_pct is not None
+                and ctx.atr_pct > CFG.decision.atr_pct_max + 1e-9):
+            return (f"波动率分位 {ctx.atr_pct:.2f} > 上限 "
+                    f"{CFG.decision.atr_pct_max}（{CFG.risk.entry_tf} 档的紧止损"
+                    f"在更高波动下会被扫 → 等波动降下来）")
+        # ---- news「独立证据」通道：重大事件 → 按**方向冲突**决定是否开仓 ----
+        # 用户 2026-10-09 原话：
+        #   > 我觉得新闻事件可以提供做单方向 而不是停止开仓
+        # 选定语义（与用户确认）：**只在与开仓方向冲突时拦，一致就放行**。
+        # 即新闻拿到方向上的"否决权"，但不能反过来凭空驱动开仓 ——
+        # 它仍不参与融合分（news 无实测 IR，不得投票，见 news_impact docstring）。
+        imp, senti = news_impact(ctx)
+        news_dir = sentiment_direction(senti)
+        if news_dir and imp >= CFG.decision.news_impact_block and news_dir != direction:
+            return (f"新闻与开仓方向冲突：新闻{sentiment_label(senti)}"
+                    f"（影响度 {imp:.2f}）看{direction_label(news_dir)}，"
+                    f"信号看{direction_label(direction)} → 等事件过去")
+        # ---- LLM 明确反对且高置信 → 不开仓（LLM 作为确认环节的实质权力）----
+        review = (ctx.llm or {}).get("review") or {}
+        verdict = review.get("verdict")
+        conf = float(review.get("confidence") or 0)
+        want = "bullish" if direction == "LONG" else "bearish"
+        if (verdict is not None and verdict != "neutral" and verdict != want
+                and conf >= CFG.decision.llm_adverse_conf):
+            return f"LLM 反对 {verdict_label(verdict)}/{conf:.2f}"
+        return None
+
+    def _zhongshu_block(self, ctx: DecisionContext, direction: str) -> str | None:
+        """中枢位置闸：现价位于中枢**中部**时禁止开仓；放行返回 None。
+
+        用户反馈「我经常看到中枢中部位置就下单了」+「要么在中枢两端下中枢的
+        单子 要么做突破的单子」。实测 123/127 笔真实单子走的都是市价开仓，
+        入场价与中枢完全无关 —— 择时在统计上等价于随机时刻入场。
+
+        ⚠️ 取不到有效中枢时**放行**（保守）：宁可维持现状，也不因为拿不到
+        中枢数据而把系统变成不开仓。
+        ⚠️ 只对**市价开仓**生效：挂单走的是 0.618 回踩位，价位本身已带择时
+        含义，再套中枢闸会把回调入场全部挡掉。
+        """
+        if not CFG.risk.zhongshu_gate:
+            return None
+        cv = center_of(getattr(ctx.ev, "chanlun", None), ctx.last_close, ctx.atr,
+                       tfs=tuple(CFG.risk.zhongshu_tfs))
+        if edge_side(cv, direction) != "mid":
+            return None
+        return (f"中枢中部禁止开仓：现价 {ctx.last_close:.2f} 位于 "
+                f"{cv.tf} 中枢 [{cv.zd:.2f}, {cv.zg:.2f}] 的 {cv.pos:.0%} 处"
+                f"（到最近边界仅 {cv.dist_edge:.2f} 点）→ 等回到两端或突破")
+
     # ---------- 空仓 ----------
     def _decide_flat(self, ctx: DecisionContext, s: float, sigma: float) -> Proposal:
         """空仓开仓门。
@@ -298,40 +381,20 @@ class DecisionEngine:
         if sigma > CFG.fusion.sigma_max:
             return Proposal(kind="hold",
                             reasons=[f"标准差 {sigma:.2f} > 上限 {CFG.fusion.sigma_max}"])
-        if ctx.news.high_risk_window:
-            return Proposal(kind="hold", reasons=["新闻高危窗口"])
-
-        # ---- news「独立证据」通道：重大事件 → 按**方向冲突**决定是否开仓 ----
-        # 用户 2026-10-09 原话：
-        #   > 我觉得新闻事件可以提供做单方向 而不是停止开仓
-        # 选定语义（与用户确认）：**只在与开仓方向冲突时拦，一致就放行**。
-        # 即新闻拿到方向上的"否决权"，但不能反过来凭空驱动开仓 ——
-        # 它仍不参与融合分（news 无实测 IR，不得投票，见 news_impact docstring）。
-        imp, senti = news_impact(ctx)
-        news_dir = sentiment_direction(senti)
-        if abs(z) >= z_min and news_dir and imp >= CFG.decision.news_impact_block:
-            # 只有在**信号本身就够开仓**（|z| 已过阈值）时，新闻冲突才拦。
-            # 这样"新闻一致"必然放行，不会出现"新闻说多、系统却因 z 不够而不开"
-            # 这种把新闻当方向驱动的副作用。
-            this_dir = "LONG" if z > 0 else "SHORT"
-            if news_dir != this_dir:
-                return Proposal(kind="hold", reasons=[
-                    f"新闻与开仓方向冲突：新闻{sentiment_label(senti)}"
-                    f"（影响度 {imp:.2f}）看{direction_label(news_dir)}，"
-                    f"信号看{direction_label(this_dir)} → 等事件过去"])
-
-        # ---- P1-2 波动 regime 闸（唯一不依赖方向预测的杠杆）----
-        vol_pct = getattr(ctx.ev.result, "vol_percentile", 0.5)
-        if vol_pct < CFG.decision.vol_pct_min:
-            return Proposal(kind="hold",
-                            reasons=[f"低波动区间 {vol_pct:.2f} < {CFG.decision.vol_pct_min}"])
-
         if abs(z) < z_min:
             return Proposal(kind="hold", reasons=[
                 f"|z| {abs(z):.2f} < 阈值 {z_min} "
                 f"(S_eff={s:+.3f} 标准差={sigma:.3f})"
                 + ("（时段收紧）" if tight else "")])
         direction = "LONG" if z > 0 else "SHORT"
+
+        # ---- 开仓闸（新闻高危 / 低波动区间 / 新闻冲突 / LLM 反对）----
+        # ⚠️ 与「持仓时再开一笔独立仓」（多开仓次数，用户 2026-10-14）共用
+        #    同一个函数：两个入口必须同一套松紧。
+        block = self._entry_block(ctx, direction)
+        if block is not None:
+            return Proposal(kind="hold", reasons=[block])
+        vol_pct = getattr(ctx.ev.result, "vol_percentile", 0.5)
 
         # ---- LLM 一致性（主路径确认环节）----
         review = (ctx.llm or {}).get("review") or {}
@@ -346,17 +409,12 @@ class DecisionEngine:
         #    probability_tier=very_low）。所以市价开仓改为：
         #    **信号够强 且 LLM 没有明确反对** 即可，不再要求 confidence 达标。
         aligned = (verdict == want) and conf >= CFG.decision.llm_align_conf
-        opposed = (verdict is not None and verdict != "neutral" and verdict != want
-                   and conf >= CFG.decision.llm_adverse_conf)
         reasons = [f"S_eff={s:+.2f} 标准差={sigma:.2f}",
                    f"波动分位={vol_pct:.2f}",
                    f"LLM={verdict_label(verdict)}/{conf:.2f} "
                    f"一致={'是' if aligned else '否'} 可用={'是' if ctx.llm_available else '否'}"]
-
-        # LLM 明确反对且高置信 → 不开仓（这是 LLM 作为确认环节的实质权力）
-        if opposed:
-            return Proposal(kind="hold",
-                            reasons=reasons + [f"LLM 反对 {verdict_label(verdict)}/{conf:.2f}"])
+        # ⚠️ 「LLM 明确反对 → 不开仓」的判定已上移到 `_entry_block`
+        #    （与多仓入口共用，避免两处松紧漂移）；这里只保留 `aligned` 作日志标注。
 
         # ---- 仅均值回归 regime 用挂单；其余一律市价开仓（用户选定）----
         # 用户原话："现在这种很难下单 我们要考虑用直接按照市价开仓 少用挂单"
@@ -370,17 +428,11 @@ class DecisionEngine:
             # 用户选定先加**硬闸**：中部不开仓，只允许贴边或突破。
             # ⚠️ 取不到有效中枢时**放行**（保守）：宁可维持现状，
             #    也不因为拿不到中枢数据而把系统变成不开仓。
-            if CFG.risk.zhongshu_gate:
-                cv = center_of(getattr(ctx.ev, "chanlun", None),
-                               ctx.last_close, ctx.atr,
-                               tfs=tuple(CFG.risk.zhongshu_tfs))
-                side = edge_side(cv, direction)
-                if side == "mid":
-                    return Proposal(kind="hold", reasons=reasons + [
-                        f"中枢中部禁止开仓：现价 {ctx.last_close:.2f} 位于 "
-                        f"{cv.tf} 中枢 [{cv.zd:.2f}, {cv.zg:.2f}] 的 "
-                        f"{cv.pos:.0%} 处（到最近边界仅 {cv.dist_edge:.2f} 点）"
-                        f"→ 等回到两端或突破"])
+            # ⚠️ 只对**市价开仓**生效：挂单走的是 0.618 回踩位，价位本身
+            #    已带择时含义，再套中枢闸会把回调入场全部挡掉。
+            zb = self._zhongshu_block(ctx, direction)
+            if zb is not None:
+                return Proposal(kind="hold", reasons=reasons + [zb])
             return Proposal(kind="open_market", direction=direction,
                             entry=ctx.last_close,
                             reasons=reasons + ["非均值回归行情 -> 直接市价开仓"])
@@ -553,6 +605,37 @@ class DecisionEngine:
                                      f"z={z:+.2f} (需>={required:.2f} 上次={last_score}) "
                                      f"置信={conf_cur:.2f} (上次={last_conf})"
                                      + ("（时段收紧）" if tight_add else "")])
+        # ---- 多次开仓（用户 2026-10-14 需求 1：多开仓次数）----
+        # 同一标的最多 `max_entries_per_symbol` 笔**独立持仓**。持仓期间若**再次**
+        # 出现满足开仓闸的信号，就再开一笔 —— 它有自己的入场价、自己的（按
+        # entry_tf 波动率封顶的）止损止盈。语义上区别于"加仓"（同一次交易里
+        # 加码、且要过逐级抬高的分数阶梯）；这里只要求过**普通开仓闸**。
+        # 1 = 关闭（回到旧行为：持仓时不新开，只走加仓阶梯）。
+        # ⚠️ 与空仓开仓**共用** `_entry_block` / `_zhongshu_block`，
+        #    保证两条入口的松紧完全一致。
+        n_cap = max(int(CFG.risk.max_entries_per_symbol), 1)
+        n_now = len([p for p in ctx.positions.positions
+                     if p.magic == CFG.mt5.magic])
+        cap_now = float(getattr(ctx, "max_lots_cap", 0.0) or 0.0)
+        room_now = cap_now - float(getattr(ctx, "used_lots", 0.0) or 0.0)
+        # ⚠️ `max_lots_cap == 0` = 调用方未提供额度信息（单测/回放）→ **不拦**，
+        #    与加仓额度闸 `room_ok` 用的是同一个约定。
+        room_ok = (room_now >= CFG.min_lot) if cap_now else True
+        z_open_min = CFG.decision.z_min_tight if tight_add else CFG.decision.z_min
+        if (n_now < n_cap and same_side and abs(z) >= z_open_min
+                and sigma <= CFG.fusion.sigma_max
+                and room_ok):
+            eb = self._entry_block(ctx, direction)
+            if eb is None:
+                eb = self._zhongshu_block(ctx, direction)
+            if eb is None:
+                return Proposal(
+                    kind="open_market", direction=direction, entry=ctx.last_close,
+                    reasons=[f"多开仓：第 {n_now + 1}/{n_cap} 笔独立仓 "
+                             f"z={z:+.2f}（需>={z_open_min}）"
+                             + ("（时段收紧）" if tight_add else "")
+                             + (f"；剩余额度 {room_now:.2f}/{cap_now:.2f} 手"
+                                if cap_now else "")])
         # ---- 超短期利润回吐检测（用户选定：改用移动止损锁盈，不再砍掉浮盈）----
         # ⚠️ 事故复盘：原实现是「浮盈从峰值回吐 50% 就**主动平仓**」，
         #    实测把 30%~75% 的浮盈砍掉：

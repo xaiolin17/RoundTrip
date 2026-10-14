@@ -551,6 +551,12 @@ def test_first_entry_tp_is_shrunk_to_70_percent_and_sl_derived():
     用户原话（2026-10-09）：
     > 我们每个品种首仓止盈点数为计算的70% 比如100买入 计算止盈110
     > 那么实际止盈107 止损按照盈亏比1.8计算
+    （2026-10-14 用户把盈亏比下限整体改为 1.5，见 `CFG.risk.min_rr`。）
+
+    ⚠️ 2026-10-14 起止损止盈还受**波动率封顶**限制（用户要求"点位设置小"）。
+    本用例取结构距离 25 点（< 封顶 30.85 = 2.5×ATR），故封顶不生效 ——
+    这样才验得到"缩 70% + 反推止损"这条规则本身；封顶生效的场景见
+    `test_vol_cap_clips_sl_and_tp_when_structure_is_far`。
     """
     gate = RiskGate(CircuitBreakers())
     atr = 12.339
@@ -559,14 +565,14 @@ def test_first_entry_tp_is_shrunk_to_70_percent_and_sl_derived():
     res = gate.evaluate(
         Proposal(kind="open_market", direction="LONG", entry=close),
         _ev(), _acc_big(), _views([]), 0.1, None, atr, None,
-        llm_review=_llm_rev([4200.0], [4500.0]), frames=frames)
+        llm_review=_llm_rev([4200.0], [4375.0]), frames=frames)
     assert res.ok, res.reason
     pl = res.plan
     # ⚠️ 市价单的 plan 不含 `entry`（由 executor 取当前 bid/ask），
     #    但含 `sl_dist`/`tp_dist`，足以校验定价规则。
     assert pl["sl"] < close < pl["tp"], "做多首仓：SL < 入场 < TP"
-    # 止盈距离 = 结构距离(4500-4350=150) × 0.70 = 105
-    want_tp_dist = (4500.0 - close) * CFG.risk.first_tp_shrink
+    # 止盈距离 = 结构距离(4375-4350=25) × 0.70 = 17.5
+    want_tp_dist = (4375.0 - close) * CFG.risk.first_tp_shrink
     assert pl["tp_dist"] == pytest.approx(want_tp_dist, abs=0.01), \
         f"首仓止盈距离应为结构距离的 70%（{want_tp_dist}），实际 {pl['tp_dist']}"
     assert pl["tp"] == pytest.approx(close + want_tp_dist, abs=0.01)
@@ -581,50 +587,58 @@ def test_first_entry_tp_is_shrunk_to_70_percent_and_sl_derived():
     assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), f"盈亏比 {rr:.4f}"
     assert CFG.risk.first_tp_shrink == pytest.approx(0.7), \
         "用户指定 70%，配置不得偏离"
-    # ⚠️ 必须**钉住 1.8 这个绝对值**：只断言 `rr == CFG.risk.min_rr` 是
-    #    相对断言，把配置改回 1.2 时两边同时变、测试照样通过（证伪实测）。
-    assert CFG.risk.min_rr == pytest.approx(1.8), \
-        "用户 2026-10-09 指定盈亏比 1.8，配置不得偏离"
-    assert rr == pytest.approx(1.8, abs=0.01), \
-        f"首仓实际盈亏比应为 1.8，得到 {rr:.4f}"
+    # ⚠️ 必须**钉住 1.5 这个绝对值**：只断言 `rr == CFG.risk.min_rr` 是
+    #    相对断言，把配置改回 1.8 时两边同时变、测试照样通过（证伪实测）。
+    assert CFG.risk.min_rr == pytest.approx(1.5), \
+        "用户 2026-10-14 指定盈亏比下限 1.5，配置不得偏离"
+    assert rr == pytest.approx(1.5, abs=0.01), \
+        f"首仓实际盈亏比应为 1.5，得到 {rr:.4f}"
 
 
 def test_first_entry_rr_holds_across_entry_prices_and_directions():
     """首仓盈亏比在任意入场价/方向下都恰为 min_rr（止损是反推出来的）。
 
-    覆盖三档入场价（远离/居中/贴近压力位），做多做空都验。
+    ⚠️ 2026-10-14 起结构距离必须落在**波动率封顶**以内（用户要求"点位设置小"），
+    故这里用 20/14 点的结构距离（与线上真实量级一致），而不是旧用例的
+    150/300 点 —— 后者在新规则下会被封顶截断，验不到"反推"这条规则。
     """
     gate = RiskGate(CircuitBreakers())
     atr = 12.339
-    for direction, sup, res_lv in (("LONG", [4000.0], [4500.0]),
-                                   ("SHORT", [4000.0], [4500.0])):
-        for px in (4200.0, 4350.0, 4440.0):
-            frames = {"1m": pd.DataFrame({"close": [px]})}
-            r = gate.evaluate(
-                Proposal(kind="open_market", direction=direction, entry=px),
-                _ev(), _acc_big(), _views([]), 0.1, None, atr, None,
-                llm_review=_llm_rev(sup, res_lv), frames=frames)
-            assert r.ok, f"{direction} 现价 {px}: {r.reason}"
-            pl = r.plan
-            if direction == "LONG":
-                assert pl["sl"] < px < pl["tp"], f"{direction} {px} 方向错"
-            else:
-                assert pl["tp"] < px < pl["sl"], f"{direction} {px} 方向错"
-            rr = pl["tp_dist"] / pl["sl_dist"]
-            assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), \
-                f"{direction} 现价 {px} 盈亏比 {rr:.4f} != {CFG.risk.min_rr}"
-            assert pl["sl_source"] == "rr_from_tp"
-            # 止盈距离必须是"入场到结构位"距离的 70%
-            struct = (max(res_lv) - px) if direction == "LONG" else (px - min(sup))
-            assert pl["tp_dist"] == pytest.approx(
-                struct * CFG.risk.first_tp_shrink, abs=0.02), \
-                f"{direction} 现价 {px} 止盈距离 {pl['tp_dist']} != {struct}×0.7"
+    cases = [
+        # (方向, 入场价, 支撑位, 压力位)
+        ("LONG", 4430.0, [4400.0], [4450.0]),    # 上方压力距 20
+        ("LONG", 4436.0, [4400.0], [4450.0]),    # 上方压力距 14
+        ("SHORT", 4420.0, [4400.0], [4450.0]),   # 下方支撑距 20
+        ("SHORT", 4414.0, [4400.0], [4450.0]),   # 下方支撑距 14
+    ]
+    for direction, px, sup, res_lv in cases:
+        frames = {"1m": pd.DataFrame({"close": [px]})}
+        r = gate.evaluate(
+            Proposal(kind="open_market", direction=direction, entry=px),
+            _ev(), _acc_big(), _views([]), 0.1, None, atr, None,
+            llm_review=_llm_rev(sup, res_lv), frames=frames)
+        assert r.ok, f"{direction} 现价 {px}: {r.reason}"
+        pl = r.plan
+        if direction == "LONG":
+            assert pl["sl"] < px < pl["tp"], f"{direction} {px} 方向错"
+        else:
+            assert pl["tp"] < px < pl["sl"], f"{direction} {px} 方向错"
+        rr = pl["tp_dist"] / pl["sl_dist"]
+        assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), \
+            f"{direction} 现价 {px} 盈亏比 {rr:.4f} != {CFG.risk.min_rr}"
+        assert pl["sl_source"] == "rr_from_tp"
+        # 止盈距离必须是"入场到结构位"距离的 70%
+        struct = (max(res_lv) - px) if direction == "LONG" else (px - min(sup))
+        assert pl["tp_dist"] == pytest.approx(
+            struct * CFG.risk.first_tp_shrink, abs=0.02), \
+            f"{direction} 现价 {px} 止盈距离 {pl['tp_dist']} != {struct}×0.7"
 
 
 def test_pending_first_entry_uses_the_same_70_percent_rule():
     """挂单（place_grid）也是首仓，必须与市价首仓**同一口径**。
 
     用户选定：市价首仓 + 挂单首仓都按 70%/反推。
+    ⚠️ 结构位距离取 18 点（< 波动率封顶 30.85），使封顶不干扰本用例。
     """
     gate = RiskGate(CircuitBreakers())
     atr, close = 12.339, 4350.0
@@ -639,13 +653,13 @@ def test_pending_first_entry_uses_the_same_70_percent_rule():
     ev.chanlun = {"15m": type("C", (), {
         "status": "ok", "center": None,
         "raw": {"layers": {"segments": [up], "strokes": [], "fractals": []}}})()}
-    rev = _llm_rev([close - 25.0], [close + 40.0])
+    rev = _llm_rev([close - 25.0], [close + 18.0])
     res = gate.evaluate(Proposal(kind="place_grid", direction="LONG", entry=close),
                         ev, acc, views, 0.1, df5, atr, None, llm_review=rev)
     assert res.ok, res.reason
     order = res.plan["grid_plan"][0]
     # 入场在回调带内（市价下方），止盈应 = 入场 + 结构距离×0.7
-    raw_tp_dist = (close + 40.0) - order["level"]
+    raw_tp_dist = (close + 18.0) - order["level"]
     assert order["tp"] == pytest.approx(
         order["level"] + raw_tp_dist * CFG.risk.first_tp_shrink, abs=0.05), \
         "挂单首仓必须与市价首仓同用 70% 缩放"
@@ -669,10 +683,11 @@ def test_add_layer_tp_is_shrunk_to_58_percent_of_structure():
         Proposal(kind="add_layer", direction="LONG", entry=123456),
         _ev(), _acc(), _views([_pos(price_open=4350.0)]),
         0.1, None, atr, None,
-        llm_review=_llm_rev([4300.0], [4500.0]), frames=frames)
+        llm_review=_llm_rev([4300.0], [4375.0]), frames=frames)
     assert res.ok, res.reason
-    struct_dist = 4500.0 - px          # 结构距离 = 150
-    want = struct_dist * CFG.risk.add_tp_shrink   # 150 * 0.58 = 87
+    # ⚠️ 结构距离取 25 点（< 波动率封顶 30.85），使封顶不干扰本用例
+    struct_dist = 4375.0 - px          # 结构距离 = 25
+    want = struct_dist * CFG.risk.add_tp_shrink   # 25 * 0.58 = 14.5
     got = res.plan["tp"] - res.plan["entry"]
     assert got == pytest.approx(want, abs=0.01), \
         f"止盈距离应为结构距离的 58%（{want}），实际 {got}"
@@ -693,13 +708,13 @@ def test_add_layer_carries_atr_sl_tp():
     res = gate.evaluate(Proposal(kind="add_layer", direction="LONG", entry=123456),
                         _ev(), _acc(), _views([_pos(price_open=4350.0)]),
                         0.1, None, atr, None,
-                        llm_review=_llm_rev([4340.0], [4420.0]))
+                        llm_review=_llm_rev([4340.0], [4375.0]))
     assert res.ok, res.reason
     pl = res.plan
     assert pl.get("sl") and pl.get("tp"), "加仓必须自带止损止盈，否则是裸仓"
     assert pl["sl"] < pl["entry"] < pl["tp"], "做多加仓：SL < 入场 < TP"
-    # 止盈距离 = 结构距离(4420-4350=70) × 0.58 = 40.6
-    raw_tp_dist = 4420.0 - pl["entry"]
+    # 止盈距离 = 结构距离(4375-4350=25) × 0.58 = 14.5（未触及波动率封顶）
+    raw_tp_dist = 4375.0 - pl["entry"]
     assert pl["tp"] == pytest.approx(pl["entry"] + raw_tp_dist * CFG.risk.add_tp_shrink,
                                      abs=0.01)
     # 止损距离 = 缩后止盈距离 / min_rr
@@ -1180,5 +1195,65 @@ def test_add_review_has_separate_llm_budget():
     assert "add_review_per_hour_budget" in src, \
         "add_review 预算必须走配置，不得硬编码"
     assert hasattr(CFG.llm, "add_review_per_hour_budget")
+
+
+# ══════════════════════════════════════════════════════════════════
+# 多次开仓（用户 2026-10-14 需求 1）：同一标的多笔独立持仓
+# ══════════════════════════════════════════════════════════════════
+def test_second_entry_allowed_while_holding():
+    """持仓期间允许**再开一笔独立仓**（各自自带止损止盈）。
+
+    MT5 对冲账户下每笔独立持仓自带 SL/TP，所以"多开仓"不是加仓的重复，
+    而是另起一笔：自己的入场价 + 自己的（按 entry_tf 波动率封顶的）止损止盈。
+    """
+    gate = RiskGate(CircuitBreakers())
+    atr, close = 12.339, 4350.0
+    frames = {"1m": pd.DataFrame({"close": [close]})}
+    r = gate.evaluate(
+        Proposal(kind="open_market", direction="LONG", entry=close),
+        _ev(), _acc_big(), _views([_pos(ticket=9001, price_open=4345.0)]),
+        0.1, None, atr, None,
+        llm_review=_llm_rev([4300.0], [4375.0]), frames=frames)
+    assert r.ok, f"持仓时应当允许再开一笔（得到 {r.reason}）"
+    pl = r.plan
+    assert pl["sl"] < close < pl["tp"], "新开的独立仓必须自带止损止盈"
+    rr = pl["tp_dist"] / pl["sl_dist"]
+    assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), f"盈亏比 {rr:.4f}"
+
+
+def test_entries_capped_by_config():
+    """达到 `max_entries_per_symbol` 后必须拒单（配置可调，1 = 关闭多仓）。"""
+    gate = RiskGate(CircuitBreakers())
+    atr, close = 12.339, 4350.0
+    frames = {"1m": pd.DataFrame({"close": [close]})}
+    cap = max(int(CFG.risk.max_entries_per_symbol), 1)
+    poss = [_pos(ticket=9100 + i, price_open=4345.0) for i in range(cap)]
+    r = gate.evaluate(
+        Proposal(kind="open_market", direction="LONG", entry=close),
+        _ev(), _acc_big(), _views(poss), 0.1, None, atr, None,
+        llm_review=_llm_rev([4300.0], [4375.0]), frames=frames)
+    assert not r.ok, "已达多仓上限仍放行"
+    assert "多仓上限" in r.reason, r.reason
+
+
+def test_multi_entry_respects_total_lots_cap(monkeypatch):
+    """多开仓仍受**总手数上限**（`CFG.max_lot`）约束。
+
+    ⚠️ 默认 `max_entries_per_symbol=3`（3×0.01 = 0.03 手 < 0.06）时先被
+    "多仓上限"拦下；这里刻意把多仓上限放宽到 10，让"总手数上限"成为唯一
+    约束 —— 否则那道闸在默认配置下形同虚设、无人验证。
+    """
+    monkeypatch.setattr(CFG.risk, "max_entries_per_symbol", 10, raising=False)
+    gate = RiskGate(CircuitBreakers())
+    atr, close = 12.339, 4350.0
+    frames = {"1m": pd.DataFrame({"close": [close]})}
+    full = [_pos(ticket=9200 + i, vol=0.01, price_open=4345.0)
+            for i in range(int(round(CFG.max_lot / 0.01)))]
+    r = gate.evaluate(
+        Proposal(kind="open_market", direction="LONG", entry=close),
+        _ev(), _acc_big(), _views(full), 0.1, None, atr, None,
+        llm_review=_llm_rev([4300.0], [4375.0]), frames=frames)
+    assert not r.ok, "总手数已用满仍放行"
+    assert "max_lot cap" in r.reason, r.reason
 
 

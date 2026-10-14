@@ -165,6 +165,14 @@ class RiskConfig:
     # （0.6 绝对分 ÷ 旧 σ 0.4895 ≈ 1.23 z，两者等价）。
     # 用户规则：每仓固定 0.01 手，同向最多加仓次数
     max_adds_per_position: int = _TOML.get("risk", {}).get("max_adds_per_position", 5)
+    #: 同一标的最多**独立持仓**笔数（多开仓次数，用户 2026-10-14 指定）。
+    #: 持仓期间若再次满足开仓闸，允许另开一笔**独立仓**（自带止损止盈、
+    #: 独立 position ticket）。1 = 关闭多仓（等价于旧行为）。
+    #: 额度受 `CFG.max_lot` 总手数上限约束（风控层逐笔检查剩余额度）。
+    #: 实证（research/37）：历史 253 笔开仓里 111 笔（43.9%）是"已有持仓
+    #: 尚未离场时又给出开仓信号"，即多仓可作用的机会占比。
+    max_entries_per_symbol: int = _TOML.get("risk", {}).get(
+        "max_entries_per_symbol", 3)
     # ---- 首仓定价（用户 2026-10-09 指定）----
     # 首仓止盈 = 结构计算值距离 × first_tp_shrink（0.70 = 缩 30%）。
     # 止损：**优先锚定结构失效边界**（structure.py::invalidation_boundary
@@ -191,28 +199,40 @@ class RiskConfig:
     # ⚠️ 2026-10-09 删除 `level_pad_atr`：新定价语义下止损优先锚定结构失效
     #    边界，无有效边界时才回退「由止盈按盈亏比反推」，都不再直接以支撑位
     #    定止损，"止损让开距离"失去作用对象（死配置）。
-    # 最小盈亏比：**同时**是回退路径"止盈距离 → 止损距离"的反推除数与赔率校验下限。
-    # 两者必须是同一个数，否则实际盈亏比与校验尺度不一致。
-    min_rr: float = _TOML.get("risk", {}).get("min_rr", 1.8)
-    #: 首仓止盈距离 = 结构计算值距离 × 本值（0.70 = 缩 30%），
-    #: 止损距离 = 缩后止盈距离 / `min_rr`。设为 1.0 = 关闭缩放。
+    # 最小盈亏比：**全局唯一硬闸**（用户 2026-10-14 指定 1.5）。
+    #: 实际盈亏比 = 止盈距离 / 止损距离 < 本值 → **直接拒单**（`rr_below_1.5`），
+    #: 不做"外扩止盈凑赔率"。首仓与加仓同一口径（旧版首仓走
+    #: `first_entry_min_rr=0.8` 的外扩路径，已删除）。
+    #: 取值依据 research/37（91 天真实 1m K 线 × 253 笔首仓反事实回放，N=31）：
+    #: 15m × 1.5×ATR × 赔率1.5 → 净R +58.27 / tR +3.12 / DSR 0.848；
+    #: 基线 1.2×ATR(1h) × 1.8 → 净R −6.21 / tR −0.45。
+    #: ⚠️ DSR 未过 0.95 门槛，属用户明确指定的规则而非统计最优调参。
+    min_rr: float = _TOML.get("risk", {}).get("min_rr", 1.5)
+    #: 时段收紧窗口（`in_tight_window`）内的更高盈亏比下限（用户 2026-10-13）。
+    #: 语义与 `min_rr` 完全一致（硬闸，由 gate 按 `now_ts` 选择），不是外扩。
+    min_rr_tight: float = _TOML.get("risk", {}).get("min_rr_tight", 1.8)
+    # ---- 开仓周期与波动率自适应（用户 2026-10-14）----
+    #: **开仓周期**（"5m" | "15m"）。决策主循环仍是 1m，本项只决定
+    #: 「用哪个周期的实时波动率做止损止盈尺度」（见 `sl_vol_cap_mult`）。
+    #: ⚠️ **代码默认 "15m" 是"安全对"的一半**：它与 `decision.atr_pct_max`
+    #:    的默认 1.0（闸关闭）配对 —— 即使 config.toml 整段丢失，也不会退化成
+    #:    "5m 档却不开波动率闸"那种**未经检验**的组合（实测那种组合全档为负）。
+    #:    实际上线值在 config.toml：`entry_tf = "5m"` + `atr_pct_max = 0.5`。
+    #: 5m 档依据：research/38（族A 净R +25.53/tR +1.74，族B 净R +60.38/tR +2.66）；
+    #: 15m 档依据：research/37（净R +58.27/tR +3.12/DSR 0.848，但**不带**上限闸）。
+    entry_tf: str = _TOML.get("risk", {}).get("entry_tf", "15m")
+    #: 止损**波动率封顶**（×ATR(entry_tf)）：止损距离取
+    #: `min(结构失效边界距离 + 缓冲, 本值×ATR(entry_tf))`，下限仍是
+    #: `structure_sl_min_atr × ATR(entry_tf)`。用户口径「结构锚定 + 波动率封顶」，
+    #: 效果是把止损从 ~28 点压到约 6 美元（"止损点设置小"）。
+    sl_vol_cap_mult: float = _TOML.get("risk", {}).get("sl_vol_cap_mult", 1.5)
+    #: 止盈**波动率封顶**（×ATR(entry_tf)）：止盈距离取
+    #: `min(结构目标距离 × tp_shrink, 本值×ATR(entry_tf))`，且不得低于
+    #: `止损距离 × min_rr`。⚠️ 需满足 本值 >= sl_vol_cap_mult × min_rr，
+    #: 否则任何单子都无法同时满足封顶与盈亏比下限（会全部被拒）。
+    tp_vol_cap_mult: float = _TOML.get("risk", {}).get("tp_vol_cap_mult", 2.5)
+    #: 首仓止盈距离 = 结构计算值距离 × 本值（0.70 = 缩 30%）。设为 1.0 = 关闭缩放。
     first_tp_shrink: float = _TOML.get("risk", {}).get("first_tp_shrink", 0.7)
-    # 首仓/挂单赔率下限（用户 2026-10-12 指定阈值 0.8；2026-10-13 由「硬拒」
-    # 改为「止盈外扩」）：定价后若首仓结构止损路径的实际赔率 tp_dist/sl_dist
-    # 低于本值，**不再拒单**，而是把止盈距离外扩到 sl_dist×本值（与加仓路径的
-    # 赔率联动同形），reason 也不再产生 rr_below_{本值}。**仅首仓**（is_add=False）
-    # 生效；回退路径（rr_from_tp）赔率恒为 min_rr，不受影响。
-    # 原硬拒依据 research/30_first_entry_rr_floor.py；改为外扩依据
-    # research/32_first_entry_positioning.py（历史 237 笔真实首仓回放：止盈外扩到
-    # 刚好过闸净R +0.174 最优，扩到满赔率或反向收止损均转差）。
-    first_entry_min_rr: float = _TOML.get("risk", {}).get(
-        "first_entry_min_rr", 0.8)
-    #: 时段收紧窗口内（见 config.in_tight_window）的首仓赔率下限，替代
-    #: `first_entry_min_rr`（默认 1.8；用户在收紧窗口选定的盈亏比）。
-    #: 仅首仓（is_add=False）生效，语义与 first_entry_min_rr 完全一致
-    #: （仍为「止盈外扩」，非硬拒）。
-    first_entry_min_rr_tight: float = _TOML.get("risk", {}).get(
-        "first_entry_min_rr_tight", 1.8)
     # ---- 加仓专用定价（用户 2026-10-08 指定）----
     # 用户原话：
     #   > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.8
@@ -356,7 +376,7 @@ class DecisionConfig:
     #   > 我想调整的是凌晨1：00到10：00的开仓信号强度要提高 盈亏比也要提高
     # 语义：在 `tight_window_tz_offset`（默认北京时间 UTC+8）的
     #   [start_hour, end_hour) 整点区间内，开仓/加仓的信号强度阈值抬高到
-    #   `z_min_tight`，并把首仓赔率下限抬高到 `risk.first_entry_min_rr_tight`。
+    #   `z_min_tight`，并把**盈亏比下限**抬高到 `risk.min_rr_tight`（硬闸）。
     # 判定时间戳由 graph 注入（`summary["ts"]`，epoch 秒，UTC）；缺失
     # （None：单测/回放未传）时**一律不收紧**，保证基线确定性、不随运行时刻漂移。
     tight_window_enabled: bool = _TOML.get("decision", {}).get(
@@ -438,6 +458,16 @@ class DecisionConfig:
     disagreement_lot_mult: float = _TOML.get("decision", {}).get("disagreement_lot_mult", 0.5)
     # ---- P1-2 波动 regime 闸：只在 σ 位于滚动高分位时开仓 ----
     vol_pct_min: float = _TOML.get("decision", {}).get("vol_pct_min", 0.0)
+    #: **波动率分位上限闸**（5m 档的验证机制，用户 2026-10-14 落地）。
+    #: 口径 = ATR(1h) 在近 240 根**已收盘** 1h bar 内的滚动分位
+    #: （见 `graph._atr_pct`；不是 `[fusion] vol_pct_*` 那套 15m 已实现波动率
+    #:  —— 同一机制换口径后明显更弱，族A +22.99 / 族B +17.89 vs +35.04 / +67.98）。
+    #: 语义：分位 > 本值 → **不开新仓**（加仓有自身阶梯，离场动作永不受限）。
+    #: 1.0 = 关闭。
+    #: ⚠️ 代码默认 1.0 与 `risk.entry_tf` 的代码默认 "15m" 构成**安全对**；
+    #:    5m 档的启用值在 config.toml 里**成对**出现（entry_tf="5m" + 本值 0.5），
+    #:    由 `test_design_config_is_self_consistent` 强制校验这个配对。
+    atr_pct_max: float = _TOML.get("decision", {}).get("atr_pct_max", 1.0)
     # ---- LLM 一致性要求：aligned 时的最低 confidence ----
     llm_align_conf: float = _TOML.get("decision", {}).get("llm_align_conf", 0.6)
     #: 持仓时 LLM 反向 verdict 触发平仓的 confidence 门槛

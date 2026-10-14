@@ -400,21 +400,26 @@ def test_user_example_100_entry_110_computed_tp_gives_107():
     """用户原话里的具体例子必须逐字成立。
 
     > 比如100买入 计算止盈110 那么实际止盈107 止损按照盈亏比1.8计算
+
+    ⚠️ 2026-10-14：盈亏比下限整体改为 **1.5**（用户指定），且新增**波动率封顶**。
+    本例取 atr=5.0 → 止盈封顶 12.5 > 7（缩后目标），故封顶不生效，
+    "缩 30% 得到 107"这条规则本身仍逐字成立；封顶生效的场景见
+    `test_vol_cap_clips_tp_when_atr_is_small`。
     """
     lv = trade_levels("LONG", 100.0,
                       {"resistance_levels": [110.0], "support_levels": [90.0]},
-                      None, atr=2.0, digits=3)
+                      None, atr=5.0, digits=3)
     assert lv.ok, lv.reason
     assert lv.tp == pytest.approx(107.0, abs=1e-6), \
         f"100 买入、计算止盈 110 -> 实际止盈应为 107，得到 {lv.tp}"
     assert lv.tp_dist == pytest.approx(7.0, abs=1e-6)
-    # 止损 = 100 - 7/1.8 = 96.1111...
-    # ⚠️ 钉住 1.8 的**绝对值**：只写 `CFG.risk.min_rr` 是相对断言，
-    #    把配置改回 1.2 时两边同时变、测试仍通过（证伪实测过）。
-    assert CFG.risk.min_rr == pytest.approx(1.8), "用户指定盈亏比 1.8"
-    assert lv.sl == pytest.approx(100.0 - 7.0 / 1.8, abs=1e-3)
-    assert lv.sl == pytest.approx(96.111, abs=0.002)
-    assert lv.sl_dist == pytest.approx(7.0 / 1.8, abs=1e-3)
+    # 止损 = 100 - 7/1.5 = 95.3333...
+    # ⚠️ 钉住 1.5 的**绝对值**：只写 `CFG.risk.min_rr` 是相对断言，
+    #    把配置改回 1.8 时两边同时变、测试仍通过（证伪实测过）。
+    assert CFG.risk.min_rr == pytest.approx(1.5), "用户 2026-10-14 指定盈亏比 1.5"
+    assert lv.sl == pytest.approx(100.0 - 7.0 / 1.5, abs=1e-3)
+    assert lv.sl == pytest.approx(95.333, abs=0.002)
+    assert lv.sl_dist == pytest.approx(7.0 / 1.5, abs=1e-3)
 
 
 def test_no_llm_levels_falls_back_to_local_structure():
@@ -687,17 +692,28 @@ def test_invalidation_boundary_none_when_too_few_bars():
 
 
 def test_stop_anchors_struct_invalidation_when_15m_available():
-    """给了 15m 结构帧且边界在正确一侧 -> 止损锚定结构失效边界。"""
+    """给了 15m 结构帧且边界在正确一侧 -> 止损锚定结构失效边界。
+
+    ⚠️ 2026-10-14：止损/止盈宽度改用**开仓周期（entry_tf）的 ATR**，
+    并叠加**波动率封顶**（止损 ≤ sl_vol_cap_mult×ATR，止盈 ≤ tp_vol_cap_mult×ATR）
+    与**盈亏比下限 1.5**。本例 atr=8.0：
+      止损 = |15−10| + 0.5×8 = 9.0（封顶 12.0 未触及）
+      止盈 = max(结构距离 7×0.7 = 4.9, 止损×1.5 = 13.5) = 13.5（封顶 20.0 未触及）
+    """
     frames = {"15m": _df_zz(_ZZ_LONG)}
     rev = {"support_levels": [12.0], "resistance_levels": [22.0]}
-    lv = trade_levels("LONG", 15.0, rev, None, atr=1.0, frames=frames)
+    lv = trade_levels("LONG", 15.0, rev, None, atr=8.0, frames=frames)
     assert lv.ok, lv.reason
     assert lv.sl_source == "struct_invalidation", lv.sl_source
-    # 止盈逻辑不变：22 - 15 = 7，缩 70% -> 4.9
-    assert lv.tp == pytest.approx(15.0 + 7.0 * CFG.risk.first_tp_shrink, abs=0.01)
-    # 止损 = 边界 10.0 + 缓冲 0.5×ATR -> 距入场 5.5
-    assert lv.sl == pytest.approx(
-        15.0 - (abs(15.0 - 10.0) + CFG.risk.structure_sl_buffer_atr * 1.0), abs=0.01)
+    want_sl_dist = abs(15.0 - 10.0) + CFG.risk.structure_sl_buffer_atr * 8.0
+    assert lv.sl_dist == pytest.approx(want_sl_dist, abs=0.01), lv.notes
+    assert lv.sl == pytest.approx(15.0 - want_sl_dist, abs=0.01)
+    # 止盈：结构距离 22−15 = 7 缩 70% = 4.9，低于「止损×盈亏比下限」-> 按下限外扩
+    assert lv.tp_dist == pytest.approx(want_sl_dist * CFG.risk.min_rr, abs=0.01), \
+        lv.notes
+    assert lv.tp == pytest.approx(15.0 + want_sl_dist * CFG.risk.min_rr, abs=0.01)
+    rr = lv.tp_dist / lv.sl_dist
+    assert rr == pytest.approx(CFG.risk.min_rr, abs=0.01), f"盈亏比 {rr:.4f}"
     assert any("结构失效边界" in n for n in lv.notes), lv.notes
 
 
@@ -717,4 +733,121 @@ def test_stop_falls_back_when_boundary_on_wrong_side():
     lv = trade_levels("LONG", 9.0, rev, None, atr=1.0, frames=frames)
     assert lv.ok, lv.reason
     assert lv.sl_source == "rr_from_tp", lv.sl_source
+
+
+# ══════════════════════════════════════════════════════════════════
+# 七、用户 2026-10-14 重新设计：波动率自适应点位 + 盈亏比 1.5 硬闸
+# ══════════════════════════════════════════════════════════════════
+def test_design_config_is_self_consistent():
+    """配置自检（需求 2/3/4 的前提）。
+
+    ⚠️ 最关键的一条：`止盈封顶 >= 止损封顶 × 盈亏比下限`。
+    否则"要满足 1.5 倍赔率"就必然突破止盈封顶 → **每一单都会被拒**
+    → 系统退化成永不开仓（这是硬闸与封顶冲突的坏结局）。
+    """
+    assert CFG.risk.min_rr == pytest.approx(1.5), "用户指定盈亏比下限 1.5"
+    assert CFG.risk.min_rr_tight >= CFG.risk.min_rr, \
+        "时段收紧窗口的下限不得低于全局下限"
+    assert CFG.risk.sl_vol_cap_mult > 0, "止损波动率封顶必须可配置且为正"
+    assert CFG.risk.tp_vol_cap_mult > 0, "止盈波动率封顶必须可配置且为正"
+    assert CFG.risk.tp_vol_cap_mult >= CFG.risk.sl_vol_cap_mult * CFG.risk.min_rr - 1e-9, (
+        f"止盈封顶 {CFG.risk.tp_vol_cap_mult} < 止损封顶 "
+        f"{CFG.risk.sl_vol_cap_mult} × 盈亏比下限 {CFG.risk.min_rr} —— "
+        f"会把所有单子拒掉")
+    assert CFG.risk.entry_tf in ("5m", "15m"), \
+        f"开仓周期只支持 5m/15m，得到 {CFG.risk.entry_tf}"
+    assert int(CFG.risk.max_entries_per_symbol) >= 1, "多开仓次数至少 1"
+    # ⚠️ **周期与波动率上限闸必须成对**（2026-10-14 落地 5m 档的前提）：
+    #    5m 档的紧止损只在低波动行情里够宽（research/38：不加闸时 5m 高波动档
+    #    净 −54.4、全档为负；加闸后族A/族B 双正）。而切回 15m 时，research/37
+    #    的 15m 结论**未包含**本闸，闸必须关掉。
+    #    这条断言的作用就是拦住"切了周期却忘了关/开闸"的静默错误配置。
+    if CFG.risk.entry_tf == "5m":
+        assert CFG.decision.atr_pct_max < 1.0, (
+            "5m 档必须开启波动率上限闸（atr_pct_max < 1.0）——"
+            "否则是不经检验的组合：research/38 实测 5m 全档为负")
+    else:
+        assert CFG.decision.atr_pct_max >= 1.0, (
+            "15m 档必须关闭该闸（atr_pct_max >= 1.0）——"
+            "research/37 的 15m 结论不含此闸，开着等于改了它的入场集")
+
+
+def test_vol_cap_clips_tp_when_atr_is_small():
+    """远端结构位 + 小 ATR -> 止盈被**波动率封顶**压小（用户："点位设置小"）。"""
+    rev = {"resistance_levels": [4450.0], "support_levels": [4250.0]}
+    atr = 2.0
+    lv = trade_levels("LONG", 4350.0, rev, None, atr=atr)
+    assert lv.ok, lv.reason
+    # 结构距离 100 × 0.7 = 70，但封顶 = tp_vol_cap_mult × 2.0 = 5
+    assert lv.tp_dist == pytest.approx(CFG.risk.tp_vol_cap_mult * atr, abs=1e-6), \
+        lv.notes
+    # 止损由止盈反推（回退路径），盈亏比恰为下限
+    # （`sl_dist` 会按品种 digits=3 规整，故容差取 1e-3）
+    assert lv.sl_dist == pytest.approx(lv.tp_dist / CFG.risk.min_rr, abs=1e-3)
+    assert lv.tp_dist / lv.sl_dist == pytest.approx(CFG.risk.min_rr, abs=1e-3)
+    assert any("止盈点位设置小" in n for n in lv.notes), lv.notes
+
+
+def test_vol_cap_clips_sl_too(monkeypatch):
+    """结构失效边界很远时，止损也被**波动率封顶**截断（不被 28 点的宽止损拖累）。"""
+    frames = {"15m": _df_zz(_ZZ_LONG)}          # 边界 = 10.0
+    rev = {"support_levels": [12.0], "resistance_levels": [40.0]}
+    # 结构距离 15−10 = 5，加 0.5×ATR 缓冲；把止损封顶压到 4.0 让它生效
+    monkeypatch.setattr(CFG.risk, "sl_vol_cap_mult", 0.5, raising=False)
+    atr = 8.0
+    lv = trade_levels("LONG", 15.0, rev, None, atr=atr, frames=frames)
+    assert lv.ok, lv.reason
+    assert lv.sl_source == "struct_invalidation", lv.sl_source
+    want_cap = CFG.risk.sl_vol_cap_mult * atr      # 0.5 × 8 = 4.0
+    assert lv.sl_dist == pytest.approx(want_cap, abs=0.01), lv.notes
+    assert any("波动率封顶" in n for n in lv.notes), lv.notes
+
+
+def test_sl_tp_scale_with_entry_tf_atr():
+    """需求 4：止损止盈宽度随**开仓周期的实时波动率**等比缩放。
+
+    用户原话：「如果是按照5m来开仓那么5m波动率的止损要设置好 不然直接就
+    被打止损了；如果是15m那么同理」。波动大 → 点位自动放宽，波动小 → 收紧。
+    """
+    rev = {"resistance_levels": [4500.0], "support_levels": [4200.0]}
+    prev = 0.0
+    for atr in (2.0, 6.0, 12.0):
+        lv = trade_levels("LONG", 4350.0, rev, None, atr_entry=atr)
+        assert lv.ok, lv.reason
+        assert lv.tp_dist == pytest.approx(CFG.risk.tp_vol_cap_mult * atr, abs=0.01)
+        assert lv.sl_dist == pytest.approx(
+            CFG.risk.tp_vol_cap_mult * atr / CFG.risk.min_rr, abs=0.01)
+        assert lv.tp_dist > prev, "波动率越大，止盈距离必须越大 —— 否则不是自适应"
+        prev = lv.tp_dist
+
+
+def test_entry_tf_atr_drives_sizing_not_high_tf_atr():
+    """尺度必须用**开仓周期**的 ATR（`atr_entry`），不能误用高级别 ATR。
+
+    高级别 ATR 只用于「紧贴反向位」判定；若拿它做止损止盈尺度，
+    "点位设置小"就落不了地（1h ATR 约为 15m 的 4 倍）。
+    """
+    rev = {"resistance_levels": [4450.0], "support_levels": [4250.0]}
+    # 高级别 ATR = 100（若误用它，封顶会是 250/150，什么都截不到）
+    lv = trade_levels("LONG", 4350.0, rev, None, atr=100.0, atr_entry=2.0)
+    assert lv.ok, lv.reason
+    assert lv.tp_dist == pytest.approx(CFG.risk.tp_vol_cap_mult * 2.0, abs=0.01), \
+        lv.notes
+
+
+def test_rr_floor_rejects_when_tp_cap_conflicts(monkeypatch):
+    """需求 3：盈亏比不满足 → **直接过滤**（不开仓）。
+
+    默认配置下封顶与下限相容（2.5 ≥ 1.5×1.5），故刻意把止盈封顶压到 1.5
+    （< 1.5×止损封顶 1.65）以验证拒绝路径真的存在、且不是死代码。
+    """
+    monkeypatch.setattr(CFG.risk, "sl_vol_cap_mult", 1.1, raising=False)
+    monkeypatch.setattr(CFG.risk, "tp_vol_cap_mult", 1.5, raising=False)
+    frames = {"15m": _df_zz(_ZZ_LONG)}
+    rev = {"support_levels": [12.0], "resistance_levels": [22.0]}
+    lv = trade_levels("LONG", 15.0, rev, None, atr=8.0, frames=frames)
+    assert not lv.ok, f"盈亏比与封顶冲突时必须拒单，却放行了：{lv.tp}/{lv.sl}"
+    assert lv.reason == f"rr_below_{CFG.risk.min_rr}", lv.reason
+    assert any("拒绝开仓" in n for n in lv.notes), lv.notes
+
 

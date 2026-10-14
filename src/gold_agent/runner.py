@@ -64,6 +64,12 @@ def _zh_reason(reason: str | None) -> str:
         ("consecutive_losses", "连亏冷却（仅停开仓/加仓）"),
         ("friday_late", "周五尾盘不开仓"),
         ("drawdown_halt", "回撤停机"),
+        # ---- 2026-10-14 重新设计新增的拒绝码 ----
+        # `rr_below_{下限}` 里的**数字必须保留**（下限是多少是诊断关键）：
+        #   如 rr_below_1.5 -> "盈亏比不足下限 1.5"
+        ("rr_below_", "盈亏比不足下限 "),
+        ("entries_capped", "多仓次数已达上限"),
+        ("levels:", "止损止盈定价："),
     ):
         out = out.replace(en, zh)
     return out

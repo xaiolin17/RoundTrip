@@ -331,10 +331,10 @@ def _pick_src(level: float | None, llm_vals: list[float],
 
 def trade_levels(direction: str, entry: float, review: dict | None,
                  ev=None, atr: float | None = None,
+                 atr_entry: float | None = None,
                  tp_shrink: float | None = None,
                  digits: int = 3,
                  frames: dict | None = None,
-                 is_add: bool = False,
                  rr_floor: float | None = None) -> TradeLevels:
     """按 LLM 判断的压力位/支撑位算止损止盈。
 
@@ -348,9 +348,15 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     `CFG.risk.first_tp_shrink`（首仓，0.70）。加仓路径显式传
     `CFG.risk.add_tp_shrink`（0.58）。
 
-    `rr_floor`：**首仓**赔率下限（步骤 3c 止盈外扩的目标）；`None` = 用
-    `CFG.risk.first_entry_min_rr`（0.8）。时段收紧窗口内由 gate 显式传
-    `CFG.risk.first_entry_min_rr_tight`（1.8）。加仓不受它影响（走 min_rr）。
+    `rr_floor`：本次开仓的**盈亏比硬下限**；`None` = 用 `CFG.risk.min_rr`（1.5）。
+    时段收紧窗口内由 gate 显式传 `CFG.risk.min_rr_tight`（1.8）。
+    首仓与加仓**同一口径**（2026-10-14 起不再有"首仓专用下限"）。
+
+    `atr_entry`：**开仓周期**（`CFG.risk.entry_tf`，默认 15m）的实时 ATR，
+    用作止损止盈的**波动率尺度**（止损封顶 `sl_vol_cap_mult`、止盈封顶
+    `tp_vol_cap_mult`、缓冲与下限）。`None` 时退回 `atr`。
+    ⚠️ `atr` 仍用于「紧贴反向位」判定（`conflict_atr_mult`）—— 那个语义是
+    "价格离结构位多远"，与止损宽度无关，故不改它的尺度。
 
     ---- 统一定价语义（用户 2026-10-09 合并首仓与加仓）----
 
@@ -365,13 +371,21 @@ def trade_levels(direction: str, entry: float, review: dict | None,
 
     步骤（首仓与加仓**完全同形**，只有缩放比例不同）：
       1. 先由结构位算出止盈目标（"计算值"，距离 D）
-      2. 止盈距离缩到 `tp_shrink` 倍（首仓 0.70 / 加仓 0.58）
+      2. 止盈距离缩到 `tp_shrink` 倍（首仓 0.70 / 加仓 0.58），并受**波动率
+         封顶** `tp_vol_cap_mult × ATR(entry_tf)` 限制（用户要求"止盈点位小"）
       3. **止损锚定结构失效边界**（用户 2026-10-10 指定）：
          取 `structure_tf` 上最近一段同向走势的起点价，外扩
-         `structure_sl_buffer_atr`×ATR 作波动缓冲，下限 `structure_sl_min_atr`×ATR
-         （`sl_source="struct_invalidation"`）。
+         `structure_sl_buffer_atr`×ATR(entry_tf) 作波动缓冲，下限
+         `structure_sl_min_atr`×ATR(entry_tf)，**再受波动率封顶**
+         `sl_vol_cap_mult × ATR(entry_tf)` 限制（用户 2026-10-14 选定口径
+         「结构锚定 + 波动率封顶」），`sl_source="struct_invalidation"`。
          无有效边界（frames 缺失 / 边界不在正确一侧 / 段不足）时，
-         **回退**旧语义：止损距离 = 止盈距离 / `min_rr`（`sl_source="rr_from_tp"`）。
+         **回退**：止损距离 = 止盈距离 / 盈亏比下限（`sl_source="rr_from_tp"`）。
+      4. **盈亏比下限硬闸**（用户 2026-10-14 原话「强制设置盈亏比最低阈值为
+         1.5，所有开仓信号必须满足该阈值才会被系统触发，不满足的信号直接
+         过滤」）：止盈距离 < 止损距离 × `rr_floor` 时，先按该下限把止盈
+         外扩到恰好达标；**若该外扩会突破止盈波动率封顶，则直接拒绝开仓**
+         （`reason=rr_below_{下限}`）—— 封顶与下限冲突即"不满足"，过滤掉。
 
     `frames`：`{周期: DataFrame}`；用于取 `structure_tf`（默认 15m）的
     摆动结构算失效边界。不再传（None）时走 `rr_from_tp` 回退，
@@ -430,12 +444,20 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     sup_all = sup + s_sup
     res_all = res + s_res
 
-    # 最小距离（防贴脸）：用 ATR 定下限
-    min_d = (CFG.risk.structure_sl_min_atr * atr) if atr else 0.0
+    # 止损止盈的**波动率尺度** = 开仓周期（`entry_tf`）的 ATR（用户 2026-10-14）。
+    # `atr_entry` 缺失时退回 `atr`（旧行为），保证单测/回放的确定性。
+    a = atr_entry if (atr_entry and atr_entry > 0) else atr
+    # 最小距离（防贴脸）：用**开仓周期**的 ATR 定下限（旧版用 1h ATR，
+    # 那是 `structure_sl_min_atr×ATR(1h)` ≈ 8.65 点的巨大下限，正是"点位过大"的
+    # 来源之一；换成 entry_tf 后 ≈ 2 点）。
+    min_d = (CFG.risk.structure_sl_min_atr * a) if a else 0.0
     # ⚠️ 冲突判定阈值原为 6 处硬编码 `0.3`，是实测 180 次
     # `fusion_vs_levels_conflict` 拒绝里 159 次的**唯一驱动常数**，
     # 却无法调参（同段的 structure_sl_min_atr 早已走配置）。
     # 收敛到 CFG.risk.conflict_atr_mult，默认 0.3 保持行为不变。
+    # ⚠️ 这里刻意用 **`atr`（高级别）** 而不是 `a`：该阈值的语义是"价格离
+    #    反向结构位多近算贴脸"，是价格距离而非止损宽度，换尺度会凭空把
+    #    大量单子判成贴脸（0.3×ATR(15m) ≈ 1.2 点 vs 0.3×ATR(1h) ≈ 5.2 点）。
     conf_d = CFG.risk.conflict_atr_mult * atr if atr else 0.0
 
     if direction == "LONG":
@@ -499,10 +521,12 @@ def trade_levels(direction: str, entry: float, review: dict | None,
     # 用户 2026-10-09 合并二者语义，旧的"止损取支撑位"路径已删除。
     if tp_shrink is None:
         tp_shrink = CFG.risk.first_tp_shrink
+    # ⚠️ 传给 `_levels_from_tp` 的 `atr` 是**开仓周期的尺度**（`a`），
+    #    止损止盈的所有宽度（缓冲/下限/封顶）都由它决定。
     return _levels_from_tp(direction, entry, out, res_all, sup_all,
                            res, sup, s_res, s_sup, hint_tp, min_d,
-                           tp_shrink, digits, atr=atr, frames=frames,
-                           is_add=is_add, rr_floor=rr_floor)
+                           tp_shrink, digits, atr=a, frames=frames,
+                           rr_floor=rr_floor)
 
 
 def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
@@ -513,9 +537,8 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
                     tp_shrink: float, digits: int = 3,
                     atr: float | None = None,
                     frames: dict | None = None,
-                    is_add: bool = False,
                     rr_floor: float | None = None) -> TradeLevels:
-    """统一定价核心：**止盈缩水 + 止损优先锚定结构失效边界**。
+    """统一定价核心：**止盈缩水 + 止损结构锚定 + 波动率封顶 + 盈亏比硬闸**。
 
     用户原话（首仓，2026-10-09）：
     > 我们每个品种首仓止盈点数为计算的70% 比如100买入 计算止盈110
@@ -525,25 +548,35 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
     > 加仓的止损位置应该是按照止盈位置计算来的 盈亏比1.8
     > 然后加仓的单子止盈点不能按照计算的数值来 要对应缩小42% 也就是原值的58%
 
-    步骤（首仓与加仓同形，只有 `tp_shrink` 不同：0.70 / 0.58）：
+    用户原话（2026-10-14 重新设计）：
+    > 止损止盈点要设置小 然后盈亏比至少1.5 但是要考虑当前的波动率
+    > 如果是按照5m来开仓那么5m波动率的止损要设置好 不然直接就被打止损了
+    > 如果是15m那么同理
+
+    步骤（首仓与加仓**同形**，只有 `tp_shrink` 不同：0.70 / 0.58；
+    止损止盈的尺度一律用 `atr` = **ATR(entry_tf)**）：
       1. 由结构位算出"计算值"止盈目标（做多取上方压力、做空取下方支撑）
-      2. 止盈**距离**缩到 `tp_shrink` 倍（**逻辑完全不变**）
+      2. 止盈**距离**缩到 `tp_shrink` 倍，再受**止盈波动率封顶**
+         `tp_vol_cap_mult × ATR(entry_tf)` 限制（用户要求"止盈点位小"）
       3. 止损：**优先锚定结构失效边界**（`structure_tf` 上最近一段同向走势
-         的起点价 + `structure_sl_buffer_atr`×ATR 波动缓冲，下限
-         `structure_sl_min_atr`×ATR），`sl_source="struct_invalidation"`；
+         的起点价 + `structure_sl_buffer_atr`×ATR(entry_tf) 波动缓冲，下限
+         `structure_sl_min_atr`×ATR(entry_tf)），**再受止损波动率封顶**
+         `sl_vol_cap_mult × ATR(entry_tf)` 限制（用户 2026-10-14 选定口径
+         「结构锚定 + 波动率封顶」），`sl_source="struct_invalidation"`；
          无有效边界时**回退**「由止盈反推」，`sl_source="rr_from_tp"`
-      4. 赔率联动：止损锚定结构边界后若赔率（止盈/止损）低于阈值，按阈值
-         反推**外扩止盈**——加仓用 `min_rr`，首仓用 `first_entry_min_rr`
-         （2026-10-13 起首仓由此前的"硬拒"改为"外扩"，见步骤 3c 注释）
+      4. **盈亏比下限硬闸**：止盈距离 < 止损距离 × `rr_floor` 时按下限反推
+         外扩；若该外扩会突破止盈封顶，则直接拒单（`reason=rr_below_{下限}`）。
+         ⚠️ 2026-10-14 起首仓与加仓**共用同一个下限**（`rr_floor`，默认
+         `CFG.risk.min_rr`=1.5，收紧窗口 1.8）；此前"加仓走 min_rr、
+         首仓走 first_entry_min_rr=0.8"的两套逻辑已删除。
 
     为什么先缩止盈再定止损：若用未缩的结构距离反推止损、再缩止盈，实际盈亏比
-    会掉到 `tp_shrink/min_rr`（首仓 0.70/1.8 ≈ 0.39）；先缩止盈再反推才能
-    让回退路径的实际盈亏比正好等于 1.8。
+    会掉到 `tp_shrink/min_rr`（0.70/1.5 ≈ 0.47）；先缩止盈再反推，才能让回退
+    路径的实际盈亏比正好等于下限。
 
     止损改锚结构失效边界的依据（research/29，R 口径回放 234 笔真实首仓）：
     以该边界 + 波动缓冲作止损，净 R 由 −0.326 提升到 +0.183、tR 由 −3.81
-    提升到 +3.26、胜率由 25.7% 提升到 69.6%，为风控口径最优；扩止盈
-    （方案 C）与 MAE 分位硬下限均转差，故**不采用**（MAE 分位仅作诊断）。
+    提升到 +3.26、胜率由 25.7% 提升到 69.6%，为风控口径最优。
     """
     # ---- 1. 取"计算值"止盈目标（未缩）----
     is_long = direction == "LONG"
@@ -573,9 +606,17 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
         out.reason = "tp_at_entry"
         return out
 
-    # ---- 2. 止盈距离缩到 tp_shrink 倍（首仓 70% / 加仓 58%）----
+    # ---- 2. 止盈距离 = 结构距离 × tp_shrink，再受**波动率封顶** ----
+    # 用户 2026-10-14：「止盈点位也要设置小」。封顶尺度 = ATR(entry_tf)。
+    tp_cap = (CFG.risk.tp_vol_cap_mult * atr) if atr else None
     tp_dist = raw_tp_dist * tp_shrink
-    # 缩后仍要尊重 ATR 防贴脸下限，否则止盈贴脸毫无意义
+    if tp_cap is not None and tp_dist > tp_cap + 1e-9:
+        out.notes.append(
+            f"止盈距离 {tp_dist:.3f} > 波动率封顶 {CFG.risk.tp_vol_cap_mult}"
+            f"×ATR({CFG.risk.entry_tf}) {tp_cap:.3f} → 压到封顶"
+            f"（用户要求「止盈点位设置小」）")
+        tp_dist = tp_cap
+    # 缩后仍要尊重防贴脸下限，否则止盈贴脸毫无意义
     if min_d and tp_dist < min_d:
         out.notes.append(
             f"缩短后止盈距离 {tp_dist:.3f} < 下限 {min_d:.3f} → 外扩到下限")
@@ -584,97 +625,96 @@ def _levels_from_tp(direction: str, entry: float, out: TradeLevels,
         f"止盈按用户要求缩 {1 - tp_shrink:.0%}（系数 {tp_shrink}）："
         f"结构距离 {raw_tp_dist:.3f} -> {tp_dist:.3f}")
 
-    # ---- 3. 止损：优先锚定结构失效边界；无有效边界则回退 rr_from_tp ----
-    # 依据 research/29（R 口径回放 234 笔真实首仓）：止损锚定"最近一段同向
-    # 走势的起点价"（结构失效边界）后，净 R −0.326 -> +0.183、tR −3.81 ->
-    # +3.26、胜率 25.7% -> 69.6%，为风控口径最优。
-    prev_sl = out.sl
+    floor_rr = CFG.risk.min_rr if rr_floor is None else float(rr_floor)
+
+    # ---- 3. 止损：结构失效边界锚定 + **波动率封顶**（用户 2026-10-14 口径）----
+    # 用户选定「结构锚定 + 波动率封顶」：
+    #   止损距离 = min(结构失效边界距离 + 缓冲, sl_vol_cap_mult × ATR(entry_tf))
+    # 依据 research/29（R 口径回放 234 笔真实首仓）：止损锚定"最近一段同向走势
+    # 的起点价"（结构失效边界）本身是风控口径最优（净 R −0.326 → +0.183）；
+    # 2026-10-14 用户在此之上要求"点位设置小、按周期波动率适配"，故再加波动率
+    # 封顶（research/37：15m × 1.5×ATR 为全族最佳，止损从 ~28 点压到约 6 美元）。
     bnd = None
     if frames:
         df_st = frames.get(getattr(CFG.risk, "structure_tf", "15m"))
         if df_st is not None:
             bnd = invalidation_boundary(df_st, direction)
+    # 0.25 = 点差保护（XAUUSDm 实测往返点差 0.240，止损不得贴到点差以内，
+    # 否则会被点差随机打掉 —— 那不是风控是送钱）。
+    sl_min = max((CFG.risk.structure_sl_min_atr * atr) if atr else 0.0, 0.25)
     # ⚠️ 边界必须在正确一侧：做多要求边界价 < 入场，做空要求 > 入场；
     #    否则说明结构已走完该段，本笔不适用结构止损，回退 rr_from_tp。
     if bnd is not None and ((is_long and bnd < entry) or (not is_long and bnd > entry)):
         struct_dist = abs(entry - bnd)
         buf = (CFG.risk.structure_sl_buffer_atr * atr) if atr else 0.0
-        floor_d = (CFG.risk.structure_sl_min_atr * atr) if atr else 0.0
-        sl_dist = max(struct_dist + buf, floor_d, 1e-9)
+        raw_dist = max(struct_dist + buf, sl_min)
+        sl_cap = (CFG.risk.sl_vol_cap_mult * atr) if atr else None
+        if sl_cap is not None and raw_dist > sl_cap + 1e-9:
+            sl_dist = max(sl_cap, sl_min)
+            out.notes.append(
+                f"止损锚定结构失效边界 {bnd:.{digits}f}（距入场 {struct_dist:.3f}）"
+                f" + 波动缓冲 {CFG.risk.structure_sl_buffer_atr}×ATR"
+                f"({CFG.risk.entry_tf}) {buf:.3f} = {raw_dist:.3f}"
+                f"，受**波动率封顶** {CFG.risk.sl_vol_cap_mult}×ATR"
+                f"({CFG.risk.entry_tf}) {sl_cap:.3f} 限制 → 止损距离 {sl_dist:.3f}"
+                f"（用户要求「止损点位设置小」）")
+        else:
+            sl_dist = raw_dist
+            out.notes.append(
+                f"止损锚定结构失效边界 {bnd:.{digits}f}（距入场 {struct_dist:.3f}）"
+                f" + 波动缓冲 {CFG.risk.structure_sl_buffer_atr}×ATR"
+                f"({CFG.risk.entry_tf}) {buf:.3f} = 止损距离 {sl_dist:.3f}"
+                f"（未触及波动率封顶）")
         out.sl_source = "struct_invalidation"
-        out.notes.append(
-            f"止损锚定结构失效边界 {bnd:.{digits}f}（距入场 {struct_dist:.3f}）"
-            f" + 波动缓冲 {CFG.risk.structure_sl_buffer_atr}×ATR {buf:.3f}"
-            f"，下限 {CFG.risk.structure_sl_min_atr}×ATR {floor_d:.3f}"
-            f" = 止损距离 {sl_dist:.3f}"
-            + (f"（原支撑位止损 {prev_sl} 已弃用）" if prev_sl else ""))
     else:
         # 无有效结构失效边界（frames 缺失 / 无 structure_tf / 无可用同向段 /
-        # 边界在错误一侧）-> 回退现状「由止盈反推」。
-        sl_dist = tp_dist / CFG.risk.min_rr
+        # 边界在错误一侧）-> 回退「由止盈反推」，盈亏比恰为下限。
+        # ⚠️ 已知偏差（如实记录，2026-10-14 落地 5m 档时发现）：
+        #    这条回退路径的止损 = 止盈/下限 = `tp_vol_cap_mult/min_rr × ATR`
+        #    （默认 2.5/1.5 ≈ 1.67×ATR），比**结构路径**的波动率封顶
+        #    （`sl_vol_cap_mult`=1.5×ATR）宽约 11%；而 research/37、38 的
+        #    反事实回测用的是 1.5×ATR（等价于结构路径）。故本路径的表现
+        #    未被逐格验证 —— 它只在"结构边界不可用"时才走到，属少数情形。
+        #    （按用户「不扩大改动」的要求，本轮不改这条既有语义。）
+        sl_dist = tp_dist / floor_rr
         out.sl_source = "rr_from_tp"
         out.notes.append(
             f"无有效结构失效边界，回退：止损由止盈反推 "
-            f"（止盈距离 {tp_dist:.3f} / 盈亏比 "
-            f"{CFG.risk.min_rr} = 止损距离 {sl_dist:.3f}）"
-            + (f"（原支撑位止损 {prev_sl} 已弃用）" if prev_sl else ""))
+            f"（止盈距离 {tp_dist:.3f} / 盈亏比下限 {floor_rr} "
+            f"= 止损距离 {sl_dist:.3f}）")
 
-    # ---- 3b. 加仓赔率联动（**仅加仓路径** `is_add=True`）----
-    # 事故（2026-10-12）：加仓手数按剩余额度固定推导（不走风险预算），止损又
-    # 锚定"远端结构失效边界"（实测距入场 30.7 点），而止盈被「缩 0.58 + 下限
-    # 0.5×ATR」压到 6.6 点 -> 赔率只剩 0.21 -> LLM 加仓复核以"风险收益严重
-    # 不成比例"连续拒绝 8 次，加仓阶梯沦为每轮空转。
-    # ⚠️ 只对**加仓**生效，首仓保持 research/29（回放 234 笔真实首仓）已验证的
-    #    口径"止损锚结构边界、止盈照常缩"：research/29 已证首仓扩止盈转差，
-    #    且 test_structure_real 明言首仓「止盈逻辑不变」。结构止损路径本身没有
-    #    `rr_from_tp` 那道 `rr_below_*` 下限（见下），故在此为加仓补上联动。
-    if is_add and out.sl_source == "struct_invalidation":
-        need_tp = sl_dist * CFG.risk.min_rr
-        if tp_dist < need_tp - 1e-9:
+    # ---- 4. 盈亏比下限（**全局硬闸**，用户 2026-10-14）----
+    # 用户原话：「强制设置盈亏比最低阈值为1.5，所有开仓信号必须满足该阈值
+    #          才会被系统触发，不满足的信号直接过滤」。
+    # 实现：先按 `止损距离 × 下限` 反推所需止盈；若这会突破**止盈波动率封顶**
+    #       （封顶与下限无法同时满足），说明该信号"不满足" → 直接拒单。
+    # 首仓与加仓**同一口径**：旧的"加仓 3b 联动 / 首仓 3c 过闸外扩"两段
+    # （下限分别是 min_rr 与 first_entry_min_rr=0.8）已在 2026-10-14 统一并删除。
+    need_tp = sl_dist * floor_rr
+    if tp_dist < need_tp - 1e-9:
+        if tp_cap is not None and need_tp > tp_cap + 1e-9:
+            out.reason = f"rr_below_{floor_rr}"
             out.notes.append(
-                f"加仓结构止损 {sl_dist:.3f} 使赔率仅 {tp_dist / sl_dist:.2f}"
-                f" < 下限 {CFG.risk.min_rr} → 按盈亏比反推，止盈距离 "
-                f"{tp_dist:.3f} 外扩到 {need_tp:.3f}")
-            tp_dist = need_tp
+                f"止损距离 {sl_dist:.3f} 要求止盈 >= {need_tp:.3f}"
+                f"（{floor_rr}×止损），但止盈被波动率封顶 "
+                f"{CFG.risk.tp_vol_cap_mult}×ATR({CFG.risk.entry_tf}) "
+                f"{tp_cap:.3f} 限制 → 盈亏比不足，**拒绝开仓**")
+            return out
+        out.notes.append(
+            f"止盈距离 {tp_dist:.3f} < 止损×下限 {floor_rr} = {need_tp:.3f}"
+            f" → 按盈亏比下限反推，止盈距离扩到 {need_tp:.3f}"
+            f"（实际盈亏比恰为 {floor_rr}）")
+        tp_dist = need_tp
 
-    # ---- 3c. 首仓止盈「过闸」外扩（**仅首仓** `is_add=False`，与 3b 同形）----
-    # 事故（2026-10-13）：首仓止损锚 15m 结构失效边界（实测距入场约 28 点），
-    # 止盈被「缩 70% + 下限 0.5×ATR」压到约 5 点 → 赔率恒约 0.19，被原先的
-    # `first_entry_min_rr` 硬闸 21/21 全拒，一小时突破也开不出首仓。
-    # 依据 research/32_first_entry_positioning.py（历史 237 笔真实首仓、同一批
-    # 信号的反事实回放）：在现状口径（A′ 净R +0.128）基础上**只把止盈外扩到刚好
-    # 过闸**（B′），净R +0.174、赔率中位 0.54→0.84、tR +2.79，是「既过闸又
-    # 不为负」的唯一改法；扩到满赔率 `min_rr`（C′ −0.273）或反向收止损
-    # （D′ −0.214）都明显转差，故**不采用**。故把原「硬拒」改为「外扩」。
-    if (not is_add) and out.sl_source == "struct_invalidation":
-        floor = (CFG.risk.first_entry_min_rr if rr_floor is None
-                 else rr_floor)
-        need_tp = sl_dist * floor
-        if tp_dist < need_tp - 1e-9:
-            out.notes.append(
-                f"首仓结构止损 {sl_dist:.3f} 使赔率仅 {tp_dist / sl_dist:.2f}"
-                f" < 下限 {floor} → 按赔率反推，止盈距离 "
-                f"{tp_dist:.3f} 外扩到 {need_tp:.3f}")
-            tp_dist = need_tp
     out.sl = round(entry - sl_dist if is_long else entry + sl_dist, digits)
 
     out.tp = round(entry + tp_dist if is_long else entry - tp_dist, digits)
     if sl_dist <= 0:
         out.reason = "sl_at_entry"
         return out
-    # ⚠️ 赔率硬校验**仅对回退路径**生效：结构失效边界路径的长度已由
-    #    「风险预算反推」自然约束（过长止损 -> 手数不足 -> 不开仓），
-    #    再加赔率门会重复阻挡，与 research/29 方案 B 的最优口径不符。
-    # ⚠️ 赔率校验用**未规整**的距离：sl_dist 恰好等于 tp_dist/min_rr，
-    #    规整到 digits 位小数后会引入误差，若拿规整后的值比较，
-    #    本应恰好等于 min_rr 的赔率会被误判为"低于 min_rr"而拒绝。
-    if (out.sl_source == "rr_from_tp"
-            and tp_dist < sl_dist * CFG.risk.min_rr - 1e-9):
-        out.reason = f"rr_below_{CFG.risk.min_rr}"
-        return out
-    # ⚠️ 2026-10-13 移除首仓确定性赔率「硬拒」（原 reason=rr_below_0.8）：
-    #    上面步骤 3c 已把首仓结构止损路径的止盈**外扩到** first_entry_min_rr×止损，
-    #    回退路径赔率恒为 min_rr（>first_entry_min_rr），故该硬拒已不可达。
+    # ⚠️ 赔率校验在第 4 步已用**未规整**的距离做过（`sl_dist` 在回退路径下恰
+    #    等于 `tp_dist/floor_rr`，规整到 digits 位小数后的值再比较会把"恰好
+    #    达标"误判为"低于下限"）。
     out.sl_dist = round(abs(entry - out.sl), digits)
     out.tp_dist = round(abs(out.tp - entry), digits)
 

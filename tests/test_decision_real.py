@@ -40,7 +40,8 @@ def _ctx(score: float, sigma: float = 0.3, holding: list[PositionRow] | None = N
          llm: dict | None = None, high_risk: bool = False,
          baseline: float = 0.0, vol_pct: float = 0.9,
          llm_available: bool | None = None,
-         regime: str = "trending") -> DecisionContext:
+         regime: str = "trending",
+         atr_pct: float | None = None) -> DecisionContext:
     ev = FusedEvidence(result=FusionResult(score=score, sigma=sigma, regime=regime,
                                            score_baseline=baseline,
                                            vol_percentile=vol_pct))
@@ -48,6 +49,7 @@ def _ctx(score: float, sigma: float = 0.3, holding: list[PositionRow] | None = N
     news = NewsView(high_risk_window=high_risk)
     return DecisionContext(ev=ev, positions=pos, news=news, llm=llm,
                            last_close=4350.0, atr=5.0, realized_vol=0.008, round_id=1,
+                           atr_pct=atr_pct,
                            llm_available=(bool((llm or {}).get("review"))
                                           if llm_available is None else llm_available))
 
@@ -617,6 +619,12 @@ def test_signal_giveback_tightens_instead_of_closing():
     def _c(score):
         c = _ctx(score=score, holding=[pos])
         c.position_adds = exhausted
+        # ⚠️ 2026-10-14 起还要**堵住"多次开仓"闸**：否则强信号 + 加仓额度用尽
+        #    会先命中"再开一笔独立仓"（`open_market`）而提前返回，
+        #    依赖 score_peak 的回吐逻辑就永远走不到。把总手数额度设为已用满，
+        #    即让多仓与加仓都无额度可用（本用例要验的是**信号回吐**那条路径）。
+        c.max_lots_cap = CFG.max_lot
+        c.used_lots = CFG.max_lot
         return c
 
     # 先在强顺向信号上建立很高的 score_peak
@@ -1252,6 +1260,101 @@ def test_summary_prints_per_source_scores_and_weights():
     assert "-0.71" in out, f"缺反向源分数: {out!r}"
     # 0 权重源必须标"未参与"，不能看起来像有意见
     assert "SMC结构 未参与" in out, f"0 权重源应标未参与: {out!r}"
+
+
+# ══════════════════════════════════════════════════════════════════
+# 多次开仓（用户 2026-10-14 需求 1）：决策层再开一笔独立仓
+# ══════════════════════════════════════════════════════════════════
+def _hold_pos(ticket: int) -> PositionRow:
+    return PositionRow(ticket=ticket, symbol="XAUUSDm", type="LONG", volume=0.01,
+                       price_open=4340.0, sl=4330.0, tp=4360.0, profit=1.0,
+                       swap=0, time=time.time(), comment="", magic=CFG.mt5.magic)
+
+
+def test_multi_entry_proposes_new_position_while_holding():
+    """持仓且加仓额度用尽时，若信号再次过开仓闸 → 提出 `open_market` 新仓。
+
+    与加仓的区别：多开仓只要求过**普通开仓闸**（|z| ≥ z_min），不要求过加仓
+    那条逐级抬高的分数阶梯；因此用"加仓次数已用尽"来隔离出多仓路径。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    pos = _hold_pos(9301)
+    c = _ctx(score=ABOVE, holding=[pos])
+    c.position_adds = {"9301": {"count": CFG.risk.max_adds_per_position}}
+    p = e.decide(c)
+    assert p.kind == "open_market", f"应当再开一笔独立仓，得到 {p.kind}"
+    assert p.direction == "LONG", p.direction
+    assert "多开仓" in _reasons(p), p.reasons
+
+
+def test_multi_entry_disabled_when_cap_is_one(monkeypatch):
+    """`max_entries_per_symbol = 1` → 关闭多仓（回到"持仓时不新开"的旧行为）。"""
+    monkeypatch.setattr(CFG.risk, "max_entries_per_symbol", 1, raising=False)
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    pos = _hold_pos(9302)
+    c = _ctx(score=ABOVE, holding=[pos])
+    c.position_adds = {"9302": {"count": CFG.risk.max_adds_per_position}}
+    p = e.decide(c)
+    assert p.kind != "open_market", f"关闭多仓时不该新开，得到 {p.kind}"
+
+
+def test_multi_entry_at_cap_falls_through_to_holding_logic(monkeypatch):
+    """持仓数已达上限 → 不再新开（走持仓管理逻辑）。"""
+    monkeypatch.setattr(CFG.risk, "max_entries_per_symbol", 1, raising=False)
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    c = _ctx(score=ABOVE, holding=[_hold_pos(9303)])
+    c.position_adds = {"9303": {"count": 0}}      # 加仓阶梯仍可用
+    p = e.decide(c)
+    assert p.kind in ("add_layer", "modify_sltp", "hold"), p.kind
+    assert p.kind != "open_market", "已达上限不得新开"
+
+
+# ══════════════════════════════════════════════════════════════════
+# 5m 档的波动率上限闸（research/38 的落地机制，用户 2026-10-14）
+# ══════════════════════════════════════════════════════════════════
+def test_atr_pct_max_gate_blocks_new_entries():
+    """波动率分位超上限 → **不开新仓**（空仓路径）。
+
+    依据 research/38：5m 档止损 1.5×ATR(5m)≈5.8 美元在高波动下必被扫 ——
+    不加闸时 5m 全档为负（高波动档 −54.4）；加闸后族A/族B 双正。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    over = CFG.decision.atr_pct_max + 0.1
+    p = e.decide(_ctx(score=ABOVE, atr_pct=over))
+    assert p.kind == "hold", f"分位 {over} 超上限应观望，得到 {p.kind}"
+    assert "波动率分位" in _reasons(p), p.reasons
+    # 闸内（或分位缺省 None）→ 正常开仓
+    under = max(CFG.decision.atr_pct_max - 0.1, 0.0)
+    p2 = e.decide(_ctx(score=ABOVE, atr_pct=under))
+    assert p2.kind == "open_market", f"闸内应可开仓，得到 {p2.kind}"
+    p3 = e.decide(_ctx(score=ABOVE))                     # atr_pct=None
+    assert p3.kind == "open_market", f"缺省分位不应被拦，得到 {p3.kind}"
+
+
+def test_atr_pct_gate_does_not_block_holding_path():
+    """该闸只拦**新开仓**：持仓的加仓/移损/平仓一律不受影响。"""
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    pos = _hold_pos(9401)
+    c = _ctx(score=ABOVE, holding=[pos], atr_pct=1.0)    # 分位拉满 = 必然超闸
+    c.position_adds = {"9401": {"count": 0}}             # 加仓阶梯可用
+    p = e.decide(c)
+    assert "波动率分位" not in _reasons(p), (
+        f"持仓路径不该被开仓闸拦：{p.kind} {p.reasons}")
+    assert p.kind in ("add_layer", "modify_sltp", "hold"), p.kind
+
+
+def test_atr_pct_gate_also_covers_multi_entry():
+    """多开仓入口与空仓共用同一套闸 —— 分位超上限时不得再开一笔。
+
+    ⚠️ 被拦时**不返回 hold**，而是继续走持仓管理（否则移损/锁盈会被每轮跳过，
+    这正是本项目记录过的"挂单/开仓闸阻塞持仓管理"那类事故）。
+    """
+    e = DecisionEngine(RiskGate(CircuitBreakers()))
+    pos = _hold_pos(9402)
+    c = _ctx(score=ABOVE, holding=[pos], atr_pct=1.0)
+    c.position_adds = {"9402": {"count": CFG.risk.max_adds_per_position}}
+    p = e.decide(c)
+    assert p.kind != "open_market", f"分位超上限仍开新仓：{p.kind}"
 
 
 def test_sources_line_is_gbk_safe():

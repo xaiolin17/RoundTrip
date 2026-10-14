@@ -222,8 +222,12 @@ class Graph:
             # t2/t3 fuse（先本地融合；LLM 之后若有效再融合一次）
             st["fused"] = self.fusion.fuse_all(st["bundle"].frames, st["chanlun"],
                                                st["mobius"], obs_id=round_id)
-            # P1-1：SL/TP 用 1h ATR（决策周期 ATR），不是 15m
+            # 高级别 ATR（默认 1h）：用于「紧贴反向位」判定等既有用途
             atr = self._decision_atr(st)
+            # 开仓周期（entry_tf）的实时波动率 —— 止损止盈的尺度（用户 2026-10-14）
+            atr_entry = self._entry_atr(st)
+            # ATR(1h) 滚动分位 —— 5m 档的波动率上限闸（research/38）
+            atr_pct = self._atr_pct(st)
 
             # t2c 信号详情日志（用户要求：把影响分析的重要信号打印到日志）
             ind = st["fused"].indicators
@@ -276,6 +280,19 @@ class Graph:
                     "range_compression": (round(ind.range_compression, 3) if ind else None),
                     "atr": round(ind.atr, 3) if ind and ind.atr else None,
                     "atr_1h": round(atr, 3) if atr else None,
+                    # 开仓周期与其 ATR —— 止损止盈的波动率尺度（用户 2026-10-14）。
+                    # ⚠️ 必须落盘：否则事后无法回答"当时的止损尺度是多少、
+                    #    为什么这个止损是这个宽度"。
+                    "entry_tf": CFG.risk.entry_tf,
+                    "atr_entry": round(atr_entry, 4) if atr_entry else None,
+                    # ATR(1h) 滚动分位 + 它的上限闸 —— 必须落盘，否则事后无法
+                    # 判断"这一轮没开仓"是信号不够，还是被波动率上限闸挡了。
+                    "atr_pct": round(atr_pct, 4) if atr_pct is not None else None,
+                    "atr_pct_max": CFG.decision.atr_pct_max,
+                    "sl_vol_cap": (round(CFG.risk.sl_vol_cap_mult * atr_entry, 4)
+                                   if atr_entry else None),
+                    "tp_vol_cap": (round(CFG.risk.tp_vol_cap_mult * atr_entry, 4)
+                                   if atr_entry else None),
                     "realized_vol_daily": (round(ind.realized_vol_daily, 5)
                                            if ind and ind.realized_vol_daily else None),
                 },
@@ -321,6 +338,7 @@ class Graph:
                                   point_value_per_lot=self._point_value(),
                                   used_lots=self._used_lots(st["positions"]),
                                   max_lots_cap=self._max_lots_cap(st["account"]),
+                                  atr_pct=atr_pct,
                                   now_ts=summary["ts"])
             if need_llm and self.llm is not None:
                 st["llm"] = await self.llm.review_and_news(ev, st["news"],
@@ -377,6 +395,8 @@ class Graph:
                 ev, st["account"], st["positions"],
                 point_value_per_lot=self._point_value(),
                 df_5m=st["bundle"].frames["5m"], atr=atr,
+                # 开仓周期的 ATR：止损止盈的波动率尺度（用户 2026-10-14）
+                atr_entry=atr_entry,
                 realized_vol=st["fused"].indicators.realized_vol_daily
                 if st["fused"].indicators else None,
                 win_rate=wr,
@@ -672,9 +692,22 @@ class Graph:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(self._position_adds), encoding="utf-8")
 
+    def _atr_of(self, frames: dict, tf: str) -> float | None:
+        """取某周期的 ATR(14)。周期缺失或样本不足（< 20 根）时返回 None。"""
+        df = (frames or {}).get(tf)
+        if df is None or len(df) < 20:
+            return None
+        tr = pd.concat([
+            df["high"] - df["low"],
+            (df["high"] - df["close"].shift()).abs(),
+            (df["low"] - df["close"].shift()).abs(),
+        ], axis=1).max(axis=1)
+        atr = float(tr.rolling(14).mean().iloc[-1])
+        return atr if atr > 0 else None
+
     # ---------- P1-1：决策周期 ATR ----------
     def _decision_atr(self, st: GraphState) -> float | None:
-        """SL/TP 用**高级别（默认 1h）**的 ATR，而不是入场周期（1m）。
+        """SL/TP 用的**高级别（默认 1h）**ATR，用于「紧贴反向位」判定等既有用途。
 
         ⚠️ 这是 1m 短线能否成立的关键，不是可选项。
 
@@ -691,20 +724,61 @@ class Graph:
         **所以"1m 不能交易"这个结论只在"用 1m 波动定止损"的前提下成立。**
 
         1m 负责**入场择时**（精度高、机会多），高级别负责**风险尺度**（成本占比低）。
+
+        ⚠️ 2026-10-14：止损止盈的宽度**已改由 `_entry_atr`（开仓周期 ATR）决定**
+        （用户要求"按周期波动率动态适配 + 点位设置小"）。本函数保留给
+        「紧贴反向位」判定（`conflict_atr_mult`，语义是价格距离而非止损宽度），
+        那里的尺度不能跟着改 —— 否则 0.3×ATR(15m) ≈ 1.2 点会把大量单子
+        误判成"贴脸"。
         """
         frames = st.get("bundle").frames if st.get("bundle") else {}
-        tf = CFG.risk.atr_tf
-        df = frames.get(tf)
-        if df is None or len(df) < 20:
-            ind = st.get("fused").indicators if st.get("fused") else None
-            return ind.atr if ind else None
-        tr = pd.concat([
-            df["high"] - df["low"],
-            (df["high"] - df["close"].shift()).abs(),
-            (df["low"] - df["close"].shift()).abs(),
-        ], axis=1).max(axis=1)
-        atr = float(tr.rolling(14).mean().iloc[-1])
-        return atr if atr > 0 else None
+        a = self._atr_of(frames, CFG.risk.atr_tf)
+        if a is not None:
+            return a
+        ind = st.get("fused").indicators if st.get("fused") else None
+        return ind.atr if ind else None
+
+    def _entry_atr(self, st: GraphState) -> float | None:
+        """**开仓周期**（`CFG.risk.entry_tf`）的实时 ATR —— 止损止盈的波动率尺度。
+
+        用户 2026-10-14 原话：
+          > 止损止盈点要设置小 然后盈亏比至少1.5 但是要考虑当前的波动率
+          > 如果是按照5m来开仓那么5m波动率的止损要设置好 不然直接就被打止损了
+          > 如果是15m那么同理
+
+        实现口径（见 `risk/levels.py`）：
+          止损距离 = min(结构失效边界距离 + 缓冲, sl_vol_cap_mult × 本值)
+          止盈距离 = min(结构目标距离 × tp_shrink, tp_vol_cap_mult × 本值)
+        取不到该周期 K 线时返回 None，`levels` 内部会退回 `atr`（旧行为）。
+        """
+        frames = st.get("bundle").frames if st.get("bundle") else {}
+        return self._atr_of(frames, CFG.risk.entry_tf)
+
+    def _atr_pct(self, st: GraphState) -> float | None:
+        """**ATR(1h) 在近 240 根已收盘 bar 内的滚动分位** —— 5m 档的波动率上限闸。
+
+        依据（research/38，用户 2026-10-14 落地）：
+          5m 档的止损 = `sl_vol_cap_mult` × ATR(5m) ≈ 5.8 美元，在高波动行情下
+          **必然被扫**。不加闸时 5m 全档为负且亏损集中在其高波动档
+          （低波动 +32.7 / 中波动 −3.0 / **高波动 −54.4**）；加闸（分位 ≤ 0.5）
+          后高波动档不再下单，族A 净R +35.04 tR +2.15、族B 净R +67.98 tR +2.70。
+
+        ⚠️ 口径必须是 **ATR(1h) 分位**，不是 `FusionResult.vol_percentile`
+        （15m 已实现波动率）：同一机制换口径后明显更弱（族A +22.99 / 族B +17.89）。
+        ⚠️ 只用**已收盘**的 1h bar（丢掉正在形成的最后一根），与研究的
+        `close_sec` 口径一致；样本不足（< 60 个 ATR 值）时返回 None → 闸不拦。
+        """
+        df = (st.get("bundle").frames or {}).get("1h") if st.get("bundle") else None
+        if df is None or len(df) < 75:
+            return None
+        base = df.iloc[:-1]                      # 丢掉未收盘的当前 1h bar
+        hi, lo, cl = base["high"], base["low"], base["close"]
+        tr = pd.concat([hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()],
+                       axis=1).max(axis=1)
+        win = tr.rolling(14).mean().dropna().tail(240)
+        if len(win) < 60:
+            return None
+        return float(win.rank(pct=True).iloc[-1])
 
     # ---------- LLM 评审日志（skill 合规审计） ----------
     def _log_llm_review(self, round_id: int, llm: dict | None, available: bool) -> None:
