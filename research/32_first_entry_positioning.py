@@ -373,7 +373,11 @@ def main() -> int:
         min_atr = float(CFG.risk.structure_sl_min_atr)
         buf_atr = float(CFG.risk.structure_sl_buffer_atr)
         min_rr = float(CFG.risk.min_rr)
-        gate_rr = float(CFG.risk.first_entry_min_rr)
+        # ⚠️ 2026-10-14：`first_entry_min_rr`（首仓专用赔率下限）已随
+        #    「盈亏比下限全局唯一（min_rr）」的重新设计**删除**。
+        #    本脚本是当时的取证脚本（结论已归档在 trials.csv 与 config.toml 的历史注释里），
+        #    取值退化为 `min_rr`，以免脚本因配置键消失而直接崩掉。
+        gate_rr = float(getattr(CFG.risk, "first_entry_min_rr", CFG.risk.min_rr))
     except Exception:
         pass
 
@@ -381,7 +385,7 @@ def main() -> int:
     p("研究取证 32 · 首仓「取位方案」回放：哪种取位能让赔率回到合理区且不亏")
     p("=" * 104)
     p(f"  参数：first_tp_shrink={shrink}  structure_sl_min_atr={min_atr}  "
-      f"structure_sl_buffer_atr={buf_atr}  min_rr={min_rr}  first_entry_min_rr={gate_rr}")
+      f"structure_sl_buffer_atr={buf_atr}  min_rr={min_rr}  first_entry_rr_gate={gate_rr}")
     p(f"  成本={COST}（价格单位/笔）  最长持有={MAX_HOLD_MIN} 分钟  "
       f"摆动确认 k={SWING_K}（15m）")
 
