@@ -1312,30 +1312,34 @@ def test_multi_entry_at_cap_falls_through_to_holding_logic(monkeypatch):
 # ══════════════════════════════════════════════════════════════════
 # 5m 档的波动率上限闸（research/38 的落地机制，用户 2026-10-14）
 # ══════════════════════════════════════════════════════════════════
-def test_atr_pct_max_gate_blocks_new_entries():
+def test_atr_pct_max_gate_blocks_new_entries(monkeypatch):
     """波动率分位超上限 → **不开新仓**（空仓路径）。
 
-    依据 research/38：5m 档止损 1.5×ATR(5m)≈5.8 美元在高波动下必被扫 ——
-    不加闸时 5m 全档为负（高波动档 −54.4）；加闸后族A/族B 双正。
+    依据 research/38：5m 档止损 1.5×ATR(5m) 在高波动下必被扫 —— 不加闸时
+    5m 全档为负（高波动档 −54.4）；加闸后族A/族B 双正。
+
+    ⚠️ 这里**固定闸值**（0.5）再验，而不是用 `CFG.decision.atr_pct_max ± 0.1`：
+    后者会随配置漂移 —— 2026-10-15 切回 15m 安全对时闸被设为 1.0（关闭），
+    用配置值构造的"超上限"场景（1.1）就不再有任何意义。测试要验的是**机制**，
+    不是当前生效值。
     """
+    monkeypatch.setattr(CFG.decision, "atr_pct_max", 0.5)
     e = DecisionEngine(RiskGate(CircuitBreakers()))
-    over = CFG.decision.atr_pct_max + 0.1
-    p = e.decide(_ctx(score=ABOVE, atr_pct=over))
-    assert p.kind == "hold", f"分位 {over} 超上限应观望，得到 {p.kind}"
+    p = e.decide(_ctx(score=ABOVE, atr_pct=0.6))
+    assert p.kind == "hold", f"分位 0.60 超上限 0.5 应观望，得到 {p.kind}"
     assert "波动率分位" in _reasons(p), p.reasons
     # 闸内（或分位缺省 None）→ 正常开仓
-    under = max(CFG.decision.atr_pct_max - 0.1, 0.0)
-    p2 = e.decide(_ctx(score=ABOVE, atr_pct=under))
+    p2 = e.decide(_ctx(score=ABOVE, atr_pct=0.4))
     assert p2.kind == "open_market", f"闸内应可开仓，得到 {p2.kind}"
     p3 = e.decide(_ctx(score=ABOVE))                     # atr_pct=None
     assert p3.kind == "open_market", f"缺省分位不应被拦，得到 {p3.kind}"
 
 
-def test_atr_pct_gate_does_not_block_holding_path():
+def test_atr_pct_gate_does_not_block_holding_path(monkeypatch):
     """该闸只拦**新开仓**：持仓的加仓/移损/平仓一律不受影响。"""
+    monkeypatch.setattr(CFG.decision, "atr_pct_max", 0.5)
     e = DecisionEngine(RiskGate(CircuitBreakers()))
-    pos = _hold_pos(9401)
-    c = _ctx(score=ABOVE, holding=[pos], atr_pct=1.0)    # 分位拉满 = 必然超闸
+    c = _ctx(score=ABOVE, holding=[_hold_pos(9401)], atr_pct=0.9)
     c.position_adds = {"9401": {"count": 0}}             # 加仓阶梯可用
     p = e.decide(c)
     assert "波动率分位" not in _reasons(p), (
@@ -1343,15 +1347,15 @@ def test_atr_pct_gate_does_not_block_holding_path():
     assert p.kind in ("add_layer", "modify_sltp", "hold"), p.kind
 
 
-def test_atr_pct_gate_also_covers_multi_entry():
+def test_atr_pct_gate_also_covers_multi_entry(monkeypatch):
     """多开仓入口与空仓共用同一套闸 —— 分位超上限时不得再开一笔。
 
     ⚠️ 被拦时**不返回 hold**，而是继续走持仓管理（否则移损/锁盈会被每轮跳过，
     这正是本项目记录过的"挂单/开仓闸阻塞持仓管理"那类事故）。
     """
+    monkeypatch.setattr(CFG.decision, "atr_pct_max", 0.5)
     e = DecisionEngine(RiskGate(CircuitBreakers()))
-    pos = _hold_pos(9402)
-    c = _ctx(score=ABOVE, holding=[pos], atr_pct=1.0)
+    c = _ctx(score=ABOVE, holding=[_hold_pos(9402)], atr_pct=0.9)
     c.position_adds = {"9402": {"count": CFG.risk.max_adds_per_position}}
     p = e.decide(c)
     assert p.kind != "open_market", f"分位超上限仍开新仓：{p.kind}"

@@ -217,7 +217,11 @@ class RiskConfig:
     #: ⚠️ **代码默认 "15m" 是"安全对"的一半**：它与 `decision.atr_pct_max`
     #:    的默认 1.0（闸关闭）配对 —— 即使 config.toml 整段丢失，也不会退化成
     #:    "5m 档却不开波动率闸"那种**未经检验**的组合（实测那种组合全档为负）。
-    #:    实际上线值在 config.toml：`entry_tf = "5m"` + `atr_pct_max = 0.5`。
+    #:    实际上线值在 config.toml：**`entry_tf = "15m"` + `atr_pct_max = 1.0`**
+    #:    （即"安全对"本身）—— 2026-10-15 由 5m 档回退而来：5m 必须配波动率上限
+    #:    闸，而该闸在单边高波动 regime 下会让系统**100% 停摆**（实盘 407 轮
+    #:    0 开仓，当时分位 0.82~0.94 > 上限 0.5）。15m 档三档波动都开仓且验证
+    #:    最强（净R +58.27 / tR +3.12 / DSR 0.848），故不需要该闸。
     #: 5m 档依据：research/38（族A 净R +25.53/tR +1.74，族B 净R +60.38/tR +2.66）；
     #: 15m 档依据：research/37（净R +58.27/tR +3.12/DSR 0.848，但**不带**上限闸）。
     entry_tf: str = _TOML.get("risk", {}).get("entry_tf", "15m")
@@ -465,8 +469,9 @@ class DecisionConfig:
     #: 语义：分位 > 本值 → **不开新仓**（加仓有自身阶梯，离场动作永不受限）。
     #: 1.0 = 关闭。
     #: ⚠️ 代码默认 1.0 与 `risk.entry_tf` 的代码默认 "15m" 构成**安全对**；
-    #:    5m 档的启用值在 config.toml 里**成对**出现（entry_tf="5m" + 本值 0.5），
-    #:    由 `test_design_config_is_self_consistent` 强制校验这个配对。
+    #: 5m 档的启用值在 config.toml 里**成对**出现（entry_tf="5m" + 本值 0.5），
+    #: 由 `test_design_config_is_self_consistent` 强制校验这个配对。
+    #: ⚠️ 当前上线组合是 15m + 本值 1.0（关闭）—— 见上面的回退说明。
     atr_pct_max: float = _TOML.get("decision", {}).get("atr_pct_max", 1.0)
     # ---- LLM 一致性要求：aligned 时的最低 confidence ----
     llm_align_conf: float = _TOML.get("decision", {}).get("llm_align_conf", 0.6)
